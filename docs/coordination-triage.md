@@ -38,8 +38,8 @@ gh pr list --repo Marvisak/VIctory --state open --limit 3000 \
   --json number,title,url,isDraft,headRefOid,baseRefName,baseRefOid,closingIssuesReferences,author > prs.json
 git fetch --no-tags upstream +refs/heads/main:refs/remotes/upstream/main
 # Fetch refs/pull/<number>/head to refs/remotes/upstream/pr/<number> for each non-draft PR targeting main.
-python -I -m unittest discover -s scripts -p 'test_coordination_triage.py' -v
-python -I scripts/coordination_triage.py --repo . --prs prs.json \
+python -B -I -m unittest discover -s scripts -p 'test_coordination_triage.py' -v
+python -B -I scripts/coordination_triage.py --repo . --prs prs.json \
   --upstream-main refs/remotes/upstream/main --fork-dev dev --out out
 ```
 
