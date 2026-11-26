@@ -21,8 +21,13 @@ pub(crate) fn plan(
     io: &StageIo,
     native_wave64: bool,
     wave: WaveMode,
+    requires_wave64_semantics: bool,
 ) -> Plan {
-    let wave64_unsupported = native_wave64 && wave.max_lanes < 64 && !wave.wide64;
+    // The native Wave64 bit alone does not require 64-lane execution. An
+    // unrestricted shader with no lane-sensitive operations can still lower
+    // to wave-size-agnostic DXIL on a 32-lane host.
+    let wave64_unsupported =
+        native_wave64 && requires_wave64_semantics && wave.max_lanes < 64 && !wave.wide64;
     let emulated_wave64 = native_wave64 && wave.max_lanes < 64 && wave.wide64;
     let group_lanes = match io {
         StageIo::Cs(cs) => cs
