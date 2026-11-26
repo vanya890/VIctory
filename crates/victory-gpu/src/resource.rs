@@ -1858,7 +1858,6 @@ fn hand_out_resource(
         let memory = resource.data() as u64;
         let mut textures = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         textures.insert(memory, at);
-        textures_at_changed(memory);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -1878,11 +1877,13 @@ impl LiveTextures {
         }
     }
 
+    /// Caller holds TEXTURES_AT; publish the resource before advancing its bucket.
     fn insert(&mut self, memory: u64, resource: usize) {
         self.by_memory.entry(memory).or_default().push(resource);
         self.live
             .get_or_insert_with(Default::default)
             .insert(resource);
+        textures_at_changed(memory);
     }
 
     fn remove(&mut self, memory: u64, resource: usize) -> bool {
@@ -1897,6 +1898,9 @@ impl LiveTextures {
             if list.is_empty() {
                 self.by_memory.remove(&memory);
             }
+        }
+        if removed {
+            textures_at_changed(memory);
         }
         removed
     }
@@ -2039,9 +2043,7 @@ impl Drop for Resource {
         if self.desc.dimension != BUFFER {
             let memory = self.data() as u64;
             let mut textures = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-            if textures.remove(memory, at) {
-                textures_at_changed(memory);
-            }
+            textures.remove(memory, at);
         }
         crate::bindless::forget(at);
         if self.desc.dimension == BUFFER {
