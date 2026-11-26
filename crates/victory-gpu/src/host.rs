@@ -315,6 +315,10 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    /// Conservative minimum and advertised maximum host wave widths.
+    /// D3D12 requires workload sizing to rely on the minimum, not maximum.
+    pub(crate) min_wave_lanes: u32,
+    pub(crate) max_wave_lanes: u32,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -468,6 +472,28 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let mut wave_options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        let wave_ops = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut wave_options).cast(),
+                size_of_val(&wave_options) as u32,
+            )
+            .is_ok()
+            && wave_options.WaveOps.as_bool();
+        let (min_wave_lanes, max_wave_lanes) = if wave_ops {
+            (wave_options.WaveLaneCountMin, wave_options.WaveLaneCountMax)
+        } else {
+            // Unknown/unsupported wave operations must not justify relaxing
+            // group synchronization or accepting a native wave64 shader.
+            (0, 0)
+        };
+        tracing::info!(
+            wave_ops,
+            min_wave_lanes,
+            max_wave_lanes,
+            "host D3D12 wave-lane support"
+        );
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -532,6 +558,8 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             depth_bounds_supported,
+            min_wave_lanes,
+            max_wave_lanes,
             queue,
             fence,
             submitted: Mutex::new(0),
