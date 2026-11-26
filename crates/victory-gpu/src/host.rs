@@ -4753,7 +4753,10 @@ mod present_plane_tests {
             eprintln!("skipping PresentX typed-view test: no D3D12 device");
             return;
         };
-        let make = |format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS| -> ID3D12Resource {
+        let make = |format: DXGI_FORMAT,
+                    flags: D3D12_RESOURCE_FLAGS,
+                    initial_state: D3D12_RESOURCE_STATES|
+         -> ID3D12Resource {
             let mut texture = None;
             // SAFETY: live device and a valid 2D resource description.
             unsafe {
@@ -4775,7 +4778,7 @@ mod present_plane_tests {
                             Flags: flags,
                             ..Default::default()
                         },
-                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        initial_state,
                         None,
                         &mut texture,
                     )
@@ -4783,55 +4786,94 @@ mod present_plane_tests {
             }
             texture.unwrap()
         };
-        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
-        let typeless = make(
-            DXGI_FORMAT_R16G16B16A16_TYPELESS,
-            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-        );
-        let list = host.new_list().unwrap();
-        let rtv = host.rtv(
-            &typeless,
-            Some(&D3D12_RENDER_TARGET_VIEW_DESC {
-                Format: DXGI_FORMAT_R16G16B16A16_UNORM,
-                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
-                Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
-                    Texture2D: D3D12_TEX2D_RTV { MipSlice: 0, PlaneSlice: 0 },
-                },
-            }),
-        );
-        // SAFETY: live typed RTV on an open list.
-        unsafe { list.list.ClearRenderTargetView(rtv, &[1.0, 0.5, 0.0, 1.0], None) };
-        list.close();
-        host.execute(&[&list]);
-
-        let mut pixel = None;
-        let converted = host.present_planes_with_compositor(
-            &[PresentPlane::Raw(
-                &typeless,
-                state,
-                Some(DXGI_FORMAT_R16G16B16A16_UNORM.0 as u32),
-            )],
-            6,
-            Compositor::new,
-            |buffer, footprint| {
+        let state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
+        let render_target_state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let first_pixel =
+            |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+                assert_eq!(footprint.Footprint.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
                 let mut mapped = std::ptr::null_mut();
-                // SAFETY: completed present copy; footprint points to one RGBA16F texel.
-                pixel = Some(unsafe {
+                // SAFETY: the present copy completed and the footprint names a live RGBA pixel.
+                let rgba = unsafe {
                     buffer.Map(0, None, Some(&mut mapped)).unwrap();
                     let rgba = mapped
                         .cast::<u8>()
                         .add(footprint.Offset as usize)
-                        .cast::<[u16; 4]>()
+                        .cast::<[u8; 4]>()
                         .read();
                     buffer.Unmap(0, None);
                     rgba
-                });
-            },
+                };
+                (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
+            };
+        let typed = make(
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
         );
-        assert!(converted.0.is_some(), "typed UNORM RTV metadata must enable conversion");
-        let [red, green, blue, alpha] = pixel.expect("converted primary pixel");
-        assert_eq!((red, blue, alpha), (0x3c00, 0x0000, 0x3c00));
-        assert!(matches!(green, 0x37ff | 0x3800), "expected ~0.5 as f16, got {green:#06x}");
+        let row_pitch = 256;
+        let (upload, data) = host
+            .upload_buffer((row_pitch * 32) as u64)
+            .expect("upload buffer for typed shader resource");
+        // SAFETY: mapped upload memory is large enough for 32 rows at this pitch.
+        unsafe {
+            for y in 0..32 {
+                let row = data.add(y * row_pitch);
+                for x in 0..32 {
+                    row.add(x * 4).write(255);
+                    row.add(x * 4 + 1).write(0);
+                    row.add(x * 4 + 2).write(128);
+                    row.add(x * 4 + 3).write(255);
+                }
+            }
+        }
+        let list = host.new_list().unwrap();
+        let source = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: the location borrows the upload resource through execution below.
+            pResource: unsafe { std::mem::transmute_copy(&upload) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                        Width: 32,
+                        Height: 32,
+                        Depth: 1,
+                        RowPitch: row_pitch as u32,
+                    },
+                },
+            },
+        };
+        let destination = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: the location borrows the typed texture through execution below.
+            pResource: unsafe { std::mem::transmute_copy(&typed) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        // SAFETY: source and destination describe compatible live resources.
+        unsafe { list.list.CopyTextureRegion(&destination, 0, 0, 0, &source, None) };
+        let to_shader = [transition(
+            &typed,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        )];
+        // SAFETY: the typed texture transitions from COPY_DEST to shader-resource state.
+        unsafe { list.list.ResourceBarrier(&to_shader) };
+        list.close();
+        host.execute(&[&list]);
+        let mut converted_pixel = None;
+        let converted = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(
+                &typed,
+                state,
+                Some(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB.0 as u32),
+            )],
+            6,
+            Compositor::new,
+            |buffer, footprint| converted_pixel = Some(first_pixel(buffer, footprint)),
+        );
+        assert!(converted.0.is_some(), "typed sRGB format must enable conversion");
+        assert_eq!(converted_pixel, Some((32, 32, [255, 0, 128, 255])));
 
         // Use a fresh Host so no other parallel test can have cached a
         // compositor with this format and bypass the injected creation error.
@@ -4852,12 +4894,12 @@ mod present_plane_tests {
                         Height: 32,
                         DepthOrArraySize: 1,
                         MipLevels: 1,
-                        Format: DXGI_FORMAT_R16G16B16A16_UNORM,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
                         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        Flags: D3D12_RESOURCE_FLAG_NONE,
                         ..Default::default()
                     },
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                     None,
                     &mut isolated_texture,
                 )
@@ -4866,7 +4908,11 @@ mod present_plane_tests {
         let isolated_texture = isolated_texture.unwrap();
         let mut attempted = false;
         let failed = isolated.present_planes_with_compositor(
-            &[PresentPlane::Raw(&isolated_texture, state, None)],
+            &[PresentPlane::Raw(
+                &isolated_texture,
+                state,
+                Some(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB.0 as u32),
+            )],
             7,
             |_, _| {
                 attempted = true;
@@ -4879,22 +4925,28 @@ mod present_plane_tests {
         assert!(attempted);
         assert!(failed.0.is_none(), "failed compositor must not raw-copy mismatched texels");
 
+        let typeless = make(
+            DXGI_FORMAT_R16G16B16A16_TYPELESS,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        );
         let ambiguous = host.present_planes_with_compositor(
             &[PresentPlane::Raw(&typeless, state, None)],
             8,
-            |_, _| panic!("typeless primary without its actual view must be rejected"),
-            |_, _| panic!("ambiguous typeless primary must not be presented"),
+            |_, _| panic!("primary without typed view metadata must not be converted"),
+            |_, _| panic!("primary without typed view metadata must not be presented"),
         );
         assert!(ambiguous.0.is_none());
 
         let denied = make(
-            DXGI_FORMAT_R16G16B16A16_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
                 | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
         );
         let mut denied_attempted = false;
         let rejected = host.present_planes_with_compositor(
-            &[PresentPlane::Raw(&denied, state, None)],
+            &[PresentPlane::Raw(&denied, render_target_state, None)],
             9,
             |_, _| {
                 denied_attempted = true;
@@ -4910,11 +4962,13 @@ mod present_plane_tests {
         let direct_primary = make(
             DXGI_FORMAT_R8G8B8A8_UNORM,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
         );
         let denied_overlay = make(
             DXGI_FORMAT_R8G8B8A8_UNORM,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
                 | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
         );
         let setup = host.new_list().unwrap();
         // SAFETY: live render-target views on an open list.
@@ -4936,8 +4990,8 @@ mod present_plane_tests {
         let mut overlay_compositor_attempted = false;
         let direct = host.present_planes_with_compositor(
             &[
-                PresentPlane::Raw(&direct_primary, state, None),
-                PresentPlane::Raw(&denied_overlay, state, None),
+                PresentPlane::Raw(&direct_primary, render_target_state, None),
+                PresentPlane::Raw(&denied_overlay, render_target_state, None),
             ],
             10,
             |_, _| {
