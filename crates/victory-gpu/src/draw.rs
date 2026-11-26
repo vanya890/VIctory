@@ -4306,7 +4306,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Bind a typed RTV to a typeless resource and verify PresentX metadata
         // records the actual view format rather than the typeless GetDesc() format.
         crate::descriptor::create_rtv(null, typeless_rt, &typed_unorm_rtv, rtv_slot);
-        crate::object::slot::<SetTargets>(list, 0x190)(list, 1, &rtv_slot, 0, null);
+        crate::object::slot::<SetTargets>(list, 0x190)(list, 1, &rtv_slot, 0, std::ptr::null::<u64>());
         assert_eq!(
             crate::resource::view_format(typeless_rt),
             Some(11),
