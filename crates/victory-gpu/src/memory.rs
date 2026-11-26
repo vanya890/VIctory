@@ -1011,7 +1011,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         let warp_requested =
             std::env::var("VICTORY_D3D12_WARP").is_ok_and(|value| value != "0");
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
-            assert!(!warp_requested, "WARP was requested but the host device or view heap was unavailable");
+            assert!(
+                !warp_requested,
+                "WARP was requested but the host device or view heap was unavailable"
+            );
             return; // no host GPU here
         };
         if warp_requested {
