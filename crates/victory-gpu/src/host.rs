@@ -3450,15 +3450,15 @@ impl Host {
             // Serialize tracked state reads, barrier recording, and execution
             // with `Host::execute` so `p.copy` matches the live GPU state.
             let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-            let planes: Vec<(&ID3D12Resource, u32)> = planes
+            let primary_state = first.state();
+            let sampleable_states: Vec<(&ID3D12Resource, u32, DXGI_FORMAT)> = sampleable
                 .iter()
-                .map(|plane| (plane.texture(), plane.state()))
+                .map(|(plane, format)| (plane.texture(), plane.state(), *format))
                 .collect();
-            let primary_state = planes[0].1;
             p.copy.reset();
             let list = &p.copy.list;
-            let (capture, probe) = if planes.len() == 1 {
-                let (texture, state) = planes[0];
+            let (capture, probe) = if !use_compositor {
+                let (texture, state) = (primary, primary_state);
                 let state = D3D12_RESOURCE_STATES(state as i32);
                 let mut before = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
@@ -3470,7 +3470,21 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
                 list.ResourceBarrier(&before);
-                list.CopyResource(&back, texture);
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&back),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
                 #[cfg(all(test, feature = "diagnostics"))]
                 let capture = {
                     // Inspect what reached the swap chain, before Present.
@@ -3510,7 +3524,8 @@ impl Host {
                 list.ResourceBarrier(&after);
                 (capture, probe)
             } else {
-                let comp = p.compositor.as_ref().expect("compositor was prepared for multiple planes");
+                let comp = p.compositor.as_ref().expect("compositor was prepared for the primary conversion or multiple planes");
+                let planes = &sampleable_states;
                 let rtv = comp.rtv_heap.GetCPUDescriptorHandleForHeapStart();
                 self.device.CreateRenderTargetView(
                     &back,
@@ -3528,12 +3543,10 @@ impl Host {
                 );
                 let srv_cpu_base = comp.srv_heap.GetCPUDescriptorHandleForHeapStart();
                 let srv_gpu_base = comp.srv_heap.GetGPUDescriptorHandleForHeapStart();
-                let count = planes.len().min(MAX_PLANES as usize);
+                let count = planes.len();
                 let mut before = Vec::with_capacity(count + 1);
                 let mut after = Vec::with_capacity(count);
-                for (i, &(tex, state)) in planes[..count].iter().enumerate() {
-                    let d = tex.GetDesc();
-                    let srv_fmt = swap_format(d.Format).unwrap_or(d.Format);
+                for (i, &(tex, state, srv_fmt)) in planes.iter().enumerate() {
                     let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
                         ptr: srv_cpu_base.ptr + i * comp.srv_stride as usize,
                     };
@@ -3558,7 +3571,7 @@ impl Host {
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
                         && planes[..i]
                             .iter()
-                            .all(|(earlier, _)| earlier.as_raw() != tex.as_raw())
+                            .all(|(earlier, _, _)| earlier.as_raw() != tex.as_raw())
                     {
                         before.push(transition(
                             tex,
