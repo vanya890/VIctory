@@ -39,8 +39,16 @@ jobs:
           VICTORY_D3D12_WARP: "1"
           VICTORY_D3D12_DEBUG: "1"
         run: |
+          $single = cargo test -p victory-gpu --features diagnostics --lib draw::tests::a_write_into_one_page_uploads_its_rows_alone --locked -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (@($single | Select-String -SimpleMatch "draw::tests::a_write_into_one_page_uploads_its_rows_alone: test").Count -ne 1) { throw "Expected exactly one fully tracked row regression test" }
           cargo test -p victory-gpu --features diagnostics --lib draw::tests::a_write_into_one_page_uploads_its_rows_alone --locked -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $mixed = cargo test -p victory-gpu --features diagnostics --lib draw::tests::tracked_rows --locked -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (@($mixed | Select-String -SimpleMatch "draw::tests::tracked_rows::").Count -ne 2) { throw "Expected exactly two mixed/untracked row regression tests" }
           cargo test -p victory-gpu --features diagnostics --lib draw::tests::tracked_rows --locked -- --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
