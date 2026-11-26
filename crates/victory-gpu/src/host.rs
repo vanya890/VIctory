@@ -728,10 +728,6 @@ pub(crate) mod tests {
         assert!(preludes.free.is_empty() && preludes.flight.is_empty());
     }
 
-    /// Shaders that use title memory mark their reads in their own bitmap:
-    /// read marks of both bitmaps are taken, each slot once until it is
-    /// forgotten, and a forgotten slot's next read is taken again.
-
     /// A list named twice by one submission gets a separate prelude pair for
     /// each use: resetting the first pair before it runs would lose its moves.
     #[test]
@@ -799,6 +795,10 @@ pub(crate) mod tests {
         assert_eq!(preludes.free.len(), 2);
         assert!(preludes.flight.is_empty());
     }
+
+    /// Shaders that use title memory mark their reads in their own bitmap:
+    /// read marks of both bitmaps are taken, each slot once until it is
+    /// forgotten, and a forgotten slot's next read is taken again.
 
     #[test]
     fn read_marks_of_both_bitmaps_are_taken() {
