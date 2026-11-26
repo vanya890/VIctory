@@ -3341,10 +3341,29 @@ impl Host {
         let fallback_state = || first.state();
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
-        let Some(format) = swap_format(primary_desc.Format) else {
-            tracing::warn!(format = primary_desc.Format.0, "cannot present this format");
+        let primary_format = first.view_format().unwrap_or(primary_desc.Format);
+        let Some(format) = swap_format(primary_format) else {
+            tracing::warn!(format = primary_format.0, "cannot present this format");
             return (None, fallback_state());
         };
+        let conversion_required = needs_format_conversion(primary_format, format);
+        let sampleable: Vec<_> = planes
+            .iter()
+            .take(MAX_PLANES as usize)
+            .filter_map(|plane| plane.srv_format().map(|srv| (plane, srv)))
+            .collect();
+        let primary_sampleable = sampleable
+            .first()
+            .is_some_and(|(plane, _)| plane.texture().as_raw() == primary.as_raw());
+        if conversion_required && !primary_sampleable {
+            tracing::warn!(
+                format = primary_format.0,
+                "cannot convert a primary plane that has no legal shader-resource view"
+            );
+            return (None, fallback_state());
+        }
+        let mut use_compositor = primary_sampleable
+            && (conversion_required || sampleable.len() > 1);
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let Presentation { presenter, retry } = &mut *presentation;
         if presenter.is_none() && !retry.ready(Instant::now()) {
@@ -3355,26 +3374,31 @@ impl Host {
             .and_then(|p| p.compositor.as_ref())
             .map(|c| c.format);
         let mut new_compositor = None;
-        let planes = if planes.len() > 1 && cached_format != Some(format) {
+        if use_compositor && cached_format != Some(format) {
             match create_compositor(&self.device, format) {
-                Ok(c) => {
-                    new_compositor = Some(c);
-                    planes
+                Ok(c) => new_compositor = Some(c),
+                Err(e) if conversion_required => {
+                    tracing::warn!(
+                        error = %e,
+                        format = format.0,
+                        "cannot present a primary plane that requires format conversion"
+                    );
+                    return (None, fallback_state());
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "presenting the primary plane after compositor initialization failed");
-                    &planes[..1]
+                    use_compositor = false;
                 }
             }
-        } else {
-            planes
-        };
+        }
         let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
-        for plane in &planes[1..] {
-            // SAFETY: live resource.
-            let d = unsafe { plane.texture().GetDesc() };
-            width = width.max(d.Width as u32);
-            height = height.max(d.Height);
+        if use_compositor {
+            for (plane, _) in &sampleable[1..] {
+                // SAFETY: each sampleable plane holds a live host resource.
+                let d = unsafe { plane.texture().GetDesc() };
+                width = width.max(d.Width as u32);
+                height = height.max(d.Height);
+            }
         }
         if presenter.is_none() {
             *presenter = match retry
