@@ -644,9 +644,7 @@ impl<'a> Lanes<'a> {
         // lookahead only fills restore cases it can prove locally (notably
         // M0-relative reads) and must not overwrite a stronger existing fact.
         for (&result, &scalar) in &p.restored {
-            if !l.restored.contains_key(&result) {
-                l.restored.insert(result, scalar);
-            }
+            l.restored.entry(result).or_insert(scalar);
         }
         Ok(l)
     }
