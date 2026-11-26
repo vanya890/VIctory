@@ -33,5 +33,12 @@ jobs:
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes xtask's repository_passes_policy, the asset-policy check.
+      # Run GPU regressions before the full workspace suite so unrelated
+      # flaky tests cannot suppress the explicit WARP validation.
+      - name: D3D12 WARP copy-back regressions
+        run: cargo test -p victory-gpu --features diagnostics --lib --locked host::withholding -- --nocapture
+        env:
+          VICTORY_D3D12_WARP: "1"
+          VICTORY_D3D12_DEBUG: "1"
       - name: Tests
         run: cargo test --workspace --locked

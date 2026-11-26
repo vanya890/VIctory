@@ -282,6 +282,17 @@ impl Shadow {
         Some((base + u32::try_from(page).ok()?, (start & 0xFFFF) as u32))
     }
 
+    /// Marks a page in the written-pages bitmap, as a shader write does (tests).
+    #[cfg(test)]
+    pub(crate) fn mark_page_for_test(&self, page: usize, memory: bool) {
+        let (bit, _) = self
+            .mark_entry(page as u64)
+            .expect("tracked copy with mark bits");
+        let b = bitmap(memory).expect("written-pages bitmap");
+        // SAFETY: bit is a valid mark bit inside the mapped bitmap.
+        unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
+
     /// Whether writes through views of this copy are marked.
     pub(crate) fn marked(&self) -> bool {
         self.marks.is_some()
@@ -948,15 +959,18 @@ pub(crate) fn take_forgotten(slot: u32) -> bool {
 }
 
 /// After a submission: every page its shaders marked as written through
-/// views goes back ([`Shadow::copy_back_marked`]), but for pages in
-/// `withheld` (ranges of copies that lists whose writes stay out of title
-/// memory declared) and, with `memory_withheld`, pages that shaders using
-/// title memory marked; the bitmaps are cleared. Before the copy-backs of
-/// declared ranges, which disarm the copies.
-// shortcut: marks do not tell lists apart: a page that a withheld list and
-// another both wrote through views goes back unless the withheld list
-// declared it.
-pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
+/// views goes back (Shadow::copy_back_marked), except pages withheld by
+/// the submission. Held pages are returned to the caller so it can retake
+/// them only after all declared copy-backs have finished.
+///
+/// A held page must not be copied back from the same copy's ordinary bitmap:
+/// it contains withheld shader bytes. The caller must drop the returned pages
+/// after ordinary Shadow::copy_back ranges too, because retaking a shared
+/// physical page marks every holder dirty.
+pub(crate) fn copy_back_marks(
+    withheld: &[(Arc<Shadow>, usize, usize)],
+    memory_withheld: bool,
+) -> Vec<(Arc<Shadow>, usize)> {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
         let Some(b) = bitmap(memory) else {
@@ -982,6 +996,8 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
     marked.sort_unstable();
     marked.dedup();
+    held.sort_unstable();
+    held.dedup();
     let page_of = |m: &Marks, n: u32| {
         let (&base, copy) = m.owners.range(..=n).next_back()?;
         let copy = copy.upgrade()?;
@@ -991,21 +1007,21 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             (copy, page)
         })
     };
-    // Held back: dropped from the copies (`crate::memory::drop_withheld`).
-    if !held.is_empty() {
+    let (held_pages, pages): (Vec<_>, Vec<_>) = {
         let m = marks();
-        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
-            crate::memory::drop_withheld(page, PAGE);
-        }
-    }
-    if marked.is_empty() {
-        return;
-    }
-    let pages: Vec<(Arc<Shadow>, usize)> = {
-        let m = marks();
-        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
+        let held_pages = held.iter().filter_map(|&n| page_of(&m, n)).collect();
+        let pages = marked
+            .iter()
+            .filter_map(|&n| page_of(&m, n).map(|(copy, page)| (n, copy, page)))
+            .collect();
+        (held_pages, pages)
     };
-    for (copy, page) in pages {
+    for (bit, copy, page) in pages {
+        // The same copy/page can be marked in both bitmaps. Its bytes are
+        // withheld, so do not copy them back before the caller retakes it.
+        if held.binary_search(&bit).is_ok() {
+            continue;
+        }
         if withheld
             .iter()
             .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
@@ -1021,6 +1037,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
     }
+    held_pages
 }
 
 struct Entry {
