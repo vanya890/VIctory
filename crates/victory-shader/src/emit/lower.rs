@@ -6635,10 +6635,16 @@ impl<'a> Lower<'a> {
                         Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                         _ => None,
                     };
-                    let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
-                        .ok_or("a carry-in from an untracked mask")?;
-                    Some(self.boolean(m, c)?)
+                    // A carry or compare already lowered keeps its lanes as a
+                    // predicate, not a structured mask.
+                    let m = m.ok_or("a carry-in from an untracked mask")?;
+                    let mask = self.x.st.masks.get(&m).copied();
+                    let bit = self.lane_bits.get(&m).copied();
+                    match (mask, bit) {
+                        (Some(mask), _) => Some(self.boolean(mask, c)?),
+                        (None, Some(bit)) => Some(bit),
+                        (None, None) => return Err("a carry-in from an untracked mask"),
+                    }
                 } else {
                     None
                 };
@@ -11091,14 +11097,20 @@ mod tests {
 
     #[test]
     fn a_carry_predicate_is_materialized_when_read_as_a_mask_dword() {
-        let carry = [
-            0xD400_0000 | 0x30F << 16 | 106 << 8 | 5,
-            258 << 9 | 257,
-        ];
-        let select = [0xD400_0000 | 0x101 << 16 | 7, 106 << 18 | 1 << 9];
-        let lowered = lower_valu(&[carry[0], carry[1], select[0], select[1]])
-            .expect("a carry lane predicate read as a scalar mask");
+        // v_add_co_u32 v1, vcc, v2, v3; s_add_u32 s0, s0, vcc
+        let carry = [0xD400_0000 | 0x30F << 16 | 106 << 8 | 1, 3 << 9 | 2];
+        let read = 0x8000_0000 | 106 << 8;
+        let lowered = lower_valu(&[carry[0], carry[1], read])
+            .expect("a carry lane predicate read as scalar data");
         assert!(lowered.wave_ops);
+    }
+
+    #[test]
+    fn a_carry_in_reads_a_carry_that_was_never_a_structured_mask() {
+        // v_add_co_u32 v1, vcc, v2, v3; v_add_co_ci_u32 v0, vcc, s2, v3, vcc
+        let carry = [0xD400_0000 | 0x30F << 16 | 106 << 8 | 1, 3 << 9 | 2];
+        let chained = 0x28 << 25 | 3 << 9 | 2;
+        lower_valu(&[carry[0], carry[1], chained]).expect("a carry-in from an earlier carry");
     }
 
     #[test]
