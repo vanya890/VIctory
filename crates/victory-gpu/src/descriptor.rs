@@ -158,6 +158,59 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Mirrors a contiguous descriptor copy with one heap lookup and pending lock.
+#[cfg(windows)]
+fn mirror_copy(dst: u64, count: u32, kind: u32, step: u64) {
+    let Some(bytes) = u64::from(count).checked_mul(step) else { return };
+    let Some(end) = dst.checked_add(bytes) else { return };
+    #[cfg(feature = "diagnostics")]
+    let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    drop(waited);
+    let Some(&(start, limit, at)) = heaps.iter().find(|&&(start, limit, _)| dst < limit && start < end) else {
+        return;
+    };
+    // SAFETY: registered heaps stay alive while the registry is locked.
+    let heap = unsafe { &*(at as *const Heap) };
+    if dst >= start
+        && end <= limit
+        && kind == heap.desc.kind
+        && (dst - start).is_multiple_of(step)
+    {
+        let first = ((dst - start) / step) as u32;
+        let Some(last) = first.checked_add(count) else { return };
+        if last > heap.desc.count { return; }
+        let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match heap.host.get() {
+            None => pending.extend(first..last),
+            Some(host) => {
+                drop(pending);
+                if let Some(host) = host {
+                    const BATCH: u32 = 256;
+                    for from in (first..last).step_by(BATCH as usize) {
+                        let to = from.saturating_add(BATCH).min(last);
+                        if to - from < 8 {
+                            for i in from..to {
+                                host.mirror(i, start + u64::from(i) * step, false);
+                            }
+                        } else {
+                            host.sync_slots(from, to, start, step);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    // Keep the original semantics for cross-heap, misaligned, and mismatched-kind ranges.
+    drop(heaps);
+    for i in 0..count {
+        mirror(dst + u64::from(i) * step);
+    }
+}
+
+
 /// Mirrors what the title wrote into its shader-visible heaps without a
 /// call: Grand Theft Auto VI copies descriptors (our records) into its heap
 /// as bytes, so only a change of its memory shows them. Each slot of a page
@@ -748,15 +801,17 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let Some(step) = increment(kind).map(u64::from) else {
         return;
     };
-    let len = u64::from(count) * step;
-    if dst != 0 && src != 0 {
-        // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
-        #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+    if count == 0 || dst == 0 || src == 0 {
+        return;
     }
+    let Some(len) = u64::from(count).checked_mul(step) else { return };
+    if dst != src {
+        // SAFETY: both ranges are descriptor slots the title owns and may overlap.
+        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+    }
+    // Self-copy still mirrors: it can expose records written directly as bytes.
+    #[cfg(windows)]
+    mirror_copy(dst, count, kind, step);
 }
 
 /// Device method: ranges of descriptors (start and count each) gathered
