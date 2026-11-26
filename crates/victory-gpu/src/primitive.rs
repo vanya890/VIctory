@@ -36,7 +36,9 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
                 let (n, kind) = components(format)?;
                 let float = matches!(kind, Kind::F32 | Kind::F16);
                 (float && n >= 2 && stride.saturating_sub(at) / kind.bytes() >= 2).then(|| {
-                    victory_shader::emit::right_angle([0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k))))
+                    victory_shader::emit::right_angle(
+                        [0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k))),
+                    )
                 })
             })
             .unwrap_or(1);
@@ -227,9 +229,14 @@ mod tests {
         let src = [vertex(0.0, 0.0), vertex(0.0, 1.0), vertex(1.0, 0.0)].concat();
         let mut dst = vec![0u8; 6 * 8];
         expand_rects(&src, &mut dst, 8, &[(0, 16)]);
-        assert_eq!(dst[24..], [&src[16..24], &src[8..16], &vertex(1.0, 1.0)[..]].concat()[..]);
+        assert_eq!(
+            dst[24..],
+            [&src[16..24], &src[8..16], &vertex(1.0, 1.0)[..]].concat()[..]
+        );
         let read = |d: &[u8], i: usize| {
-            let f = |k: usize| f32::from_le_bytes(d[i * 8 + k * 4..i * 8 + k * 4 + 4].try_into().unwrap());
+            let f = |k: usize| {
+                f32::from_le_bytes(d[i * 8 + k * 4..i * 8 + k * 4 + 4].try_into().unwrap())
+            };
             [f(0), f(1)]
         };
         let turn = |d: &[u8], i: usize| {

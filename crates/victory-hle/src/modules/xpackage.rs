@@ -328,8 +328,13 @@ mod tests {
 
     #[test]
     fn completed_installation_unregisters_progress_immediately() {
-        type Register =
-            extern "system" fn(This, *const c_void, *mut c_void, *const c_void, *mut u64) -> HRESULT;
+        type Register = extern "system" fn(
+            This,
+            *const c_void,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
         type Unregister = extern "system" fn(This, *const c_void, u64, bool) -> bool;
         extern "system" fn callback(_: *mut c_void, _: *const c_void) {}
 

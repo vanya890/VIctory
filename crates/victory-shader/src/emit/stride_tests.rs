@@ -320,7 +320,11 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         32,
     );
     let texel = [[1.0f32, 2.0, 3.0, 4.0]];
-    let views = [View::RawUav(32), View::Texture(1, 1, &texel), View::NullBuffers];
+    let views = [
+        View::RawUav(32),
+        View::Texture(1, 1, &texel),
+        View::NullBuffers,
+    ];
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -340,7 +344,16 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         }
         let dispatch = Dispatch {
             // Heap index 1 holds no buffer view: stride 0.
-            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0] })],
+            roots: vec![
+                (0, Root::Constants(ud)),
+                (
+                    1,
+                    Root::View {
+                        srv: true,
+                        data: vec![4, 0],
+                    },
+                ),
+            ],
             views: &views,
             samplers: &[],
             groups: [1, 1, 1],
@@ -368,7 +381,10 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
         vec![entry(ResourceType::Uav, 4, 2)],
         32,
     );
-    assert!(shader.heap && !shader.heap_writes, "reads the heap itself, writes through a table");
+    assert!(
+        shader.heap && !shader.heap_writes,
+        "reads the heap itself, writes through a table"
+    );
     assert_eq!(shader.root_srvs, [VIEW_STRIDES], "the guard's stride table");
     let data: Vec<u32> = vec![7, 8, 9, 10];
     let views = [
@@ -406,7 +422,16 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
                 &Dispatch {
                     // User data, then the stride table: heap index 1 holds a
                     // buffer view.
-                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 4] })],
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: vec![4, 4],
+                            },
+                        ),
+                    ],
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],
@@ -426,12 +451,17 @@ fn a_half_buffer_load_reads_the_half_at_its_address() {
     let shader = build(
         HALF_LOAD_WAVE32,
         vec![param(RootType::Table, 0), param(RootType::Table, 2)],
-        vec![entry(ResourceType::Srv, 4, 0), entry(ResourceType::Uav, 4, 2)],
+        vec![
+            entry(ResourceType::Srv, 4, 0),
+            entry(ResourceType::Uav, 4, 2),
+        ],
         32,
     );
     // 32 halves 0x8000 + 3 × lane, two per dword (low half first).
     let half = |l: u32| 0x8000 + 3 * l;
-    let data: Vec<u32> = (0..16).map(|k| half(2 * k) | half(2 * k + 1) << 16).collect();
+    let data: Vec<u32> = (0..16)
+        .map(|k| half(2 * k) | half(2 * k + 1) << 16)
+        .collect();
     let views = [
         View::Buffer {
             data: &data,
@@ -638,7 +668,11 @@ const D16_X_LOAD_WAVE32: &[u32] = &[
 /// Runs `shader` (user data: tables at heap indices 0, 1, 2 in order) on
 /// hardware and WARP with `views` and the view-stride table `strides`;
 /// each adapter's UAV contents.
-fn run_tables(shader: &HostShader, views: &[View], strides: Vec<u32>) -> Vec<(&'static str, Vec<Vec<u32>>)> {
+fn run_tables(
+    shader: &HostShader,
+    views: &[View],
+    strides: Vec<u32>,
+) -> Vec<(&'static str, Vec<Vec<u32>>)> {
     assert_eq!(shader.root_srvs, [VIEW_STRIDES]);
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -662,7 +696,16 @@ fn run_tables(shader: &HostShader, views: &[View], strides: Vec<u32>) -> Vec<(&'
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: strides.clone() })],
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: strides.clone(),
+                            },
+                        ),
+                    ],
                     views,
                     samplers: &[],
                     groups: [1, 1, 1],
@@ -671,7 +714,10 @@ fn run_tables(shader: &HostShader, views: &[View], strides: Vec<u32>) -> Vec<(&'
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         out.push((label, words));
     }
-    assert!(!out.is_empty(), "neither hardware nor WARP SM 6.6 device available");
+    assert!(
+        !out.is_empty(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
     out
 }
 
@@ -698,10 +744,20 @@ fn d16_typed_buffer_accesses_pass_bits_through_integer_views() {
     // Lane l: negative zero and small, signalling NaN, denormal and
     // all-ones patterns as bits; normal halves for the float view.
     let bits: Vec<u32> = (0..32u32)
-        .flat_map(|l| [(0x8000 | l) | (0x7C01 + l) << 16, (1 + l) | (0xFFFF - l) << 16])
+        .flat_map(|l| {
+            [
+                (0x8000 | l) | (0x7C01 + l) << 16,
+                (1 + l) | (0xFFFF - l) << 16,
+            ]
+        })
         .collect();
     let halves: Vec<u32> = (0..32u32)
-        .flat_map(|l| [(0x3C00 + l) | (0xC000 + 3 * l) << 16, (0x1400 + l) | (0x5BFF - l) << 16])
+        .flat_map(|l| {
+            [
+                (0x3C00 + l) | (0xC000 + 3 * l) << 16,
+                (0x1400 + l) | (0x5BFF - l) << 16,
+            ]
+        })
         .collect();
     let cases: [(DXGI_FORMAT, u32, &[u32]); 2] = [
         (DXGI_FORMAT_R16G16B16A16_UINT, 8 | VIEW_INTEGER, &bits),
@@ -710,7 +766,10 @@ fn d16_typed_buffer_accesses_pass_bits_through_integer_views() {
     for (format, stride, data) in cases {
         let views = [
             View::TypedUav(format, 32, 8),
-            View::Buffer { data, stride: Stride::Raw },
+            View::Buffer {
+                data,
+                stride: Stride::Raw,
+            },
             View::RawUav(64),
         ];
         for (label, words) in run_tables(&shader, &views, vec![stride, 4, 4]) {
@@ -727,18 +786,39 @@ fn d16_x_loads_read_r16_uint_and_r16_float_views() {
     let shader = build(
         D16_X_LOAD_WAVE32,
         vec![param(RootType::Table, 0), param(RootType::Table, 1)],
-        vec![entry(ResourceType::Srv, 4, 0), entry(ResourceType::Uav, 4, 1)],
+        vec![
+            entry(ResourceType::Srv, 4, 0),
+            entry(ResourceType::Uav, 4, 1),
+        ],
         32,
     );
-    let pack = |h: &dyn Fn(u32) -> u32| -> Vec<u32> { (0..16u32).map(|k| h(2 * k) | h(2 * k + 1) << 16).collect() };
+    let pack = |h: &dyn Fn(u32) -> u32| -> Vec<u32> {
+        (0..16u32).map(|k| h(2 * k) | h(2 * k + 1) << 16).collect()
+    };
     let uint = |l: u32| 0xF000 | l;
     let half = |l: u32| 0x3C00 + 5 * l;
     let cases: [(DXGI_FORMAT, u32, Vec<u32>, Vec<u32>); 2] = [
-        (DXGI_FORMAT_R16_UINT, 2 | VIEW_INTEGER, pack(&uint), (0..32).map(uint).collect()),
-        (DXGI_FORMAT_R16_FLOAT, 2, pack(&half), (0..32).map(half).collect()),
+        (
+            DXGI_FORMAT_R16_UINT,
+            2 | VIEW_INTEGER,
+            pack(&uint),
+            (0..32).map(uint).collect(),
+        ),
+        (
+            DXGI_FORMAT_R16_FLOAT,
+            2,
+            pack(&half),
+            (0..32).map(half).collect(),
+        ),
     ];
     for (format, stride, data, want) in cases {
-        let views = [View::Buffer { data: &data, stride: Stride::Format(format, 2) }, View::RawUav(32)];
+        let views = [
+            View::Buffer {
+                data: &data,
+                stride: Stride::Format(format, 2),
+            },
+            View::RawUav(32),
+        ];
         for (label, words) in run_tables(&shader, &views, vec![stride, 4]) {
             assert_eq!(words[0], want, "{label} {format:?}");
         }

@@ -151,7 +151,10 @@ fn library() -> Option<&'static Shared> {
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
-            library.map(|l| Shared { loads: l.library.clone(), state: Mutex::new(l) })
+            library.map(|l| Shared {
+                loads: l.library.clone(),
+                state: Mutex::new(l),
+            })
         })
         .as_ref()
 }
@@ -162,7 +165,9 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            device
+                .CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?
+                .cast()
         }
     };
     if !blob.is_empty() {
@@ -179,7 +184,9 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
                     prebuilt_changed: false,
                 });
             }
-            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+            Err(e) => {
+                tracing::info!(error = %e, "host pipeline library rejected; starting an empty one")
+            }
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
@@ -218,7 +225,10 @@ fn tag(blob: &[u8]) -> String {
 /// The pre-build's list as saved: the tag it holds for, then its keys.
 fn list(tag: &str, keys: &HashSet<String>) -> String {
     let keys = keys.iter().map(String::as_str);
-    std::iter::once(tag).chain(keys).collect::<Vec<_>>().join("\n")
+    std::iter::once(tag)
+        .chain(keys)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The keys of a saved list, if it holds for `tag` (else none).
@@ -233,7 +243,13 @@ fn listed(list: &[u8], tag: &str) -> HashSet<String> {
 
 /// Whether the pre-build has the title pipeline `key` in the library.
 pub(crate) fn prebuilt(key: &str) -> bool {
-    library().is_some_and(|l| l.state.lock().unwrap_or_else(|e| e.into_inner()).prebuilt.contains(key))
+    library().is_some_and(|l| {
+        l.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prebuilt
+            .contains(key)
+    })
 }
 
 /// The pre-build has the title pipeline `key` in the library now.
@@ -248,7 +264,11 @@ pub(crate) fn note_prebuilt(key: String) {
 /// description holds.
 pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> String {
     let mut h = blake3::Hasher::new();
-    for part in [kind.as_bytes(), root].into_iter().chain(code.iter().copied()).chain([state.as_bytes()]) {
+    for part in [kind.as_bytes(), root]
+        .into_iter()
+        .chain(code.iter().copied())
+        .chain([state.as_bytes()])
+    {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
@@ -306,7 +326,9 @@ thread_local! {
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let (Some(dir), Some(library)) = (DIR.get(), library()) else {
+        return;
+    };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -323,7 +345,10 @@ pub(crate) fn save(now: bool) {
         let size = unsafe { l.library.GetSerializedSize() };
         let Some(mut bytes) = zeroed(size) else {
             // Left for a later save: the pipelines stay counted as added.
-            tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
+            tracing::warn!(
+                bytes = size,
+                "no memory to serialise the host pipeline library; saved later"
+            );
             return;
         };
         // SAFETY: a buffer of the size the library asks for.
@@ -407,7 +432,10 @@ static CREATED: Mutex<(u64, Option<HashSet<String>>)> = Mutex::new((0, None));
 pub(crate) fn note_created(key: &str) {
     let mut created = CREATED.lock().unwrap_or_else(|e| e.into_inner());
     created.0 += 1;
-    created.1.get_or_insert_with(HashSet::new).insert(key.to_owned());
+    created
+        .1
+        .get_or_insert_with(HashSet::new)
+        .insert(key.to_owned());
 }
 
 /// Title pipelines created so far, and how many distinct ones.
@@ -434,16 +462,28 @@ impl Used {
         for (place, key) in listed.lines().filter(|l| !l.is_empty()).enumerate() {
             before.entry(key.to_owned()).or_insert(place);
         }
-        Used { before, now: HashSet::new() }
+        Used {
+            before,
+            now: HashSet::new(),
+        }
     }
 
     /// The list to keep: this run's keys, then earlier runs' others, most
     /// recent first, at most `EARLY_MAX` (the oldest go once it is full).
     fn list(&self) -> Vec<String> {
-        let mut earlier: Vec<_> = self.before.iter().filter(|(k, _)| !self.now.contains(*k)).collect();
+        let mut earlier: Vec<_> = self
+            .before
+            .iter()
+            .filter(|(k, _)| !self.now.contains(*k))
+            .collect();
         earlier.sort_unstable_by_key(|&(_, &place)| place);
         let earlier = earlier.into_iter().map(|(k, _)| k);
-        self.now.iter().chain(earlier).take(EARLY_MAX).cloned().collect()
+        self.now
+            .iter()
+            .chain(earlier)
+            .take(EARLY_MAX)
+            .cloned()
+            .collect()
     }
 }
 
@@ -458,7 +498,10 @@ fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
         let read = Used::read(&listed);
-        tracing::info!(pipelines = read.before.len(), "title pipelines to start early");
+        tracing::info!(
+            pipelines = read.before.len(),
+            "title pipelines to start early"
+        );
         *used = Some(read);
     }
     used
@@ -477,7 +520,11 @@ pub(crate) fn wanted_early(key: &str) -> bool {
 
 /// The title pipeline with `key` was drawn or dispatched with.
 pub(crate) fn note_used(key: &str) {
-    if used().get_or_insert_with(Used::default).now.insert(key.to_owned()) {
+    if used()
+        .get_or_insert_with(Used::default)
+        .now
+        .insert(key.to_owned())
+    {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -508,13 +555,25 @@ mod tests {
     /// This run's keys stay in the list; earlier runs' fill it up to the cap.
     #[test]
     fn the_early_list_keeps_this_run_first() {
-        let keys = |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<HashSet<_>>();
-        let before = keys(0..EARLY_MAX).into_iter().enumerate().map(|(i, k)| (k, i)).collect();
-        let used = Used { before, now: keys(EARLY_MAX - 10..EARLY_MAX + 10) };
+        let keys =
+            |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<HashSet<_>>();
+        let before = keys(0..EARLY_MAX)
+            .into_iter()
+            .enumerate()
+            .map(|(i, k)| (k, i))
+            .collect();
+        let used = Used {
+            before,
+            now: keys(EARLY_MAX - 10..EARLY_MAX + 10),
+        };
         let list = used.list();
         assert_eq!(list.len(), EARLY_MAX);
         assert!(used.now.iter().all(|k| list.contains(k)));
-        assert_eq!(list.iter().collect::<HashSet<_>>().len(), EARLY_MAX, "no key twice");
+        assert_eq!(
+            list.iter().collect::<HashSet<_>>().len(),
+            EARLY_MAX,
+            "no key twice"
+        );
     }
 
     /// A full list makes room by the oldest runs' keys, and keeps that
@@ -808,10 +867,12 @@ mod tests {
 
     #[test]
     fn a_rejected_blob_gives_an_empty_library() {
-        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
+        else {
             return; // no host GPU here
         };
-        let library = open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
+        let library =
+            open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());

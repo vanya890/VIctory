@@ -195,7 +195,9 @@ pub(crate) fn presented() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log() {
     let [waits, at_once, shared] = [0, 1, 2].map(|i| WAITS[i].swap(0, Ordering::Relaxed));
-    tracing::info!("frame waits: {waits}, {at_once} of them ended at once; presents sharing a flip tick: {shared}");
+    tracing::info!(
+        "frame waits: {waits}, {at_once} of them ended at once; presents sharing a flip tick: {shared}"
+    );
 }
 
 /// Device method: no statistics are kept, so none are returned.
@@ -267,11 +269,21 @@ mod tests {
         // once, on the latest tick passed; the next one waits for the next.
         std::thread::sleep(Duration::from_millis(110));
         let before = Instant::now();
-        assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
-        assert!(before.elapsed() < Duration::from_millis(10), "{:?}", before.elapsed());
+        assert_eq!(
+            wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+            S_OK
+        );
+        assert!(
+            before.elapsed() < Duration::from_millis(10),
+            "{:?}",
+            before.elapsed()
+        );
         let late = LAST[2].load(Ordering::Relaxed);
         assert!(late >= flips[3] + 2, "{late} after {}", flips[3]);
-        assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
+        assert_eq!(
+            wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+            S_OK
+        );
         assert_eq!(LAST[2].load(Ordering::Relaxed), late + 1);
     }
 

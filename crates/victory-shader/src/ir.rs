@@ -329,17 +329,19 @@ fn contains(set: &RegSet, reg: Reg) -> bool {
 /// In [`Reg`] order, which is also index order.
 fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
     let (mut word, mut bits) = (0, set[0]);
-    std::iter::from_fn(move || loop {
-        if bits != 0 {
-            let b = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            return Some(reg_at(word * 64 + b));
+    std::iter::from_fn(move || {
+        loop {
+            if bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                return Some(reg_at(word * 64 + b));
+            }
+            word += 1;
+            if word >= set.len() {
+                return None;
+            }
+            bits = set[word];
         }
-        word += 1;
-        if word >= set.len() {
-            return None;
-        }
-        bits = set[word];
     })
 }
 
@@ -832,7 +834,8 @@ fn effects(
             // (and below the proven bound).
             let indexed = |op: &Operand, out: &mut Vec<(Reg, Value)>| match *op {
                 Operand::Vector { reg, .. } if u16::from(reg) < vgprs => {
-                    let end = m0_max.map_or(vgprs, |m| vgprs.min(u16::from(reg) + u16::from(m) + 1));
+                    let end =
+                        m0_max.map_or(vgprs, |m| vgprs.min(u16::from(reg) + u16::from(m) + 1));
                     out.extend((u16::from(reg)..end).map(|r| (Reg::V(r as u8), NONE)));
                     Ok(())
                 }

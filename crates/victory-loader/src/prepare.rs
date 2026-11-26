@@ -142,7 +142,9 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     // `bytes` anyway; the clamp only keeps the bound honest.
     let (mut at, end) = (
         start as usize,
-        (start as usize).saturating_add(size as usize).min(bytes.len()),
+        (start as usize)
+            .saturating_add(size as usize)
+            .min(bytes.len()),
     );
     while at + 8 <= end {
         let (Some(page), Some(block)) =
@@ -310,7 +312,10 @@ mod tests {
         let mut bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         let info = ImageInfo::parse(&bytes).unwrap();
         let section = info.sections.first().expect("test image has a section");
-        assert!(section.file_size >= 12, "first section holds the synthetic block");
+        assert!(
+            section.file_size >= 12,
+            "first section holds the synthetic block"
+        );
 
         // Point BASERELOC at a synthetic block inside a file-backed section.
         // This exercises the complete directory/block/entry walk without

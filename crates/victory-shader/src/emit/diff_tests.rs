@@ -1491,7 +1491,11 @@ fn translated_compute_matches_pc() {
                 super::host::view_strides(&views)
             } else {
                 assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
-                if srv { root_srv.clone() } else { root_cbv.clone() }
+                if srv {
+                    root_srv.clone()
+                } else {
+                    root_cbv.clone()
+                }
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }

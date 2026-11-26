@@ -1,7 +1,7 @@
 //! Recognise the console compiler's SCC-producing resource waterfall loop.
 
 use super::Lower;
-use crate::ir::{Exit, Inst, Reg, EXEC};
+use crate::ir::{EXEC, Exit, Inst, Reg};
 
 impl Lower<'_> {
     /// Whether `inst` is the `s_andn2_wrexec` of the console compiler's
