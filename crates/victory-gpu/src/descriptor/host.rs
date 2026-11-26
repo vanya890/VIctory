@@ -2724,10 +2724,18 @@ mod tests {
     #[test]
     fn depth_twin_uav_ranges_fall_back_to_null_before_d3d12_creation() {
         let Some(host_gpu) = host() else {
+            assert!(
+                std::env::var_os("VICTORY_D3D12_WARP").is_none(),
+                "VICTORY_D3D12_WARP=1 was requested, but no D3D12 WARP device could be created"
+            );
             eprintln!("SKIP: no host D3D12 device; depth-twin integration path not exercised");
             return;
         };
         let Some(heap) = HostHeap::new(false, 8) else {
+            assert!(
+                std::env::var_os("VICTORY_D3D12_WARP").is_none(),
+                "VICTORY_D3D12_WARP=1 was requested, but the D3D12 descriptor heap could not be created"
+            );
             eprintln!("SKIP: could not create the host descriptor heap");
             return;
         };
