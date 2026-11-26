@@ -71,7 +71,7 @@ mod submission_completion_tests {
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
 
     use windows::Win32::Foundation::{
-        E_FAIL, ERROR_INVALID_HANDLE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        E_FAIL, ERROR_INVALID_HANDLE, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
     use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
@@ -1626,7 +1626,7 @@ impl Host {
                     || self.fence.SetEventOnCompletion(*submitted, self.event),
                     || WaitForSingleObject(self.event, INFINITE),
                     *submitted,
-                    || unsafe { self.fence.GetCompletedValue() },
+                    || self.fence.GetCompletedValue(),
                 )
             };
             if let Err(error) = completion {
