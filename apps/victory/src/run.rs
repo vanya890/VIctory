@@ -62,7 +62,7 @@ pub fn run(
     // when the host's FidelityFX serves.
     victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
     let prepared = victory_loader::prepare(
-        &std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?,
+        &std::fs::read(&exe).with_context(|| format!("reading {}", exe.display()))?,
     )?;
     let hash = prepared.original_hash.to_hex();
     let title_dir = exe.parent().unwrap_or(Path::new("."));
