@@ -1214,7 +1214,12 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
-        let rtv = host.rtv(&texture, record.desc().as_ref());
+        let desc = record.desc();
+        crate::resource::record_rtv_view_format(
+            record.resource,
+            desc.as_ref().map(|view| view.Format.0 as u32),
+        );
+        let rtv = host.rtv(&texture, desc.as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
