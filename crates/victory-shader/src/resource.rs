@@ -2089,7 +2089,7 @@ impl Tracer<'_> {
         let name = inst.name();
         if matches!(
             name,
-            "v_readlane_b32" | "v_movrels_b32" | "v_movreld_b32" | "v_swaprel_b32"
+            "v_readlane_b32" | "v_movrels_b32"
         ) && let Some((_, result)) = inst.writes.first()
             && let Some(&scalar) = self.restored.get(result)
         {
