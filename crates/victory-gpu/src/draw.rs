@@ -2099,6 +2099,8 @@ const QUAD_STRIP: u32 = 20;
 
 #[cfg(test)]
 mod tests {
+    mod tracked_rows;
+
     use super::*;
 
     /// A root signature that indexes the heaps directly needs one of each

@@ -10,7 +10,12 @@
 //! same physical pages) in the runtime's memory; elsewhere, a content hash
 //! of the whole memory at every submission that samples it.
 //!
-//! shortcut: a change detiles the whole texture, not the pages written.
+//! Tracked changes detile and copy only the rows reached by changed pages
+//! when a subresource is fully covered by tracked memory. Shared pages and
+//! untracked memory keep the whole-subresource hash path.
+//!
+//! shortcut: a change to wholly untracked texture memory still hashes the
+//! whole texture; only the hash itself is optimized.
 //! Textures read through descriptor tables are brought up to date, and for
 //! shaders that index the heap themselves every texture with a resource
 //! object the heap views (`crate::bindless`); textures the title placed in
@@ -551,11 +556,11 @@ fn copies(
     texture: &ID3D12Resource,
     staging: &Staging,
     (buffer, at): (&ID3D12Resource, u64),
-    subresources: &[u32],
+    subresources: &[Sub],
     name: impl Fn() -> String,
 ) {
-    for &i in subresources {
-        let i = i as usize;
+    for (i, band) in subresources {
+        let i = *i as usize;
         let mut footprint = staging.footprints[i];
         footprint.Offset += at;
         let footprint = &footprint;
@@ -603,14 +608,42 @@ fn copies(
                 PlacedFootprint: *footprint,
             },
         };
-        // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        // Only the rows detiled: the staging buffer's other rows hold
+        // whatever its last user left.
+        let f = footprint.Footprint;
+        let block = staging.layout.desc.block.max(1);
+        match band {
+            Some(r) if *r != (0..staging.rows[i]) => {
+                let (top, bottom) = (r.start * block, (r.end * block).min(f.Height));
+                if top >= bottom {
+                    continue;
+                }
+                let rows = D3D12_BOX {
+                    left: 0,
+                    top,
+                    front: 0,
+                    right: f.Width,
+                    bottom,
+                    back: f.Depth,
+                };
+                // SAFETY: an open list; both locations name live resources,
+                // the box lies inside the footprint.
+                unsafe { list.list.CopyTextureRegion(&to, 0, top, 0, &from, Some(&rows)) };
+            }
+            // SAFETY: an open list; both locations name live resources.
+            _ => unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) },
+        }
     }
 }
 
 /// What a refresh gives: a staging buffer, where its space starts in it,
-/// and the subresources detiled into it.
-pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
+/// and the subresources detiled into it with the rows (in elements) if
+/// only those were.
+pub(crate) type Upload = (ID3D12Resource, u64, Vec<Sub>);
+
+/// A subresource a refresh detiled, and its rows (in elements, every depth
+/// slice) if only those.
+pub(crate) type Sub = (u32, Option<std::ops::Range<u32>>);
 
 /// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
 /// at most: the title's own threads need the rest), here when that is
@@ -669,7 +702,7 @@ impl Staging {
     pub(crate) fn refresh(&self) -> Option<Upload> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let (read, buffer) = self.refresh_now();
+        let (read, buffer) = self.refresh_now(Self::detile);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -678,75 +711,108 @@ impl Staging {
 
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
-    fn refresh_now(&self) -> (usize, Option<Upload>) {
-        let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
+    fn refresh_now(
+        &self,
+        detile: impl FnOnce(&Self, &[u8], &[Sub]) -> Option<(ID3D12Resource, u64)>,
+    ) -> (usize, Option<Upload>) {
+        let all = || (0..self.footprints.len() as u32).map(|i| (i, None)).collect::<Vec<Sub>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(t) = &self.tracked {
-            // Most refreshes find nothing: the tracker's dense bit says so
-            // without its lock (123,000 refreshes a frame, run evict3).
+            // A tracker with any untracked span has no clean bit and is
+            // checked on every use. Those spans must be candidates even
+            // when no tracked page was written.
             if t.clean() {
                 return (0, None);
             }
             let ranges = t.take(start, start + size);
-            if ranges.is_empty() {
+            let untracked = t.untracked(start, start + size);
+            if ranges.is_empty() && untracked.is_empty() {
                 return (0, None);
             }
-            // Only the subresources in the pages that changed (streamed
-            // textures change page by page; a whole re-read and detile of
-            // each cost up to 430 MB a frame, run integ2).
             let n = self.footprints.len();
             let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
             let touched: Vec<usize> = (0..n)
                 .filter(|&i| {
                     let (a, b) = span(i);
-                    ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
+                    ranges.iter().chain(&untracked).any(|&(f, e)| f - start < b && a < e - start)
                 })
                 .collect();
-            // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page. Not kept: it would
-            // double each texture's system memory. Only the touched spans
-            // are written, and only they are hashed and detiled.
+
+            // Only a fully tracked subresource whose own 64 KiB pages
+            // changed can use row-level reads. Shared or untracked pages
+            // still need the whole-subresource hash to avoid false sharing.
+            let page = crate::watch::PAGE;
+            let own = |i: usize| {
+                let (a, b) = span(i);
+                let (a0, b0) = (start + a, start + b);
+                !untracked.iter().any(|&(f, e)| f < b0 && a0 < e)
+                    && ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0))
+            };
+            let changed: Vec<(usize, usize)> = ranges
+                .iter()
+                .map(|&(f, e)| (f.max(start) - start, e.min(start + size) - start))
+                .filter(|r| r.0 < r.1)
+                .collect();
+            type Band = Option<(std::ops::Range<u32>, std::ops::Range<usize>)>;
+            let plan: Vec<(usize, Band)> = touched
+                .into_iter()
+                .map(|i| {
+                    let s = i as u32;
+                    let band = if own(i) { self.layout.touched_rows(s % self.mips, s / self.mips, &changed) } else { None };
+                    (i, band)
+                })
+                .collect();
+
+            // Read only the tiled byte spans the selected rows need. The
+            // scratch buffer is not retained: retaining it doubles texture
+            // system memory on large streamed pools.
             let mut scratch = Scratch::take(size);
             let read = &mut scratch.0[..size];
             let mut bytes = 0;
             let mut done: Vec<(usize, usize)> = Vec::new();
-            for &i in &touched {
-                let (a, b) = span(i);
-                if !done.contains(&(a, b)) {
+            for (i, band) in &plan {
+                let (a, b) = match band {
+                    Some((rows, _)) if rows.is_empty() => continue,
+                    Some((_, tiled)) => (tiled.start, tiled.end.min(size)),
+                    None => span(*i),
+                };
+                if a < b && !done.contains(&(a, b)) {
                     // SAFETY: inside the buffer of the texture's size.
                     crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
                     (bytes, _) = (bytes + b - a, done.push((a, b)));
                 }
             }
-            // A changed page that holds only the subresource's bytes says it
-            // changed. Pages it shares with other data the title writes
-            // (small textures): its own bytes decide. Keep BLAKE3 here: this
-            // is the final false-sharing guard for tracked subresources.
-            let page = crate::watch::PAGE;
             last.hashes.resize(n, None);
-            let fresh: Vec<u32> = touched
+            let fresh: Vec<Sub> = plan
                 .into_iter()
-                .filter(|&i| {
-                    let (a, b) = span(i);
-                    let (a0, b0) = (start + a, start + b);
-                    if ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0)) {
+                .filter_map(|(i, band)| match band {
+                    // None of its rows read the bytes changed.
+                    Some((rows, _)) if rows.is_empty() => None,
+                    Some((rows, _)) => {
                         last.hashes[i] = None;
-                        return true;
+                        Some((i as u32, Some(rows)))
                     }
-                    let hash = blake3::hash(&read[a..b]);
-                    last.hashes[i].replace(hash) != Some(hash)
+                    None if own(i) => {
+                        last.hashes[i] = None;
+                        Some((i as u32, None))
+                    }
+                    None => {
+                        let (a, b) = span(i);
+                        let hash = blake3::hash(&read[a..b]);
+                        (last.hashes[i].replace(hash) != Some(hash)).then_some((i as u32, None))
+                    }
                 })
-                .map(|i| i as u32)
                 .collect();
             if fresh.is_empty() {
                 return (bytes, None);
             }
-            let buffer = self.detile(read, &fresh);
+            let buffer = detile(self, read, &fresh);
             if buffer.is_none() {
-                for &i in &fresh {
+                t.retry(&ranges);
+                for &(i, _) in &fresh {
                     last.hashes[i as usize] = None;
                 }
             }
@@ -769,7 +835,7 @@ impl Staging {
             }
             let zeros = vec![0u8; size];
             let every = all();
-            let buffer = self.detile(&zeros, &every);
+            let buffer = detile(self, &zeros, &every);
             last.hash = buffer.is_some().then(|| content_hash(&zeros));
             return (0, buffer.map(|(b, at)| (b, at, every)));
         }
@@ -782,7 +848,7 @@ impl Staging {
             return (size, None);
         }
         let every = all();
-        let buffer = self.detile(tiled, &every);
+        let buffer = detile(self, tiled, &every);
         last.hash = buffer.is_some().then_some(hash);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -792,7 +858,7 @@ impl Staging {
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
     /// staging buffer (`None` if none could be had or a subresource could
     /// not be read).
-    fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
+    fn detile(&self, tiled: &[u8], subresources: &[Sub]) -> Option<(ID3D12Resource, u64)> {
         let (buffer, at, data) = staging_space(self.size)?;
         #[cfg(feature = "diagnostics")]
         // Scanned only when its message is wanted: a pass over every
@@ -808,7 +874,8 @@ impl Staging {
                 tracing::debug!(memory = ?self.memory, desc = ?self.layout.desc, "a sampled texture detiled");
             }
         }
-        for &i in subresources {
+        for (i, band) in subresources {
+            let i = *i;
             let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
             let (mip, slice) = (i % self.mips, i / self.mips);
             let f = footprint.Footprint;
@@ -818,10 +885,11 @@ impl Staging {
             // keeping the slice strictly inside the mapped staging buffer even when
             // GetCopyableFootprints does not pad the final row of the last subresource.
             let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            let done = match band {
+                Some(r) => self.layout.detile_rows(tiled, mip, slice, linear, pitch, pitch * rows as usize, r.clone()),
+                None => self.layout.detile(tiled, mip, slice, linear, pitch, pitch * rows as usize),
+            };
+            if let Err(e) = done {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return None;
             }
@@ -1037,8 +1105,23 @@ fn content_hash(bytes: &[u8]) -> [u64; 2] {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn untracked_bytes(staging: &Staging) -> Vec<(usize, usize)> {
+        let start = staging.memory as usize;
+        staging.tracked.as_ref().unwrap().untracked(start, start + staging.layout.size as usize)
+    }
+
+    /// Simulates unavailable staging space after the texture took its pages.
+    pub(crate) fn defer_one_upload(staging: &Staging) {
+        let mut attempted = false;
+        let (read, upload) = staging.refresh_now(|_, _, _| {
+            attempted = true;
+            None
+        });
+        assert!(attempted && read > 0 && upload.is_none());
+    }
 
     #[test]
     fn content_hash_detects_single_bit_tail_and_order_changes() {
