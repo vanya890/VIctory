@@ -3197,28 +3197,53 @@ impl Meter {
 
 /// A texture presented by [`Host::present_planes`].
 pub(crate) enum PresentPlane<'a> {
-    /// A title texture whose tracked host state is read under `Host::submitted`.
-    Tracked(&'a crate::resource::HostTexture),
+    /// A title texture, its tracked host state, and the typed RTV format used
+    /// by the title when the host resource itself is typeless. Callers obtain
+    /// the override with `resource::view_format(title_resource)`.
+    Tracked(&'a crate::resource::HostTexture, Option<u32>),
     /// A raw host texture in a known state (tests).
     #[cfg(all(test, feature = "diagnostics"))]
-    Raw(&'a ID3D12Resource, u32),
+    Raw(&'a ID3D12Resource, u32, Option<u32>),
 }
 
 impl<'a> PresentPlane<'a> {
     fn texture(&self) -> &'a ID3D12Resource {
         match self {
-            Self::Tracked(copy) => &copy.texture,
+            Self::Tracked(copy, _) => &copy.texture,
             #[cfg(all(test, feature = "diagnostics"))]
-            Self::Raw(texture, _) => texture,
+            Self::Raw(texture, _, _) => texture,
         }
     }
 
     fn state(&self) -> u32 {
         match self {
-            Self::Tracked(copy) => copy.state.load(Ordering::Relaxed),
+            Self::Tracked(copy, _) => copy.state.load(Ordering::Relaxed),
             #[cfg(all(test, feature = "diagnostics"))]
-            Self::Raw(_, state) => *state,
+            Self::Raw(_, state, _) => *state,
         }
+    }
+
+    fn view_format(&self) -> Option<DXGI_FORMAT> {
+        match self {
+            Self::Tracked(_, format) => format.map(|f| DXGI_FORMAT(f as i32)),
+            #[cfg(all(test, feature = "diagnostics"))]
+            Self::Raw(_, _, format) => format.map(|f| DXGI_FORMAT(f as i32)),
+        }
+    }
+
+    /// The format a compositor may safely sample. A typeless resource needs
+    /// the actual typed view that produced its pixels; a denied-SRV resource
+    /// cannot be sampled at all.
+    fn srv_format(&self) -> Option<DXGI_FORMAT> {
+        let desc = unsafe { self.texture().GetDesc() };
+        if desc.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 != 0 {
+            return None;
+        }
+        let format = self.view_format().unwrap_or(desc.Format);
+        if self.view_format().is_none() && is_typeless_color_format(format) {
+            return None;
+        }
+        compositor_srv_format(format)
     }
 }
 
@@ -3232,7 +3257,7 @@ impl Host {
     pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
         let planes: Vec<_> = planes
             .iter()
-            .map(|&(texture, state)| PresentPlane::Raw(texture, state))
+            .map(|&(texture, state)| PresentPlane::Raw(texture, state, None))
             .collect();
         self.present_planes(&planes, frame).0
     }
@@ -4311,8 +4336,8 @@ mod present_state_sync_tests {
             let _ = tests::issued();
             let (_, state) = host.present_planes_with_compositor(
                 &[
-                    PresentPlane::Tracked(&scene_copy),
-                    PresentPlane::Tracked(&overlay_copy),
+                    PresentPlane::Tracked(&scene_copy, None),
+                    PresentPlane::Tracked(&overlay_copy, None),
                 ],
                 1,
                 |_, _| {
