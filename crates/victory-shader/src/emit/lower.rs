@@ -80,6 +80,9 @@ pub(crate) struct Lowered {
     /// Barrier modes emitted by the test translation.
     #[cfg(test)]
     pub barrier_modes: Vec<u32>,
+    /// Fixed wave size requested by the test translation.
+    #[cfg(test)]
+    pub wave_size: Option<u32>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -583,64 +586,10 @@ impl<'a> Lower<'a> {
         });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
-        let mut console_lanes = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
-            // Code reading other lanes needs the console's wave size and
-            // lane order; so do lane masks read as numbers, and LDS shared
-            // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
-                let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
-                    || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
-            }) || {
-                // Masks held as numbers or constant lane sets: the lane
-                // tests its own bit by its console lane.
-                let whens = x.st.exits.iter().filter_map(|e| match *e {
-                    LaneExit::Branch { when, .. } => Some(when),
-                    _ => None,
-                });
-                let mut all: Vec<Bool> =
-                    x.st.guards
-                        .iter()
-                        .flatten()
-                        .flatten()
-                        .copied()
-                        .chain(whens)
-                        .collect();
-                all.sort_unstable();
-                all.dedup();
-                all.into_iter().any(|g| {
-                    x.st.bools
-                        .support(g)
-                        .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
-                })
-            };
-            let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
-            }
         }
-        // Gate native Wave64 only when this translation actually needs
-        // 64-lane semantics. The native metadata bit alone is not sufficient:
-        // unrestricted shaders can lower to wave-size-agnostic DXIL.
-        let wave_plan = wave::plan(
-            p,
-            x.st,
-            &x.native.io,
-            x.native.wave64,
-            wave,
-            s.wave_size == Some(64),
-        );
-        let wave64_unsupported = wave_plan.wave64_unsupported;
-        let relaxed_barriers = wave_plan.relaxed_barriers;
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
@@ -686,6 +635,19 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let wave_plan = wave::plan(
+            p,
+            x.st,
+            &x.native.io,
+            x.native.wave64,
+            wave,
+            &x.res.waterfall.reads,
+            s.lds_dwords,
+        );
+        let wave64_unsupported = wave_plan.wave64_unsupported;
+        let relaxed_barriers = wave_plan.relaxed_barriers;
+        let console_lanes = wave_plan.console_lanes;
+        s.wave_size = wave_plan.wave_size;
         Lower {
             s,
             x,
@@ -1461,6 +1423,8 @@ impl<'a> Lower<'a> {
             has_half_wave_mask: self.s.m.has_i32_const(!31),
             #[cfg(test)]
             barrier_modes: self.barrier_modes,
+            #[cfg(test)]
+            wave_size: self.s.wave_size,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
