@@ -57,12 +57,12 @@ pub fn run(
         // device, the caches) takes the space the title's 32-bit memory needs.
         victory_hle::modules::xmem::low_guards::install();
     }
-    let cfg = victory_core::Config::load()?;
+    let (exe, cfg) = launch_paths(exe, victory_core::Config::load()?)?;
     // Before the import registry is first used: it holds the module only
     // when the host's FidelityFX serves.
     victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
     let prepared = victory_loader::prepare(
-        &std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?,
+        &std::fs::read(&exe).with_context(|| format!("reading {}", exe.display()))?,
     )?;
     let hash = prepared.original_hash.to_hex();
     let title_dir = exe.parent().unwrap_or(Path::new("."));
@@ -82,7 +82,7 @@ pub fn run(
     // Mapped: the patched bytes (the exe's size, 114 MB) are not needed.
     drop(prepared);
     victory_hle::runtime::set_main_image(image.base());
-    victory_hle::runtime::set_image_path(image.base(), exe);
+    victory_hle::runtime::set_image_path(image.base(), &exe);
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
@@ -199,6 +199,21 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(code)
+}
+
+
+/// Runner-owned paths outlive startup: title code may change the process's
+/// current directory before a late DLL load or a save. Keep today's meaning
+/// of relative paths (the launch directory), without requiring files to exist.
+#[cfg(windows)]
+fn launch_paths(
+    exe: &Path,
+    mut cfg: victory_core::Config,
+) -> Result<(std::path::PathBuf, victory_core::Config)> {
+    let exe = std::path::absolute(exe).context("resolving the title executable path")?;
+    cfg.cache_dir = std::path::absolute(&cfg.cache_dir).context("resolving the cache directory")?;
+    cfg.data_dir = std::path::absolute(&cfg.data_dir).context("resolving the data directory")?;
+    Ok((exe, cfg))
 }
 
 #[cfg(windows)]
@@ -493,6 +508,77 @@ mod absent_tests {
 #[cfg(all(test, windows))]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    /// Change CWD only in a child test process, so other parallel tests
+    /// cannot observe it. Lookups and writes must still use the launch root.
+    #[test]
+    fn launch_paths_survive_a_title_changing_the_current_directory() {
+        const CHILD: &str = "VICTORY_LAUNCH_PATHS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let cfg = victory_core::Config {
+                cache_dir: "cache".into(),
+                data_dir: "data".into(),
+                ..Default::default()
+            };
+            let (exe, cfg) =
+                super::launch_paths(std::path::Path::new("package/title.exe"), cfg).unwrap();
+            let images = cfg.cache_subdir("images").unwrap();
+            let storage = cfg.data_subdir("00000000/storage").unwrap();
+            let title = victory_hle::runtime::Title {
+                storage,
+                ..Default::default()
+            };
+            std::env::set_current_dir("elsewhere").unwrap();
+            assert_eq!(std::fs::read(&exe).unwrap(), b"synthetic executable");
+            assert_eq!(
+                std::fs::read(exe.parent().unwrap().join("late.dll")).unwrap(),
+                b"synthetic DLL"
+            );
+            std::fs::write(images.join("probe.txt"), b"cached").unwrap();
+            std::fs::write(title.storage.join("save.txt"), b"persistent").unwrap();
+            std::fs::create_dir_all(title.saves()).unwrap();
+            std::fs::write(title.saves().join("save.txt"), b"saved").unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("package")).unwrap();
+        std::fs::create_dir(root.join("elsewhere")).unwrap();
+        std::fs::write(root.join("package/title.exe"), b"synthetic executable").unwrap();
+        std::fs::write(root.join("package/late.dll"), b"synthetic DLL").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "run::tests::launch_paths_survive_a_title_changing_the_current_directory",
+                "--nocapture",
+            ])
+            .current_dir(root)
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child {}:\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(root.join("cache/images/probe.txt")).unwrap(),
+            b"cached"
+        );
+        assert_eq!(
+            std::fs::read(root.join("data/00000000/storage/save.txt")).unwrap(),
+            b"persistent"
+        );
+        assert_eq!(
+            std::fs::read(root.join("data/00000000/saves/save.txt")).unwrap(),
+            b"saved"
+        );
+        assert!(!root.join("elsewhere/cache").exists());
+        assert!(!root.join("elsewhere/data").exists());
+    }
+
 
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {
