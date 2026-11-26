@@ -423,6 +423,27 @@ for index in 0..count {
 
 Для данного эксперимента не включать `VICTORY_D3D12_GBV`: GPU-based validation предназначена для GPU work/command validation и не нужна, чтобы диагностировать аргументы CPU-side CreateCommittedResource. Не включать `VICTORY_NO_TDR`: оно не связано с проверяемым HRESULT и меняет поведение watchdog.
 
+### Test entrypoint для указанной команды
+
+Чтобы команда ниже имела реальную цель, добавить временный test entrypoint рядом с helper-функциями:
+
+```rust
+#[test]
+fn issue153_d3d12_diagnostics() {
+    // create() honours VICTORY_D3D12_DEBUG before D3D12CreateDevice.
+    let isolated = create().expect("create isolated D3D12 diagnostics device");
+    let is_warp =
+        cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP");
+
+    d3d12_issue153_diagnostics(&isolated.device, is_warp);
+    d3d12_issue153_creation_matrix(&isolated.device);
+
+    // Keep this test observational: no assertions about A-E success.
+}
+```
+
+Внутри `d3d12_issue153_creation_matrix` интегрировать InfoQueue snapshot из предыдущего подраздела: перед каждым отдельным вызовом A–E очистить очередь, после получения HRESULT немедленно прочитать и вывести все новые сообщения, затем перейти к следующему варианту. Не запускать одновременно другие D3D12 tests на том же device. При отсутствии `isolated.messages` вывести `INFOQUEUE unavailable`, не считать это пустым результатом.
+
 ---
 
 ## 6. Команды воспроизведения
