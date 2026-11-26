@@ -28,7 +28,7 @@ jobs:
           persist-credentials: false
 
       - name: Test the read-only triage code
-        run: python -I -m unittest discover -s scripts -p 'test_coordination_triage.py' -v
+        run: python -B -I -m unittest discover -s scripts -p 'test_coordination_triage.py' -v
 
       - name: List upstream pull requests
         env:
@@ -60,7 +60,7 @@ jobs:
           PY
 
       - name: Compare exact PR heads with upstream main and fork dev
-        run: python -I scripts/coordination_triage.py --repo . --prs prs.json --upstream-main refs/remotes/upstream/main --fork-dev HEAD --out out
+        run: python -B -I scripts/coordination_triage.py --repo . --prs prs.json --upstream-main refs/remotes/upstream/main --fork-dev HEAD --out out
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
