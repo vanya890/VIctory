@@ -1132,6 +1132,46 @@ pub(crate) mod tests {
         assert_ne!(old, new, "a new generation");
     }
 
+    /// A contiguous descriptor copy crossing adjacent heaps must use the
+    /// original per-handle fallback and enqueue both destination slots.
+    #[cfg(windows)]
+    #[test]
+    fn contiguous_copy_crossing_heap_boundary_mirrors_both_heaps() {
+        let mut memory = vec![0u8; 8 * 16];
+        let base = memory.as_mut_ptr() as u64;
+        let desc = HeapDesc { kind: SAMPLERS, count: 4, flags: SHADER_VISIBLE, nodes: 1 };
+        let mut first = std::ptr::null();
+        let mut second = std::ptr::null();
+        assert_eq!(create(desc, Placement { address: base, size: 4 * 16 }, &mut first), S_OK);
+        assert_eq!(create(desc, Placement { address: base + 4 * 16, size: 4 * 16 }, &mut second), S_OK);
+        let source = [0u8; 2 * 16];
+        copy_simple(std::ptr::null(), 2, base + 3 * 16, source.as_ptr() as u64, SAMPLERS);
+        let a = heap(first).pending.lock().unwrap().clone();
+        let b = heap(second).pending.lock().unwrap().clone();
+        assert_eq!(a, [3]);
+        assert_eq!(b, [0]);
+        release(first);
+        release(second);
+    }
+
+    /// The underlying descriptor copy retains memmove semantics for both
+    /// overlap directions, and self-copy still exercises the mirror path.
+    #[test]
+    fn contiguous_descriptor_copy_preserves_overlap_and_self_copy() {
+        let mut memory = vec![0u8; 5 * 32];
+        for i in 0..5 {
+            memory[i * 32] = (i + 1) as u8;
+        }
+        let base = memory.as_mut_ptr() as u64;
+        copy_simple(std::ptr::null(), 4, base + 32, base, VIEWS_KIND);
+        assert_eq!((0..5).map(|i| memory[i * 32]).collect::<Vec<_>>(), [1, 1, 2, 3, 4]);
+        copy_simple(std::ptr::null(), 4, base, base + 32, VIEWS_KIND);
+        assert_eq!((0..5).map(|i| memory[i * 32]).collect::<Vec<_>>(), [1, 2, 3, 4, 4]);
+        let before = memory.clone();
+        copy_simple(std::ptr::null(), 5, base, base, VIEWS_KIND);
+        assert_eq!(memory, before);
+    }
+
     /// A record the title copies into its shader-visible heap as bytes (no
     /// call) is made on the host at the next sync, and only then.
     #[cfg(windows)]
