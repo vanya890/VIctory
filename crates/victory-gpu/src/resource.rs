@@ -283,8 +283,9 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
 #[cfg(windows)]
 /// The typed RTV format to use when presenting a title texture. The most
-/// recently bound RTV view takes precedence; for a typeless host copy without
-/// a recorded view, fall back to the title resource's own format.
+/// recently bound RTV view takes precedence for typeless host copies; otherwise
+/// use the title resource's own format only when it is a valid typed view.
+/// Returns None when no safe typed view can be inferred.
 pub(crate) fn view_format(this: This) -> Option<u32> {
     let copy = host_copy(this)?;
     view_format_of(this, &copy)
