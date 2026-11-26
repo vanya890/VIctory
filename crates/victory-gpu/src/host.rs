@@ -4908,7 +4908,11 @@ mod present_plane_tests {
         let isolated_texture = isolated_texture.unwrap();
         let mut attempted = false;
         let failed = isolated.present_planes_with_compositor(
-            &[PresentPlane::Raw(&isolated_texture, state, None)],
+            &[PresentPlane::Raw(
+                &isolated_texture,
+                state,
+                Some(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB.0 as u32),
+            )],
             7,
             |_, _| {
                 attempted = true;
