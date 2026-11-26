@@ -143,8 +143,11 @@ mod tests {
         data[DOS_E_LFANEW..DOS_E_LFANEW + 4].copy_from_slice(&0x40u32.to_le_bytes());
         let opt = optional_header_offset(&data).unwrap();
         let fh = file_header_offset(&data).unwrap();
-        data[fh + FILE_HEADER_SIZE_OF_OPTIONAL_HEADER..fh + FILE_HEADER_SIZE_OF_OPTIONAL_HEADER + 2]
-            .copy_from_slice(&((OPT_DATA_DIRECTORY + 16 * DATA_DIRECTORY_SIZE) as u16).to_le_bytes());
+        data[fh + FILE_HEADER_SIZE_OF_OPTIONAL_HEADER
+            ..fh + FILE_HEADER_SIZE_OF_OPTIONAL_HEADER + 2]
+            .copy_from_slice(
+                &((OPT_DATA_DIRECTORY + 16 * DATA_DIRECTORY_SIZE) as u16).to_le_bytes(),
+            );
         data[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
         data[opt + OPT_NUMBER_OF_RVA_AND_SIZES..opt + OPT_NUMBER_OF_RVA_AND_SIZES + 4]
             .copy_from_slice(&16u32.to_le_bytes());
@@ -259,7 +262,8 @@ mod tests {
         let opt = optional_header_offset(&data).unwrap();
         // The optional header declares room for two data directories.
         let size = (OPT_DATA_DIRECTORY + 2 * DATA_DIRECTORY_SIZE) as u16;
-        data[fh + FILE_HEADER_SIZE_OF_OPTIONAL_HEADER..fh + FILE_HEADER_SIZE_OF_OPTIONAL_HEADER + 2]
+        data[fh + FILE_HEADER_SIZE_OF_OPTIONAL_HEADER
+            ..fh + FILE_HEADER_SIZE_OF_OPTIONAL_HEADER + 2]
             .copy_from_slice(&size.to_le_bytes());
         assert_eq!(
             data_directory_offset(&data, 1),

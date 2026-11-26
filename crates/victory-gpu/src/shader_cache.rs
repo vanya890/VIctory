@@ -1,6 +1,6 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
 //! cache folder, keyed by the container's content and by what the
-//! translation depends on ([`build`]), so a changed translator never serves
+//! translation depends on (`build`), so a changed translator never serves
 //! an old translation, while rebuilding the rest of VIctory keeps them.
 //! Each translator's entries are in a folder of their own, named by the
 //! start of that key: older translators' folders can be deleted whole.

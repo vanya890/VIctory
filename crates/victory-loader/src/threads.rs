@@ -164,8 +164,8 @@ fn end_other_threads(keep: &[u32]) {
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcessId, GetCurrentThreadId, OpenThread, THREAD_TERMINATE, TerminateThread,
-        THREAD_QUERY_INFORMATION,
+        GetCurrentProcessId, GetCurrentThreadId, OpenThread, THREAD_QUERY_INFORMATION,
+        THREAD_TERMINATE, TerminateThread,
     };
     // SAFETY: plain queries of the calling process and thread.
     let (process, me) = unsafe { (GetCurrentProcessId(), GetCurrentThreadId()) };
@@ -323,7 +323,10 @@ impl OwnTls {
 /// title callbacks.
 fn started_by_rust() -> bool {
     // SAFETY: the calling thread's pseudo handle.
-    starts_in(unsafe { windows_sys::Win32::System::Threading::GetCurrentThread() }, c"")
+    starts_in(
+        unsafe { windows_sys::Win32::System::Threading::GetCurrentThread() },
+        c"",
+    )
 }
 
 /// Whether `thread`'s start routine lies in the module named `module`

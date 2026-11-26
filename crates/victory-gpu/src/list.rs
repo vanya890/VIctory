@@ -133,7 +133,10 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(
+    this: This,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) {
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
@@ -193,24 +196,62 @@ pub(crate) fn take_cuts() -> (u64, u64) {
 /// title list records into (the queue runs each once its waits hold,
 /// `crate::hold`); bottom-of-pipe writes recorded before it land when the
 /// part before it has run.
-extern "system" fn wait32(this: This, address: u64, comparison: u32, reference: u32, mask: u32, _flags: u32) {
-    wait(this, crate::hold::ValueWait { address, bytes: 4, comparison, reference: u64::from(reference), mask: u64::from(mask) });
+extern "system" fn wait32(
+    this: This,
+    address: u64,
+    comparison: u32,
+    reference: u32,
+    mask: u32,
+    _flags: u32,
+) {
+    wait(
+        this,
+        crate::hold::ValueWait {
+            address,
+            bytes: 4,
+            comparison,
+            reference: u64::from(reference),
+            mask: u64::from(mask),
+        },
+    );
 }
-pub(crate) extern "system" fn wait64(this: This, address: u64, comparison: u32, reference: u64, _flags: u32) {
-    wait(this, crate::hold::ValueWait { address, bytes: 8, comparison, reference, mask: u64::MAX });
+pub(crate) extern "system" fn wait64(
+    this: This,
+    address: u64,
+    comparison: u32,
+    reference: u64,
+    _flags: u32,
+) {
+    wait(
+        this,
+        crate::hold::ValueWait {
+            address,
+            bytes: 8,
+            comparison,
+            reference,
+            mask: u64::MAX,
+        },
+    );
 }
 
 fn wait(this: This, wait: crate::hold::ValueWait) {
     #[cfg(windows)]
     {
-        let Some(current) = host_list(this) else { return };
+        let Some(current) = host_list(this) else {
+            return;
+        };
         if !current.is_empty() {
-            let Some(next) = next_segment(this) else { return };
+            let Some(next) = next_segment(this) else {
+                return;
+            };
             CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             current.close();
             // SAFETY: the title passes one of our lists.
             let list = unsafe { &*this.cast::<List>() };
-            list.state.lock().unwrap_or_else(|e| e.into_inner()).cut(next);
+            list.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cut(next);
             next.defer_wait(wait);
             return;
         }
@@ -253,9 +294,15 @@ fn restart(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
     for (k, h) in hosts.iter_mut().enumerate() {
         if std::sync::Arc::strong_count(h) > 1 {
             EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(segment = k, "a list reset while a queue still holds part of it: that part keeps its own host list");
+            tracing::debug!(
+                segment = k,
+                "a list reset while a queue still holds part of it: that part keeps its own host list"
+            );
             let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop();
-            match spare.map(Ok).or_else(|| crate::host::host().map(|host| host.new_list())) {
+            match spare
+                .map(Ok)
+                .or_else(|| crate::host::host().map(|host| host.new_list()))
+            {
                 Some(Ok(fresh)) => left = Some(std::mem::replace(h, std::sync::Arc::new(fresh))),
                 _ => continue,
             }
@@ -291,8 +338,15 @@ pub(crate) fn recycle(list: std::sync::Arc<crate::host::HostList>) {
 /// descriptor slots and title-memory page table. Freed once that host list
 /// (the list's last held one, so the last to run) is gone.
 #[cfg(windows)]
-fn leave(to: Option<std::sync::Arc<crate::host::HostList>>, uploads: Vec<Upload>, state: crate::draw::State) {
-    struct Kept(#[allow(dead_code)] Vec<Upload>, #[allow(dead_code)] crate::draw::State);
+fn leave(
+    to: Option<std::sync::Arc<crate::host::HostList>>,
+    uploads: Vec<Upload>,
+    state: crate::draw::State,
+) {
+    struct Kept(
+        #[allow(dead_code)] Vec<Upload>,
+        #[allow(dead_code)] crate::draw::State,
+    );
     // SAFETY: only dropped, with the host list, after it has run.
     unsafe impl Send for Kept {}
     if let Some(held) = to {
@@ -432,11 +486,20 @@ extern "system" fn list_release(this: This) -> u32 {
     if !this.is_null() && object::refs(this) == 1 {
         // SAFETY: the title passes one of our lists.
         let list = unsafe { &*this.cast::<List>() };
-        let held = list.hosts.lock().unwrap_or_else(|e| e.into_inner()).iter().rfind(|h| std::sync::Arc::strong_count(h) > 1).cloned();
+        let held = list
+            .hosts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rfind(|h| std::sync::Arc::strong_count(h) > 1)
+            .cloned();
         if held.is_some() {
             EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!("a list released while a queue still holds part of it: that part runs on its own");
-            let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
+            tracing::debug!(
+                "a list released while a queue still holds part of it: that part runs on its own"
+            );
+            let uploads =
+                std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
             leave(held, uploads, state);
         }
@@ -466,7 +529,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     {
         let held = restart(this);
         // SAFETY: the title passes one of our lists.
-        let mut state = unsafe { &(*this.cast::<List>()).state }.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = unsafe { &(*this.cast::<List>()).state }
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let old = std::mem::take(&mut *state);
         state.reset(pipeline);
         drop(state);
@@ -562,7 +627,12 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| format!("barrier kinds {:?}", barriers.iter().map(|b| b.kind).collect::<Vec<_>>()));
+        list.note_op(|| {
+            format!(
+                "barrier kinds {:?}",
+                barriers.iter().map(|b| b.kind).collect::<Vec<_>>()
+            )
+        });
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))
@@ -773,7 +843,9 @@ fn copy_extent_sub(
     };
     Some(CopyExtent {
         width: (desc.Width >> mip).max(1).next_multiple_of(block),
-        height: (u64::from(desc.Height) >> mip).max(1).next_multiple_of(block),
+        height: (u64::from(desc.Height) >> mip)
+            .max(1)
+            .next_multiple_of(block),
         depth,
         block,
     })
@@ -988,7 +1060,8 @@ extern "system" fn copy_texture_region(
 /// Texture read backs since the last frame-rate line: how many, bytes
 /// (diagnostics).
 #[cfg(feature = "diagnostics")]
-pub(crate) static READ_BACKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub(crate) static READ_BACKS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// (texture, buffer) pairs read back so far, each logged once (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -999,7 +1072,13 @@ static READ_BACK_PAIRS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex
 /// run its rows go into the title's buffer (the title reads them on the CPU
 /// after its fence).
 #[cfg(windows)]
-fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src: &CopyLocation, source_box: *const [u32; 6]) {
+fn read_back(
+    list: &crate::host::HostList,
+    dst: &CopyLocation,
+    at: [u32; 3],
+    src: &CopyLocation,
+    source_box: *const [u32; 6],
+) {
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_BOX, D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
     };
@@ -1011,7 +1090,10 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
             return;
         }};
     }
-    let (Some(host), Some(texture)) = (crate::host::host(), crate::resource::host_resource(src.resource)) else {
+    let (Some(host), Some(texture)) = (
+        crate::host::host(),
+        crate::resource::host_resource(src.resource),
+    ) else {
         refused!("no host texture");
     };
     // SAFETY: the title's box (same layout as the host's) or null; a live texture.
@@ -1028,12 +1110,24 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
         None => refused!("a region outside its texture or footprint"),
     }
     let size = match b {
-        Some(b) => [b.right.saturating_sub(b.left), b.bottom.saturating_sub(b.top), b.back.saturating_sub(b.front)],
+        Some(b) => [
+            b.right.saturating_sub(b.left),
+            b.bottom.saturating_sub(b.top),
+            b.back.saturating_sub(b.front),
+        ],
         None => {
             // A subresource index shares the footprint's first dword.
             let mip = src.footprint.offset as u32 % u32::from(desc.MipLevels.max(1));
-            let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { u32::from(desc.DepthOrArraySize) } else { 1 };
-            [((desc.Width >> mip) as u32).max(1), (desc.Height >> mip).max(1), (depth >> mip).max(1)]
+            let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                u32::from(desc.DepthOrArraySize)
+            } else {
+                1
+            };
+            [
+                ((desc.Width >> mip) as u32).max(1),
+                (desc.Height >> mip).max(1),
+                (depth >> mip).max(1),
+            ]
         }
     };
     // The host takes footprints of 256-byte pitches only (as the console).
@@ -1050,7 +1144,10 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     let (Some(rows), Some(len)) = (dst.footprint.rows(at, size), dst.footprint.bytes()) else {
         refused!("a region outside its footprint");
     };
-    let (Some(title), Some((buffer, data))) = (buffer_range(dst.resource, dst.footprint.offset, len), list.readback(host, len)) else {
+    let (Some(title), Some((buffer, data))) = (
+        buffer_range(dst.resource, dst.footprint.offset, len),
+        list.readback(host, len),
+    ) else {
         return;
     };
     if crate::texture::title_written(&texture) {
@@ -1064,7 +1161,8 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     #[cfg(feature = "diagnostics")]
     {
         let text = || {
-            let mem = crate::resource::texture_memory(src.resource).map_or(0, |(at, _)| at as usize);
+            let mem =
+                crate::resource::texture_memory(src.resource).map_or(0, |(at, _)| at as usize);
             format!(
                 "read back {:?} (mem {mem:#x}, {}x{} f{} sub {}) {size:?} at {at:?} into {:?}+{:#x}, {len} bytes",
                 src.resource,
@@ -1139,8 +1237,8 @@ extern "system" fn resolve(
     {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
-            D3D12_RESOLVE_MODE_AVERAGE, D3D12_RESOURCE_DESC,
-            D3D12_RESOURCE_DIMENSION_TEXTURE2D, ID3D12GraphicsCommandList1,
+            D3D12_RESOLVE_MODE_AVERAGE, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            ID3D12GraphicsCommandList1,
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
@@ -1296,8 +1394,13 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(&texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+            list.list.ClearDepthStencilView(
+                dsv,
+                D3D12_CLEAR_FLAGS(flags as i32 & 3),
+                depth,
+                stencil,
+                rects,
+            )
         };
     }
     #[cfg(not(windows))]
@@ -1432,7 +1535,10 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
+    let Some(len) = usize::try_from(size)
+        .ok()
+        .and_then(|s| s.checked_add(align))
+    else {
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
@@ -1446,7 +1552,10 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    uploads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(block);
     at
 }
 
@@ -1538,8 +1647,10 @@ unsafe impl Send for Upload {}
 
 /// Live list upload blocks and their bytes (the statistics).
 #[cfg(windows)]
-pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// Draw state the host has no use for (root signatures: ours come with
 /// the pipeline; depth bounds, depth order and shading rate hints): any
@@ -1586,7 +1697,10 @@ mod state {
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
         // SAFETY: the title passes four floats or null.
-        with_state(this, |list, s| s.blend_factor(list, unsafe { factor.as_ref() }));
+        with_state(this, |list, s| {
+            // SAFETY: the title callback contract supplies four readable floats or null.
+            s.blend_factor(list, unsafe { factor.as_ref() })
+        });
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
         with_state(this, |list, s| s.stencil_ref(list, reference));
@@ -1843,7 +1957,11 @@ extern "system" fn execute_indirect(
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let kind = if *kind == DISPATCH_SINGLE {
+            DISPATCH
+        } else {
+            *kind
+        };
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -1896,7 +2014,6 @@ pub(crate) fn take_counts() -> (u64, u64) {
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
-
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
@@ -1912,11 +2029,18 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         #[cfg(feature = "diagnostics")]
         if !_groups.is_null() {
             // SAFETY: the title passes `count` groups of 16 bytes: kind, count, pointer.
-            let groups = unsafe { std::slice::from_raw_parts(_groups.cast::<[u32; 4]>(), count as usize) };
-            list.note_op(|| format!("barrier groups {:?}", groups.iter().map(|g| (g[0], g[1])).collect::<Vec<_>>()));
+            let groups =
+                unsafe { std::slice::from_raw_parts(_groups.cast::<[u32; 4]>(), count as usize) };
+            list.note_op(|| {
+                format!(
+                    "barrier groups {:?}",
+                    groups.iter().map(|g| (g[0], g[1])).collect::<Vec<_>>()
+                )
+            });
         }
         // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        let barrier =
+            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1930,7 +2054,13 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
     defer_write(this, address, Written::Value(u64::from(value)), 4);
 }
-pub(crate) extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+pub(crate) extern "system" fn write64(
+    this: This,
+    address: u64,
+    value: u64,
+    _flush: u32,
+    flags: u32,
+) {
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
@@ -2237,10 +2367,19 @@ mod tests {
         assert!((1 << 32..1 << 40).contains(&(p as usize)), "{p:p}");
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
-        assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
+        assert!(
+            allocate_upload(list, 8, 0x30).is_null(),
+            "not a power of two"
+        );
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
-        assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        assert!(
+            // SAFETY: list is the live list created by this test and not released yet.
+            unsafe { &(*list.cast::<List>()).uploads }
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
@@ -2340,20 +2479,25 @@ mod tests {
                 row_pitch: 0,
             },
         };
-        let fp_loc = |resource: This, format: u32, width: u32, height: u32, depth: u32| CopyLocation {
-            resource,
-            kind: 1,
-            footprint: crate::resource::PlacedFootprint {
-                offset: 0,
-                format,
-                width,
-                height,
-                depth,
-                row_pitch: 256,
-            },
-        };
+        let fp_loc =
+            |resource: This, format: u32, width: u32, height: u32, depth: u32| CopyLocation {
+                resource,
+                kind: 1,
+                footprint: crate::resource::PlacedFootprint {
+                    offset: 0,
+                    format,
+                    width,
+                    height,
+                    depth,
+                    row_pitch: 256,
+                },
+            };
 
-        let run_copy = |name: &str, dst: CopyLocation, at: [u32; 3], src: CopyLocation, bx: Option<[u32; 6]>| {
+        let run_copy = |name: &str,
+                        dst: CopyLocation,
+                        at: [u32; 3],
+                        src: CopyLocation,
+                        bx: Option<[u32; 6]>| {
             let null = std::ptr::null();
             let mut allocator = null;
             assert_eq!(
@@ -2380,34 +2524,184 @@ mod tests {
         };
 
         // Invalid copies must be ignored rather than failing `Close()` with `E_INVALIDARG`.
-        run_copy("t2t_oob_dst_sub", sub_loc(rgba_dst, 2), [0, 0, 0], sub_loc(rgba_src, 0), None);
-        run_copy("t2t_oob_src_sub", sub_loc(rgba_dst, 0), [0, 0, 0], sub_loc(rgba_src, 2), None);
-        run_copy("t2t_oob_src_box", sub_loc(rgba_dst, 0), [0, 0, 0], sub_loc(rgba_src, 0), Some([0, 0, 0, 32, 16, 1]));
-        run_copy("t2t_oob_dst_xy", sub_loc(rgba_dst, 0), [12, 0, 0], sub_loc(rgba_src, 0), Some([0, 0, 0, 8, 8, 1]));
-        run_copy("t2t_wrong_dst_kind", fp_loc(rgba_dst, 28, 16, 16, 1), [0, 0, 0], sub_loc(rgba_src, 0), None);
-        run_copy("bc_unaligned_dst_x", sub_loc(bc_dst, 0), [1, 0, 0], sub_loc(bc_src, 0), Some([0, 0, 0, 4, 4, 1]));
-        run_copy("bc_unaligned_src_box", sub_loc(bc_dst, 3), [0, 0, 0], sub_loc(bc_src, 3), Some([0, 0, 0, 2, 2, 1]));
-        run_copy("bc_mip3_oob_box", sub_loc(bc_dst, 3), [0, 0, 0], sub_loc(bc_src, 3), Some([0, 0, 0, 8, 4, 1]));
-        run_copy("b2t_zero_width", sub_loc(rgba_dst, 0), [0, 0, 0], fp_loc(buf, 28, 0, 16, 1), None);
-        run_copy("b2t_oob_dst_mip1", sub_loc(rgba_dst, 1), [0, 0, 0], fp_loc(buf, 28, 16, 16, 1), None);
-        run_copy("b2t_oob_src_box", sub_loc(rgba_dst, 0), [0, 0, 0], fp_loc(buf, 28, 8, 8, 1), Some([0, 0, 0, 16, 8, 1]));
-        run_copy("t2b_oob_src_sub", fp_loc(buf, 28, 16, 16, 1), [0, 0, 0], sub_loc(rgba_src, 2), None);
-        run_copy("t2b_oob_src_box", fp_loc(buf, 28, 16, 16, 1), [0, 0, 0], sub_loc(rgba_src, 1), Some([0, 0, 0, 16, 8, 1]));
-        run_copy("3d_oob_sub", sub_loc(tex3d_dst, 3), [0, 0, 0], sub_loc(tex3d_src, 0), None);
-        run_copy("3d_oob_z", sub_loc(tex3d_dst, 1), [0, 0, 2], sub_loc(tex3d_src, 1), Some([0, 0, 0, 4, 4, 1]));
-        run_copy("ds_oob_plane2", sub_loc(ds_dst, 2), [0, 0, 0], sub_loc(ds_src, 0), None);
+        run_copy(
+            "t2t_oob_dst_sub",
+            sub_loc(rgba_dst, 2),
+            [0, 0, 0],
+            sub_loc(rgba_src, 0),
+            None,
+        );
+        run_copy(
+            "t2t_oob_src_sub",
+            sub_loc(rgba_dst, 0),
+            [0, 0, 0],
+            sub_loc(rgba_src, 2),
+            None,
+        );
+        run_copy(
+            "t2t_oob_src_box",
+            sub_loc(rgba_dst, 0),
+            [0, 0, 0],
+            sub_loc(rgba_src, 0),
+            Some([0, 0, 0, 32, 16, 1]),
+        );
+        run_copy(
+            "t2t_oob_dst_xy",
+            sub_loc(rgba_dst, 0),
+            [12, 0, 0],
+            sub_loc(rgba_src, 0),
+            Some([0, 0, 0, 8, 8, 1]),
+        );
+        run_copy(
+            "t2t_wrong_dst_kind",
+            fp_loc(rgba_dst, 28, 16, 16, 1),
+            [0, 0, 0],
+            sub_loc(rgba_src, 0),
+            None,
+        );
+        run_copy(
+            "bc_unaligned_dst_x",
+            sub_loc(bc_dst, 0),
+            [1, 0, 0],
+            sub_loc(bc_src, 0),
+            Some([0, 0, 0, 4, 4, 1]),
+        );
+        run_copy(
+            "bc_unaligned_src_box",
+            sub_loc(bc_dst, 3),
+            [0, 0, 0],
+            sub_loc(bc_src, 3),
+            Some([0, 0, 0, 2, 2, 1]),
+        );
+        run_copy(
+            "bc_mip3_oob_box",
+            sub_loc(bc_dst, 3),
+            [0, 0, 0],
+            sub_loc(bc_src, 3),
+            Some([0, 0, 0, 8, 4, 1]),
+        );
+        run_copy(
+            "b2t_zero_width",
+            sub_loc(rgba_dst, 0),
+            [0, 0, 0],
+            fp_loc(buf, 28, 0, 16, 1),
+            None,
+        );
+        run_copy(
+            "b2t_oob_dst_mip1",
+            sub_loc(rgba_dst, 1),
+            [0, 0, 0],
+            fp_loc(buf, 28, 16, 16, 1),
+            None,
+        );
+        run_copy(
+            "b2t_oob_src_box",
+            sub_loc(rgba_dst, 0),
+            [0, 0, 0],
+            fp_loc(buf, 28, 8, 8, 1),
+            Some([0, 0, 0, 16, 8, 1]),
+        );
+        run_copy(
+            "t2b_oob_src_sub",
+            fp_loc(buf, 28, 16, 16, 1),
+            [0, 0, 0],
+            sub_loc(rgba_src, 2),
+            None,
+        );
+        run_copy(
+            "t2b_oob_src_box",
+            fp_loc(buf, 28, 16, 16, 1),
+            [0, 0, 0],
+            sub_loc(rgba_src, 1),
+            Some([0, 0, 0, 16, 8, 1]),
+        );
+        run_copy(
+            "3d_oob_sub",
+            sub_loc(tex3d_dst, 3),
+            [0, 0, 0],
+            sub_loc(tex3d_src, 0),
+            None,
+        );
+        run_copy(
+            "3d_oob_z",
+            sub_loc(tex3d_dst, 1),
+            [0, 0, 2],
+            sub_loc(tex3d_src, 1),
+            Some([0, 0, 0, 4, 4, 1]),
+        );
+        run_copy(
+            "ds_oob_plane2",
+            sub_loc(ds_dst, 2),
+            [0, 0, 0],
+            sub_loc(ds_src, 0),
+            None,
+        );
 
         // Valid copies (including empty/inverted no-op boxes, BC 1x1/2x2 tail mips, 3D z-slices,
         // 2-plane depth/stencil, B2T uploads, and T2B readbacks) must keep succeeding cleanly.
-        run_copy("empty_box_noop", sub_loc(rgba_dst, 0), [100, 0, 0], sub_loc(rgba_src, 0), Some([0, 0, 0, 0, 4, 1]));
-        run_copy("inverted_box_noop", sub_loc(rgba_dst, 0), [0, 0, 0], sub_loc(rgba_src, 0), Some([100, 0, 0, 4, 4, 1]));
-        run_copy("t2t_valid_mip1", sub_loc(rgba_dst, 1), [0, 0, 0], sub_loc(rgba_src, 1), Some([0, 0, 0, 8, 8, 1]));
-        run_copy("bc_mip3_2x2_box4", sub_loc(bc_dst, 3), [0, 0, 0], sub_loc(bc_src, 3), Some([0, 0, 0, 4, 4, 1]));
-        run_copy("bc_mip4_1x1_b2t_4x4", sub_loc(bc_dst, 4), [0, 0, 0], fp_loc(buf, 71, 4, 4, 1), None);
-        run_copy("bc_mip4_1x1_b2t_1x1", sub_loc(bc_dst, 4), [0, 0, 0], fp_loc(buf, 71, 1, 1, 1), None);
-        run_copy("t2b_valid_mip1", fp_loc(buf, 28, 8, 8, 1), [0, 0, 0], sub_loc(rgba_src, 1), Some([0, 0, 0, 8, 8, 1]));
-        run_copy("3d_valid_z1", sub_loc(tex3d_dst, 1), [0, 0, 1], sub_loc(tex3d_src, 1), Some([0, 0, 0, 4, 4, 1]));
-        run_copy("ds_valid_plane1", sub_loc(ds_dst, 1), [0, 0, 0], sub_loc(ds_src, 1), None);
+        run_copy(
+            "empty_box_noop",
+            sub_loc(rgba_dst, 0),
+            [100, 0, 0],
+            sub_loc(rgba_src, 0),
+            Some([0, 0, 0, 0, 4, 1]),
+        );
+        run_copy(
+            "inverted_box_noop",
+            sub_loc(rgba_dst, 0),
+            [0, 0, 0],
+            sub_loc(rgba_src, 0),
+            Some([100, 0, 0, 4, 4, 1]),
+        );
+        run_copy(
+            "t2t_valid_mip1",
+            sub_loc(rgba_dst, 1),
+            [0, 0, 0],
+            sub_loc(rgba_src, 1),
+            Some([0, 0, 0, 8, 8, 1]),
+        );
+        run_copy(
+            "bc_mip3_2x2_box4",
+            sub_loc(bc_dst, 3),
+            [0, 0, 0],
+            sub_loc(bc_src, 3),
+            Some([0, 0, 0, 4, 4, 1]),
+        );
+        run_copy(
+            "bc_mip4_1x1_b2t_4x4",
+            sub_loc(bc_dst, 4),
+            [0, 0, 0],
+            fp_loc(buf, 71, 4, 4, 1),
+            None,
+        );
+        run_copy(
+            "bc_mip4_1x1_b2t_1x1",
+            sub_loc(bc_dst, 4),
+            [0, 0, 0],
+            fp_loc(buf, 71, 1, 1, 1),
+            None,
+        );
+        run_copy(
+            "t2b_valid_mip1",
+            fp_loc(buf, 28, 8, 8, 1),
+            [0, 0, 0],
+            sub_loc(rgba_src, 1),
+            Some([0, 0, 0, 8, 8, 1]),
+        );
+        run_copy(
+            "3d_valid_z1",
+            sub_loc(tex3d_dst, 1),
+            [0, 0, 1],
+            sub_loc(tex3d_src, 1),
+            Some([0, 0, 0, 4, 4, 1]),
+        );
+        run_copy(
+            "ds_valid_plane1",
+            sub_loc(ds_dst, 1),
+            [0, 0, 0],
+            sub_loc(ds_src, 1),
+            None,
+        );
 
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for obj in [
@@ -2426,45 +2720,45 @@ mod tests {
         let _ = host.log_messages();
         let make_texture =
             |dimension: u32, width: u32, height: u32, depth: u16, mips: u16, samples: u32| {
-            let words: [u32; 14] = [
-                dimension,
-                0,
-                0,
-                0,
-                width,
-                0,
-                height,
-                u32::from(depth) | u32::from(mips) << 16,
-                28,
-                samples,
-                0,
-                0,
-                1,
-                0,
-            ];
-            let heap: [u32; 5] = [1, 0, 0, 0, 0];
-            let iid = crate::object::guid(
-                0x696442be,
-                0xa72e,
-                0x4059,
-                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
-            );
-            let mut out = std::ptr::null();
-            assert_eq!(
-                crate::resource::create_committed(
-                    std::ptr::null(),
-                    heap.as_ptr().cast(),
+                let words: [u32; 14] = [
+                    dimension,
                     0,
-                    words.as_ptr().cast(),
                     0,
-                    std::ptr::null(),
-                    &iid,
-                    &mut out,
-                ),
-                S_OK
-            );
-            out
-        };
+                    0,
+                    width,
+                    0,
+                    height,
+                    u32::from(depth) | u32::from(mips) << 16,
+                    28,
+                    samples,
+                    0,
+                    0,
+                    1,
+                    0,
+                ];
+                let heap: [u32; 5] = [1, 0, 0, 0, 0];
+                let iid = crate::object::guid(
+                    0x696442be,
+                    0xa72e,
+                    0x4059,
+                    [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+                );
+                let mut out = std::ptr::null();
+                assert_eq!(
+                    crate::resource::create_committed(
+                        std::ptr::null(),
+                        heap.as_ptr().cast(),
+                        0,
+                        words.as_ptr().cast(),
+                        0,
+                        std::ptr::null(),
+                        &iid,
+                        &mut out,
+                    ),
+                    S_OK
+                );
+                out
+            };
 
         let single_64 = make_texture(3, 64, 64, 1, 1, 1);
         let single_64_mips = make_texture(3, 64, 64, 1, 2, 1);
@@ -2540,14 +2834,17 @@ mod tests {
             PlaneCount: 0,
         };
         // SAFETY: live device and initialized format-info struct.
-        assert!(unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_FORMAT_INFO,
-                std::ptr::from_mut(&mut info).cast(),
-                std::mem::size_of_val(&info) as u32,
-            )
-        }
-        .is_ok());
+        assert!(
+            // SAFETY: host owns a live D3D12 device; info is initialized and correctly sized.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_INFO,
+                    std::ptr::from_mut(&mut info).cast(),
+                    std::mem::size_of_val(&info) as u32,
+                )
+            }
+            .is_ok()
+        );
         assert_eq!(info.PlaneCount, 2);
         assert_eq!(
             texture_subresource_count(3, 2, u32::from(info.PlaneCount)),

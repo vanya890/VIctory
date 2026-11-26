@@ -1659,7 +1659,13 @@ fn conversion_probes() -> Vec<Probe> {
         0xBF80_0000,
         0x7FC0_0000,
     ]);
-    for m in [NONE, M { clamp: true, ..NONE }] {
+    for m in [
+        NONE,
+        M {
+            clamp: true,
+            ..NONE
+        },
+    ] {
         p.push(probe(
             vop3(0x18A, 5, [v(1), 0, 0], m),
             exact.clone(),
@@ -3178,7 +3184,9 @@ fn lds_out_of_bounds_reads_zero_and_drops_writes() {
     assert_clean(check(&[
         probe(plain, inputs.clone(), INT, |i| vec![i[0], 0, 0, 0]),
         probe(more, inputs.clone(), INT, |i| vec![i[0], 0, 0, i[0]]),
-        probe(masked, inputs, INT, |i| vec![if i[0] > i[1] { 0 } else { OLD }]),
+        probe(masked, inputs, INT, |i| {
+            vec![if i[0] > i[1] { 0 } else { OLD }]
+        }),
     ]));
 }
 
@@ -3189,29 +3197,95 @@ fn lds_out_of_bounds_reads_zero_and_drops_writes() {
 #[test]
 fn v_fmac_f32_accumulator_modifiers_match_rdna2_oracle() {
     const ROWS: [([u32; 4], u32, u32); 16] = [
-        ([0x3F80_0000, 0x4000_0000, 0x3F80_0000, OLD], 0x3F80_0000, 0x4040_0000),
-        ([0x3F80_0000, 0x4000_0000, 0xBF80_0000, OLD], 0x4040_0000, 0x4040_0000),
-        ([0x4000_0000, 0x4040_0000, 0xC0C0_0000, OLD], 0x4140_0000, 0x4140_0000),
-        ([0x4000_0000, 0xC040_0000, 0xC0C0_0000, OLD], 0x0000_0000, 0x0000_0000),
-        ([0x0000_0000, 0xBF80_0000, 0x0000_0000, OLD], 0x8000_0000, 0x0000_0000),
-        ([0x0000_0000, 0xBF80_0000, 0x8000_0000, OLD], 0x0000_0000, 0x0000_0000),
-        ([0x3F80_0000, 0x3F80_0000, 0x7F80_0000, OLD], 0xFF80_0000, 0x7F80_0000),
-        ([0x3F80_0000, 0x3F80_0000, 0xFF80_0000, OLD], 0x7F80_0000, 0x7F80_0000),
-        ([0x7F80_0000, 0x3F80_0000, 0xFF80_0000, OLD], 0x7F80_0000, 0x7F80_0000),
-        ([0x3F80_0000, 0x3F80_0000, 0x7FC0_0001, OLD], 0xFFC0_0001, 0x7FC0_0001),
-        ([0x3F80_0000, 0x3F80_0000, 0xFFA0_0000, OLD], 0x7FA0_0000, 0x7FA0_0000),
-        ([0x3F80_0000, 0x3F80_0000, 0x0000_0001, OLD], 0x3F80_0000, 0x3F80_0000),
-        ([0x0080_0000, 0x3F80_0000, 0x8080_0001, OLD], 0x0100_0000, 0x0100_0000),
-        ([0x4040_0000, 0x3EAA_AAAB, 0xBF80_0000, OLD], 0x4000_0000, 0x4000_0000),
-        ([0x7F7F_FFFF, 0x4000_0000, 0xFF7F_FFFF, OLD], 0x7F80_0000, 0x7F80_0000),
-        ([0xBF80_0000, 0x4000_0000, 0x4000_0000, OLD], 0xC080_0000, 0x0000_0000),
+        (
+            [0x3F80_0000, 0x4000_0000, 0x3F80_0000, OLD],
+            0x3F80_0000,
+            0x4040_0000,
+        ),
+        (
+            [0x3F80_0000, 0x4000_0000, 0xBF80_0000, OLD],
+            0x4040_0000,
+            0x4040_0000,
+        ),
+        (
+            [0x4000_0000, 0x4040_0000, 0xC0C0_0000, OLD],
+            0x4140_0000,
+            0x4140_0000,
+        ),
+        (
+            [0x4000_0000, 0xC040_0000, 0xC0C0_0000, OLD],
+            0x0000_0000,
+            0x0000_0000,
+        ),
+        (
+            [0x0000_0000, 0xBF80_0000, 0x0000_0000, OLD],
+            0x8000_0000,
+            0x0000_0000,
+        ),
+        (
+            [0x0000_0000, 0xBF80_0000, 0x8000_0000, OLD],
+            0x0000_0000,
+            0x0000_0000,
+        ),
+        (
+            [0x3F80_0000, 0x3F80_0000, 0x7F80_0000, OLD],
+            0xFF80_0000,
+            0x7F80_0000,
+        ),
+        (
+            [0x3F80_0000, 0x3F80_0000, 0xFF80_0000, OLD],
+            0x7F80_0000,
+            0x7F80_0000,
+        ),
+        (
+            [0x7F80_0000, 0x3F80_0000, 0xFF80_0000, OLD],
+            0x7F80_0000,
+            0x7F80_0000,
+        ),
+        (
+            [0x3F80_0000, 0x3F80_0000, 0x7FC0_0001, OLD],
+            0xFFC0_0001,
+            0x7FC0_0001,
+        ),
+        (
+            [0x3F80_0000, 0x3F80_0000, 0xFFA0_0000, OLD],
+            0x7FA0_0000,
+            0x7FA0_0000,
+        ),
+        (
+            [0x3F80_0000, 0x3F80_0000, 0x0000_0001, OLD],
+            0x3F80_0000,
+            0x3F80_0000,
+        ),
+        (
+            [0x0080_0000, 0x3F80_0000, 0x8080_0001, OLD],
+            0x0100_0000,
+            0x0100_0000,
+        ),
+        (
+            [0x4040_0000, 0x3EAA_AAAB, 0xBF80_0000, OLD],
+            0x4000_0000,
+            0x4000_0000,
+        ),
+        (
+            [0x7F7F_FFFF, 0x4000_0000, 0xFF7F_FFFF, OLD],
+            0x7F80_0000,
+            0x7F80_0000,
+        ),
+        (
+            [0xBF80_0000, 0x4000_0000, 0x4000_0000, OLD],
+            0xC080_0000,
+            0x0000_0000,
+        ),
     ];
     let inputs: Vec<[u32; 4]> = ROWS.iter().map(|&(i, _, _)| i).collect();
     let fmac_probe = |m: M, pick: fn(&([u32; 4], u32, u32)) -> u32| {
         let mut body = vec![vop1(0x01, 5, v(3))];
         body.extend(vop3(0x12B, 5, [v(1), v(2), 0], m));
         probe(body, inputs.clone(), F32, move |i| {
-            vec![pick(ROWS.iter().find(|&&(r, _, _)| r == i).expect("known input"))]
+            vec![pick(
+                ROWS.iter().find(|&&(r, _, _)| r == i).expect("known input"),
+            )]
         })
     };
     assert_clean(check(&[

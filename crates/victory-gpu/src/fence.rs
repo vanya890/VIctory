@@ -126,7 +126,9 @@ pub(crate) fn set(this: This, value: u64) -> HRESULT {
         if reached {
             set_event(event);
             WAITED.0.fetch_add(1, Ordering::Relaxed);
-            WAITED.1.fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+            WAITED
+                .1
+                .fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         !reached
     });
@@ -141,7 +143,10 @@ static WAITED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 /// Events set since the last call and how long they waited, summed.
 pub(crate) fn take_waited() -> (u64, std::time::Duration) {
     let n = WAITED.0.swap(0, Ordering::Relaxed);
-    (n, std::time::Duration::from_micros(WAITED.1.swap(0, Ordering::Relaxed)))
+    (
+        n,
+        std::time::Duration::from_micros(WAITED.1.swap(0, Ordering::Relaxed)),
+    )
 }
 
 /// A fence's value.

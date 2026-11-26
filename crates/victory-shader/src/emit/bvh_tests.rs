@@ -761,7 +761,13 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
             }
             let roots = vec![
                 (0, Root::Constants(ud.clone())),
-                (1, Root::View { srv: true, data: page_table(1, 3) }),
+                (
+                    1,
+                    Root::View {
+                        srv: true,
+                        data: page_table(1, 3),
+                    },
+                ),
                 (2, Root::Uav(2 * 4096 / 32)),
             ];
             let views = [

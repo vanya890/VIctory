@@ -744,7 +744,15 @@ fn relative_moves_in_waterfall_loops_reach_each_lane_s_element() {
         View::RawUav(12 * 32),
     ];
     let want: Vec<u32> = (0..12u32)
-        .flat_map(|k| (0..32u32).map(move |lane| if (lane >> 1).min(11) == k { 1 << lane | 0x8000_0000 } else { 0 }))
+        .flat_map(|k| {
+            (0..32u32).map(move |lane| {
+                if (lane >> 1).min(11) == k {
+                    1 << lane | 0x8000_0000
+                } else {
+                    0
+                }
+            })
+        })
         .collect();
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()

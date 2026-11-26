@@ -1081,13 +1081,13 @@ mod tests {
         };
 
         let (zero_shape, v0_in, saved) = run(128);
-        assert_eq!(
-            zero_shape,
-            Some(Shape::Half(Op::AddH, v0_in, saved, 0, 31))
-        );
+        assert_eq!(zero_shape, Some(Shape::Half(Op::AddH, v0_in, saved, 0, 31)));
         for c in 240..=248u16 {
             let (shape, _, _) = run(c);
-            assert_eq!(shape, None, "inline float const {c} was treated as identity");
+            assert_eq!(
+                shape, None,
+                "inline float const {c} was treated as identity"
+            );
         }
     }
 }

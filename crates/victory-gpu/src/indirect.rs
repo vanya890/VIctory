@@ -162,7 +162,10 @@ fn make() -> windows::core::Result<Clamp> {
         if let Some(errors) = errors {
             // SAFETY: the blob's own bytes.
             let text = unsafe {
-                std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
+                std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                )
             };
             tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
         }
@@ -171,7 +174,8 @@ fn make() -> windows::core::Result<Clamp> {
     let code = code.ok_or_else(windows::core::Error::empty)?;
     // SAFETY: the blob's own bytes; the root signature is inside the shader.
     unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let bytes =
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
@@ -203,7 +207,11 @@ fn make() -> windows::core::Result<Clamp> {
 // promoted to a write state the input assembler may not use (the debug
 // layer cannot see view accesses; GPU-based validation might); upgrade to
 // per-list tracked buffer states if a driver or that validation minds.
-pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
+pub(crate) fn bound(
+    list: &HostList,
+    gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<ID3D12Resource> {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return None;
     };
@@ -219,7 +227,11 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
         // Earlier shader writes (the title's argument passes) first.
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(
+                &out,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
         ]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
@@ -231,7 +243,11 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
         l.Dispatch(records.min(1), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+            transition(
+                &out,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            ),
         ]);
     }
     Some(out)
@@ -254,7 +270,9 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
         },
     }
 }
@@ -304,7 +322,11 @@ mod tests {
             list.close();
             host.execute(&[&list]);
             for at in 0..all {
-                assert_eq!(data.add(at).read_volatile(), words[at % words.len()], "the title's copy as written");
+                assert_eq!(
+                    data.add(at).read_volatile(),
+                    words[at % words.len()],
+                    "the title's copy as written"
+                );
             }
             let mut out_data = std::ptr::null_mut();
             out?.Map(0, None, Some(&mut out_data)).unwrap();
@@ -390,9 +412,15 @@ mod tests {
             let mut run = issued();
             run.extend(order.iter().flat_map(|&i| recorded[i].1.clone()));
             let mut states: std::collections::HashMap<usize, u32> =
-                [key(&title), key(&recorded[0].0), key(&recorded[1].0)].into_iter().map(|k| (k, 0)).collect();
+                [key(&title), key(&recorded[0].0), key(&recorded[1].0)]
+                    .into_iter()
+                    .map(|k| (k, 0))
+                    .collect();
             replay(&run, &mut states).unwrap();
-            assert!(run.iter().all(|t| t.0 != key(&title)), "the title's copy is never transitioned");
+            assert!(
+                run.iter().all(|t| t.0 != key(&title)),
+                "the title's copy is never transitioned"
+            );
             assert!(states.values().all(|&s| s == 0), "all common again");
             for (out, _) in &recorded {
                 let mut p = std::ptr::null_mut();
@@ -404,7 +432,12 @@ mod tests {
                 assert_eq!(clamped, [65_535, 1, 1]);
             }
             // SAFETY: as above.
-            assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1], "the title's copy as written");
+            assert_eq!(
+                // SAFETY: data points into the still-mapped readback buffer.
+                unsafe { data.cast::<[u32; 3]>().read_volatile() },
+                [70_000, 1, 1],
+                "the title's copy as written"
+            );
         }
     }
 

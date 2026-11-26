@@ -128,7 +128,9 @@ impl<S, F> Held<S, F> {
         let now = Instant::now();
         match self.queues.iter_mut().find(|(q, _)| *q == queue) {
             Some((_, items)) => items.push_back((item, now, true)),
-            None => self.queues.push((queue, VecDeque::from([(item, now, true)]))),
+            None => self
+                .queues
+                .push((queue, VecDeque::from([(item, now, true)]))),
         }
     }
 
@@ -147,9 +149,7 @@ impl<S, F> Held<S, F> {
         let reads = std::cell::RefCell::new(Vec::new());
         let read = |address: u64, bytes: u8| {
             let mut cache = reads.borrow_mut();
-            if let Some((_, _, value)) = cache
-                .iter()
-                .find(|(a, b, _)| *a == address && *b == bytes)
+            if let Some((_, _, value)) = cache.iter().find(|(a, b, _)| *a == address && *b == bytes)
             {
                 return *value;
             }
@@ -211,7 +211,7 @@ impl<S, F> Held<S, F> {
                         Some(Item::Signal(fence, value)) => {
                             signal(fence, value);
                             reads.borrow_mut().clear();
-                        },
+                        }
                         Some(Item::FenceWait(fence, _)) => {
                             drop(fence);
                             // A completed fence is a synchronization boundary: work
@@ -241,13 +241,20 @@ impl<S, F> Held<S, F> {
 
     /// The queues still holding work: (queue, items, how long the head
     /// waited, the head's waits that do not hold).
-    pub(crate) fn blocked(&self, read: &dyn Fn(u64, u8) -> Option<u64>) -> Vec<(usize, usize, Duration, Vec<ValueWait>)> {
+    pub(crate) fn blocked(
+        &self,
+        read: &dyn Fn(u64, u8) -> Option<u64>,
+    ) -> Vec<(usize, usize, Duration, Vec<ValueWait>)> {
         self.queues
             .iter()
             .filter_map(|(q, items)| {
                 let (head, since, _) = items.front()?;
                 let unmet = match head {
-                    Item::Segment(_, waits) => waits.iter().filter(|w| w.holds(read) == Some(false)).copied().collect(),
+                    Item::Segment(_, waits) => waits
+                        .iter()
+                        .filter(|w| w.holds(read) == Some(false))
+                        .copied()
+                        .collect(),
                     _ => Vec::new(),
                 };
                 Some((*q, items.len(), since.elapsed(), unmet))
@@ -262,7 +269,9 @@ impl<S, F> Held<S, F> {
 
     /// Whether `queue` holds anything.
     pub(crate) fn holds_work(&self, queue: usize) -> bool {
-        self.queues.iter().any(|(q, items)| *q == queue && !items.is_empty())
+        self.queues
+            .iter()
+            .any(|(q, items)| *q == queue && !items.is_empty())
     }
 
     /// Releases work held longer than `limit` at the heads of blocked
@@ -300,7 +309,13 @@ mod tests {
     }
 
     fn ge(address: u64, reference: u64) -> ValueWait {
-        ValueWait { address, bytes: 8, comparison: GREATER_EQUAL, reference, mask: u64::MAX }
+        ValueWait {
+            address,
+            bytes: 8,
+            comparison: GREATER_EQUAL,
+            reference,
+            mask: u64::MAX,
+        }
     }
 
     fn pump(held: &mut Held<&'static str>, fake: &RefCell<Fake>) -> Pumped {
@@ -320,14 +335,34 @@ mod tests {
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));
         };
-        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal })
+        held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        })
     }
 
     #[test]
     fn comparisons_test_the_masked_value() {
         let read = |_, _| Some(0x1_0000_0005);
-        let w = |comparison, reference| ValueWait { address: 8, bytes: 4, comparison, reference, mask: 0xffff_ffff };
-        let expect = [(NEVER, false), (LESS, false), (EQUAL, true), (LESS_EQUAL, true), (GREATER, false), (NOT_EQUAL, false), (GREATER_EQUAL, true), (ALWAYS, true)];
+        let w = |comparison, reference| ValueWait {
+            address: 8,
+            bytes: 4,
+            comparison,
+            reference,
+            mask: 0xffff_ffff,
+        };
+        let expect = [
+            (NEVER, false),
+            (LESS, false),
+            (EQUAL, true),
+            (LESS_EQUAL, true),
+            (GREATER, false),
+            (NOT_EQUAL, false),
+            (GREATER_EQUAL, true),
+            (ALWAYS, true),
+        ];
         for (cmp, holds) in expect {
             assert_eq!(w(cmp, 5).holds(&read), Some(holds), "comparison {cmp}");
         }
@@ -347,7 +382,11 @@ mod tests {
         let mut held = Held::default();
         held.push(2, Item::Segment("depth", vec![ge(0x100, 7)]));
         let p = pump(&mut held, &fake);
-        assert_eq!((p.pieces, p.segments), (0, 0), "held: the value is not there");
+        assert_eq!(
+            (p.pieces, p.segments),
+            (0, 0),
+            "held: the value is not there"
+        );
         assert!(held.holds_work(2));
         held.push(1, Item::Segment("draw", vec![]));
         let p = pump(&mut held, &fake);
@@ -449,7 +488,10 @@ mod tests {
             run: &mut run,
             signal: &mut signal,
         });
-        assert_eq!(*ran.borrow(), vec![(2, vec!["after-fence"]), (1, vec!["queue-a"])]);
+        assert_eq!(
+            *ran.borrow(),
+            vec![(2, vec!["after-fence"]), (1, vec!["queue-a"])]
+        );
         assert_eq!(reads.get(), 3, "the post-fence read must not reuse X=0");
         assert!(!pumped.blocked);
         assert!(held.is_empty());
@@ -465,10 +507,7 @@ mod tests {
 
         let p = pump(&mut held, &fake);
 
-        assert_eq!(
-            fake.borrow().log,
-            ["q2: release", "q1: waiting"]
-        );
+        assert_eq!(fake.borrow().log, ["q2: release", "q1: waiting"]);
         assert!(!p.blocked, "all queues drained during the later pump pass");
         assert!(held.is_empty());
     }
@@ -507,7 +546,10 @@ mod tests {
         held.push(1, Item::Segment("g1", vec![ge(0x10, 1)]));
         held.push(1, Item::Segment("g2", vec![ge(0x30, 1)]));
         pump(&mut held, &fake);
-        assert_eq!(fake.borrow().log, ["q1: g0", "q2: c1", "q1: g1", "q2: c2", "q1: g2"]);
+        assert_eq!(
+            fake.borrow().log,
+            ["q1: g0", "q2: c1", "q1: g1", "q2: c2", "q1: g2"]
+        );
         assert!(held.blocked(&|_, _| Some(0)).is_empty());
     }
 
@@ -567,7 +609,10 @@ mod tests {
         let read = |a: u64, _| Some(*fake.borrow().memory.get(&a).unwrap_or(&0));
         let blocked = held.blocked(&read);
         assert_eq!(blocked.len(), 1);
-        assert_eq!((blocked[0].0, blocked[0].1, blocked[0].3.clone()), (2, 2, vec![ge(0x100, 2)]));
+        assert_eq!(
+            (blocked[0].0, blocked[0].1, blocked[0].3.clone()),
+            (2, 2, vec![ge(0x100, 2)])
+        );
         fake.borrow_mut().memory.insert(0x100, 2);
         let p = pump(&mut held, &fake);
         assert_eq!(p.waited.len(), 1);
@@ -578,7 +623,13 @@ mod tests {
     fn unknown_comparisons_are_counted_and_do_not_hold_work() {
         let fake = RefCell::new(Fake::default());
         let mut held = Held::default();
-        let odd = ValueWait { address: 0x100, bytes: 4, comparison: 12, reference: 1, mask: 0xffff_ffff };
+        let odd = ValueWait {
+            address: 0x100,
+            bytes: 4,
+            comparison: 12,
+            reference: 1,
+            mask: 0xffff_ffff,
+        };
         held.push(2, Item::Segment("odd", vec![odd]));
         let p = pump(&mut held, &fake);
         assert_eq!((p.segments, p.unknown), (1, 1));
