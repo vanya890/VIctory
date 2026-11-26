@@ -1507,6 +1507,97 @@ fn range_in_bounds(first: u32, count: u32, total: u32) -> bool {
             || (count > 0 && u64::from(first) + u64::from(count) <= u64::from(total)))
 }
 
+/// Return the concrete number of array slices to put in a D3D12 descriptor.
+/// The console's UINT_MAX means "all remaining"; non-null D3D12 ArraySize
+/// fields require an explicit count.
+fn array_count(first: u32, count: u32, total: u32) -> Option<u32> {
+    if first >= total || count == 0 {
+        return None;
+    }
+    let count = if count == u32::MAX { total - first } else { count };
+    first.checked_add(count).filter(|&end| end <= total).map(|_| count)
+}
+
+/// Return the concrete number of cubes to put in a D3D12 cube-array SRV.
+fn cube_count(first_face: u32, count: u32, total_faces: u32) -> Option<u32> {
+    if first_face >= total_faces {
+        return None;
+    }
+    let count = if count == u32::MAX {
+        (total_faces - first_face) / 6
+    } else {
+        count
+    };
+    (count > 0
+        && u64::from(first_face) + u64::from(count) * 6 <= u64::from(total_faces))
+        .then_some(count)
+}
+
+/// Replace console remaining-range sentinels with concrete host SRV counts.
+/// Called only after the resource/view range has passed validation.
+fn normalize_srv_array_counts(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, total: u32) -> bool {
+    // SAFETY: each arm accesses and writes only the union member selected by ViewDimension.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+                let mut v = desc.Anonymous.Texture1DArray;
+                let Some(count) = array_count(v.FirstArraySlice, v.ArraySize, total) else { return false };
+                v.ArraySize = count;
+                desc.Anonymous.Texture1DArray = v;
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let mut v = desc.Anonymous.Texture2DArray;
+                let Some(count) = array_count(v.FirstArraySlice, v.ArraySize, total) else { return false };
+                v.ArraySize = count;
+                desc.Anonymous.Texture2DArray = v;
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => {
+                let mut v = desc.Anonymous.Texture2DMSArray;
+                let Some(count) = array_count(v.FirstArraySlice, v.ArraySize, total) else { return false };
+                v.ArraySize = count;
+                desc.Anonymous.Texture2DMSArray = v;
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let mut v = desc.Anonymous.TextureCubeArray;
+                let Some(count) = cube_count(v.First2DArrayFace, v.NumCubes, total) else { return false };
+                v.NumCubes = count;
+                desc.Anonymous.TextureCubeArray = v;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Replace console remaining-range sentinels with concrete host UAV counts.
+fn normalize_uav_array_counts(desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC, total: u32) -> bool {
+    // SAFETY: each arm accesses and writes only the union member selected by ViewDimension.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+                let mut v = desc.Anonymous.Texture1DArray;
+                let Some(count) = array_count(v.FirstArraySlice, v.ArraySize, total) else { return false };
+                v.ArraySize = count;
+                desc.Anonymous.Texture1DArray = v;
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                let mut v = desc.Anonymous.Texture2DArray;
+                let Some(count) = array_count(v.FirstArraySlice, v.ArraySize, total) else { return false };
+                v.ArraySize = count;
+                desc.Anonymous.Texture2DArray = v;
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY => {
+                let mut v = desc.Anonymous.Texture2DMSArray;
+                let Some(count) = array_count(v.FirstArraySlice, v.ArraySize, total) else { return false };
+                v.ArraySize = count;
+                desc.Anonymous.Texture2DMSArray = v;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 /// Whether `plane` is valid for a view in `view_format` of a texture in
 /// `resource_format`.
 fn valid_plane(resource_format: DXGI_FORMAT, view_format: DXGI_FORMAT, plane: u32) -> bool {
@@ -1530,7 +1621,7 @@ fn valid_component_mapping(mapping: u32) -> bool {
 /// Whether `desc`'s dimension, mip/slice/plane ranges and component mapping
 /// fit `texture` on the host: invalid descriptions remove the retail D3D12
 /// device (`DXGI_ERROR_INVALID_CALL`) inside `CreateShaderResourceView`.
-fn texture_srv_fits(texture: &ID3D12Resource, desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> bool {
+fn texture_srv_fits(texture: &ID3D12Resource, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) -> bool {
     if !valid_component_mapping(desc.Shader4ComponentMapping) {
         once!(
             mapping = format_args!("{:#x}", desc.Shader4ComponentMapping),
@@ -1594,6 +1685,7 @@ fn texture_srv_fits(texture: &ID3D12Resource, desc: &D3D12_SHADER_RESOURCE_VIEW_
             _ => false,
         }
     };
+    let ok = ok && normalize_srv_array_counts(desc, array);
     if !ok {
         once!(
             resource_dim = d.Dimension.0,
@@ -1607,10 +1699,7 @@ fn texture_srv_fits(texture: &ID3D12Resource, desc: &D3D12_SHADER_RESOURCE_VIEW_
     ok
 }
 
-/// Whether `desc`'s dimension and mip/slice/plane ranges fit `texture` on the
-/// host: invalid descriptions remove the retail D3D12 device
-/// (`DXGI_ERROR_INVALID_CALL`) inside `CreateUnorderedAccessView`.
-fn texture_uav_fits(texture: &ID3D12Resource, desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> bool {
+fn texture_uav_fits(texture: &ID3D12Resource, desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC) -> bool {
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     let mips = u32::from(d.MipLevels);
@@ -1653,6 +1742,7 @@ fn texture_uav_fits(texture: &ID3D12Resource, desc: &D3D12_UNORDERED_ACCESS_VIEW
             _ => false,
         }
     };
+    let ok = ok && normalize_uav_array_counts(desc, array);
     if !ok {
         once!(
             resource_dim = d.Dimension.0,
@@ -1718,7 +1808,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
-                if desc.as_ref().is_some_and(|d| !texture_srv_fits(texture, d)) {
+                if desc.as_mut().is_some_and(|d| !texture_srv_fits(texture, d)) {
                     return None;
                 }
                 // SAFETY: a live texture and a slot of our heap.
@@ -1769,7 +1859,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
-            if desc.as_ref().is_some_and(|d| !texture_uav_fits(texture, d)) {
+            if desc.as_mut().is_some_and(|d| !texture_uav_fits(texture, d)) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
@@ -2800,6 +2890,48 @@ mod tests {
     /// `HostHeap::view_addresses`, and `descriptor::pinned_view` against concurrent
     /// `Resource::Release()` across textures, buffers, and dual-resource UAVs must
     /// neither dereference freed resources nor deadlock on `VIEWS`.
+    #[test]
+    fn array_view_sentinels_are_normalized_in_host_descriptors() {
+        let mut srv_words = [0u32; 10];
+        srv_words[1] = 5; // TEXTURE2DARRAY
+        srv_words[5] = 1; // MipLevels
+        srv_words[6] = 2; // FirstArraySlice
+        srv_words[7] = u32::MAX; // console "all remaining" sentinel
+        let mut srv = srv_desc(&srv_words);
+        assert!(normalize_srv_array_counts(&mut srv, 6));
+        // SAFETY: the test selected TEXTURE2DARRAY above.
+        assert_eq!(unsafe { srv.Anonymous.Texture2DArray.ArraySize }, 4);
+
+        let mut ms_srv_words = [0u32; 10];
+        ms_srv_words[1] = 7; // TEXTURE2DMSARRAY
+        ms_srv_words[4] = 1; // FirstArraySlice
+        ms_srv_words[5] = u32::MAX; // ArraySize
+        let mut ms_srv = srv_desc(&ms_srv_words);
+        assert!(normalize_srv_array_counts(&mut ms_srv, 6));
+        // SAFETY: the test selected TEXTURE2DMSARRAY above.
+        assert_eq!(unsafe { ms_srv.Anonymous.Texture2DMSArray.ArraySize }, 5);
+
+        let mut cube_words = [0u32; 10];
+        cube_words[1] = 10; // TEXTURECUBEARRAY
+        cube_words[5] = 1; // MipLevels
+        cube_words[6] = 6; // First2DArrayFace
+        cube_words[7] = u32::MAX; // NumCubes
+        let mut cube_srv = srv_desc(&cube_words);
+        assert!(normalize_srv_array_counts(&mut cube_srv, 18));
+        // SAFETY: the test selected TEXTURECUBEARRAY above.
+        assert_eq!(unsafe { cube_srv.Anonymous.TextureCubeArray.NumCubes }, 2);
+
+        let mut uav_words = [0u32; 10];
+        uav_words[1] = 5; // TEXTURE2DARRAY
+        uav_words[2] = 1; // MipSlice
+        uav_words[3] = 2; // FirstArraySlice
+        uav_words[4] = u32::MAX; // ArraySize
+        let mut uav = uav_desc(&uav_words);
+        assert!(normalize_uav_array_counts(&mut uav, 6));
+        // SAFETY: the test selected TEXTURE2DARRAY above.
+        assert_eq!(unsafe { uav.Anonymous.Texture2DArray.ArraySize }, 4);
+    }
+
     #[test]
     fn texture_views_with_invalid_dimensions_ranges_or_mapping_fall_back_to_null() {
         let Some(host) = host() else {
