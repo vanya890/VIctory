@@ -914,6 +914,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cached_title_written_flags_match_resource_flag_semantics() {
+        assert!(title_written_flags(0));
+        assert!(!title_written_flags(0x1)); // render target
+        assert!(!title_written_flags(0x2)); // depth/stencil
+        assert!(!title_written_flags(0x4)); // unordered access
+        assert!(!title_written_flags(0x7)); // any host-written use
+        assert!(title_written_flags(0x8)); // deny shader resource alone
+    }
+
+    #[test]
     fn subresource_len_stays_inside_staging_total() {
         // A 4x4 RGBA8 texture has RowPitch=256, rows=4, last_row=16 -> total=784.
         // Padded size (1024) must be clamped to 784 so from_raw_parts_mut stays in bounds.
