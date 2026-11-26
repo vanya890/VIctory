@@ -32,9 +32,6 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      # Includes xtask's repository_passes_policy, the asset-policy check.
-      - name: Tests
-        run: cargo test --workspace --locked
       # The ordinary workspace test may have no hardware adapter. Run the
       # prelude regressions explicitly on WARP and fail if WARP is unavailable.
       - name: WARP state-prelude regressions
@@ -44,3 +41,6 @@ jobs:
         run: |
           cargo test -p victory-gpu --features diagnostics --lib host::tests::lists_without_state_changes_do_not_create_a_prelude -- --exact
           cargo test -p victory-gpu --features diagnostics --lib host::tests::a_second_use_gets_its_own_prelude -- --exact
+      # Includes xtask's repository_passes_policy, the asset-policy check.
+      - name: Tests
+        run: cargo test --workspace --locked
