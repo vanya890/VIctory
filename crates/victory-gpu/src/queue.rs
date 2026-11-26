@@ -1478,6 +1478,10 @@ mod tests {
         // Title legally releases `q1` while its held work is still pending.
         let q1_addr = q1 as usize;
         let refs_left = slot::<Release>(q1, 0x10)(q1);
+        assert_eq!(
+            refs_left, 1,
+            "HELD must retain exactly one COM reference until q1 drains"
+        );
 
         // The extra COM reference keeps q1 allocated, so a replacement queue
         // cannot reuse its address before the held work drains.
