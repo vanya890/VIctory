@@ -4788,13 +4788,40 @@ mod present_plane_tests {
         assert_eq!((red, blue, alpha), (0x3c00, 0x0000, 0x3c00));
         assert!(matches!(green, 0x37ff | 0x3800), "expected ~0.5 as f16, got {green:#06x}");
 
+        // Use a fresh Host so no other parallel test can have cached a
+        // compositor with this format and bypass the injected creation error.
+        let isolated = create().expect("isolated D3D12 host");
+        let mut isolated_texture = None;
+        // SAFETY: live isolated device and a valid 2D render-target description.
+        unsafe {
+            isolated.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 32,
+                        Height: 32,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R16G16B16A16_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut isolated_texture,
+                )
+                .unwrap();
+        }
+        let isolated_texture = isolated_texture.unwrap();
         let mut attempted = false;
-        let failed = host.present_planes_with_compositor(
-            &[PresentPlane::Raw(
-                &typeless,
-                state,
-                Some(DXGI_FORMAT_R16G16B16A16_UNORM.0 as u32),
-            )],
+        let failed = isolated.present_planes_with_compositor(
+            &[PresentPlane::Raw(&isolated_texture, state, None)],
             7,
             |_, _| {
                 attempted = true;
