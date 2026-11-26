@@ -24,7 +24,7 @@ pub(crate) fn plan(
     io: &StageIo,
     native_wave64: bool,
     wave: WaveMode,
-    waterfall_reads: &HashSet<Value>,
+    waterfall_reads: &[Value],
     lds_dwords: u32,
 ) -> Plan {
     let is_compute = matches!(io, StageIo::Cs(_));
