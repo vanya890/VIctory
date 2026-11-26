@@ -4790,15 +4790,15 @@ mod present_plane_tests {
         let render_target_state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
         let first_pixel =
             |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
-                assert_eq!(footprint.Footprint.Format, DXGI_FORMAT_R16G16B16A16_FLOAT);
+                assert_eq!(footprint.Footprint.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
                 let mut mapped = std::ptr::null_mut();
-                // SAFETY: the present copy completed and the footprint names a live, aligned RGBA16F pixel.
+                // SAFETY: the present copy completed and the footprint names a live RGBA pixel.
                 let rgba = unsafe {
                     buffer.Map(0, None, Some(&mut mapped)).unwrap();
                     let rgba = mapped
                         .cast::<u8>()
                         .add(footprint.Offset as usize)
-                        .cast::<[u16; 4]>()
+                        .cast::<[u8; 4]>()
                         .read();
                     buffer.Unmap(0, None);
                     rgba
@@ -4806,7 +4806,7 @@ mod present_plane_tests {
                 (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
             };
         let typed = make(
-            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
             D3D12_RESOURCE_FLAG_NONE,
             D3D12_RESOURCE_STATE_COPY_DEST,
         );
@@ -4835,7 +4835,7 @@ mod present_plane_tests {
                 PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                     Offset: 0,
                     Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
                         Width: 32,
                         Height: 32,
                         Depth: 1,
@@ -4866,14 +4866,14 @@ mod present_plane_tests {
             &[PresentPlane::Raw(
                 &typed,
                 state,
-                Some(DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32),
+                Some(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB.0 as u32),
             )],
             6,
             Compositor::new,
             |buffer, footprint| converted_pixel = Some(first_pixel(buffer, footprint)),
         );
-        assert!(converted.0.is_some(), "typed UNORM format must enable conversion");
-        assert_eq!(converted_pixel, Some((32, 32, [0x3c00, 0, 0x3804, 0x3c00])));
+        assert!(converted.0.is_some(), "typed sRGB format must enable conversion");
+        assert_eq!(converted_pixel, Some((32, 32, [255, 0, 55, 255])));
 
         // Use a fresh Host so no other parallel test can have cached a
         // compositor with this format and bypass the injected creation error.
