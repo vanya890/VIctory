@@ -975,7 +975,6 @@ fn staging_copy(
     Some(s)
 }
 
-
 /// Fast 128-bit non-cryptographic content digest for detecting changes in
 /// untracked texture memory. Processes 32 bytes per iteration across four
 /// independent 64-bit accumulators to stay memory-bandwidth-bound.
@@ -1109,7 +1108,6 @@ mod tests {
             fast,
         );
     }
-
 
     #[test]
     fn cached_title_written_flags_match_resource_flag_semantics() {
