@@ -4806,23 +4806,23 @@ mod present_plane_tests {
                 (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
             };
         let typed = make(
-            DXGI_FORMAT_R16G16B16A16_UNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
             D3D12_RESOURCE_FLAG_NONE,
             D3D12_RESOURCE_STATE_COPY_DEST,
         );
-        let row_pitch = 32 * 8;
+        let row_pitch = 32 * 4;
         let (upload, data) = host
             .upload_buffer((row_pitch * 32) as u64)
             .expect("upload buffer for typed shader resource");
         // SAFETY: mapped upload memory is large enough for 32 rows at this pitch.
         unsafe {
             for y in 0..32 {
-                let row = data.add(y * row_pitch).cast::<u16>();
+                let row = data.add(y * row_pitch);
                 for x in 0..32 {
-                    row.add(x * 4).write(0xffff);
+                    row.add(x * 4).write(255);
                     row.add(x * 4 + 1).write(0);
-                    row.add(x * 4 + 2).write(0x8000);
-                    row.add(x * 4 + 3).write(0xffff);
+                    row.add(x * 4 + 2).write(128);
+                    row.add(x * 4 + 3).write(255);
                 }
             }
         }
@@ -4835,7 +4835,7 @@ mod present_plane_tests {
                 PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                     Offset: 0,
                     Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                        Format: DXGI_FORMAT_R16G16B16A16_UNORM,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
                         Width: 32,
                         Height: 32,
                         Depth: 1,
@@ -4873,7 +4873,7 @@ mod present_plane_tests {
             |buffer, footprint| converted_pixel = Some(first_pixel(buffer, footprint)),
         );
         assert!(converted.0.is_some(), "typed UNORM format must enable conversion");
-        assert_eq!(converted_pixel, Some((32, 32, [0x3c00, 0, 0x3800, 0x3c00])));
+        assert_eq!(converted_pixel, Some((32, 32, [0x3c00, 0, 0x3804, 0x3c00])));
 
         // Use a fresh Host so no other parallel test can have cached a
         // compositor with this format and bypass the injected creation error.
@@ -4894,7 +4894,7 @@ mod present_plane_tests {
                         Height: 32,
                         DepthOrArraySize: 1,
                         MipLevels: 1,
-                        Format: DXGI_FORMAT_R16G16B16A16_UNORM,
+                        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
                         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                         Flags: D3D12_RESOURCE_FLAG_NONE,
                         ..Default::default()
