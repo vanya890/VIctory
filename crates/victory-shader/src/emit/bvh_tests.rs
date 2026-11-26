@@ -848,11 +848,16 @@ fn intersections_on_nodes_in_title_memory_equal_the_reference() {
     run_cases(true, 4, true);
 }
 
-/// A lost carry must land on an unmapped page; a non-zero high pointer word
-/// must select a separate mapped page in the root-derived title-memory path.
+/// A dropped low-word carry must land on an unmapped page.
 #[test]
-fn root_derived_bvh_addresses_preserve_low_word_carries_and_node_hi() {
+fn root_derived_bvh_addresses_preserve_low_word_carries() {
     // `memory = false` selects the Source::Built root-descriptor path.
     run_cases_at(false, 4, false, TITLE - 0x1_0000_0000, 0x2000_0000, 0);
+}
+
+/// A non-zero high pointer word must select a separate mapped page.
+#[test]
+fn root_derived_bvh64_addresses_preserve_node_hi() {
+    // `memory = false` selects the Source::Built root-descriptor path.
     run_cases_at(true, 4, false, TITLE, 0, 1);
 }
