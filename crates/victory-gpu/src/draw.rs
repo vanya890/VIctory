@@ -809,7 +809,15 @@ impl State {
             // their addresses go into the page table.
             let mut roots = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                let n = dwords as usize;
+                let mut stack = [0u32; 64];
+                let mut overflow = Vec::new();
+                let values: &mut [u32] = if n <= stack.len() {
+                    &mut stack[..n]
+                } else {
+                    overflow.resize(n, 0);
+                    &mut overflow
+                };
                 for u in &t.host.user_data {
                     if u.root == RootType::Descriptor
                         && u.dword == 0
@@ -1961,9 +1969,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     // Constant buffers (raw views) to their copy's end at most; others in
     // the copy their host view reads.
     let range = match *view {
-        View::Constant(address, size) => crate::shadow::find(address, 1).and_then(|s| {
+        View::Constant(address, size) => crate::shadow::find(address, 1).map(|s| {
             let len = u64::from(size).min(s.left(address));
-            crate::shadow::find(address, len).map(|s| (s, address, len))
+            (s, address, len)
         }),
         _ => crate::descriptor::host::view_copy(view),
     };
