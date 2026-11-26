@@ -200,6 +200,10 @@ impl<T: Clone> Chunks<T> {
             self.all.select_nth_unstable_by_key(CHUNKS_KEPT, |chunk| std::cmp::Reverse(chunk.size));
         }
         self.all.truncate(CHUNKS_KEPT);
+        // Large chunks should be considered before smaller retained chunks.
+        // Otherwise a large request can skip a small chunk and strand it for
+        // later smaller requests in the same submission.
+        self.all.sort_unstable_by_key(|chunk| std::cmp::Reverse(chunk.size));
     }
 
     fn take(
