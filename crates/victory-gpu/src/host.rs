@@ -3332,7 +3332,8 @@ impl<'a> PresentPlane<'a> {
     /// the actual typed view that produced its pixels; a denied-SRV resource
     /// cannot be sampled at all.
     fn srv_format(&self) -> Option<DXGI_FORMAT> {
-        // SAFETY: this plane owns a live host resource.\n        let desc = unsafe { self.texture().GetDesc() };
+        // SAFETY: this plane owns a live host resource.
+        let desc = unsafe { self.texture().GetDesc() };
         if desc.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 != 0 {
             return None;
         }
