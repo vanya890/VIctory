@@ -2392,7 +2392,7 @@ impl HostList {
                 // A previous use in this same submission is still in flight.
                 // Allocate another pair, but only because this prelude has work.
                 None => {
-                    let host = host().unwrap_or_else(|| fail("the list's host is unavailable"));
+                    let host = host().unwrap_or_else(|| fail(format_args!("the list's host is unavailable")));
                     match host.new_prelude() {
                         Ok(pair) => pair,
                         Err(e) => fail(format_args!(
