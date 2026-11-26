@@ -4623,6 +4623,102 @@ mod present_plane_tests {
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
+
+    #[test]
+    fn present_single_plane_copies_subresource_zero_of_mipmapped_and_array_textures() {
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX subresource test: no D3D12 device");
+            return;
+        };
+        let make = |mips: u16, array: u16, color: [f32; 4]| -> ID3D12Resource {
+            let mut texture = None;
+            // SAFETY: live device and a valid 2D render-target description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 32,
+                            Height: 32,
+                            DepthOrArraySize: array,
+                            MipLevels: mips,
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+                let texture = texture.unwrap();
+                let desc = D3D12_RENDER_TARGET_VIEW_DESC {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    ViewDimension: if array > 1 {
+                        D3D12_RTV_DIMENSION_TEXTURE2DARRAY
+                    } else {
+                        D3D12_RTV_DIMENSION_TEXTURE2D
+                    },
+                    Anonymous: if array > 1 {
+                        D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2DArray: D3D12_TEX2D_ARRAY_RTV {
+                                MipSlice: 0,
+                                FirstArraySlice: 0,
+                                ArraySize: 1,
+                                PlaneSlice: 0,
+                            },
+                        }
+                    } else {
+                        D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_RTV { MipSlice: 0, PlaneSlice: 0 },
+                        }
+                    },
+                };
+                let list = host.new_list().unwrap();
+                list.list.ClearRenderTargetView(host.rtv(&texture, Some(&desc)), &color, None);
+                list.close();
+                host.execute(&[&list]);
+                texture
+            }
+        };
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let mipmapped = make(3, 1, [0.0, 1.0, 0.0, 1.0]);
+        let arrayed = make(1, 2, [0.0, 0.0, 1.0, 1.0]);
+        let first_pixel = |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the present copy completed; footprint names a live RGBA pixel.
+            unsafe {
+                buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                let rgba = mapped
+                    .cast::<u8>()
+                    .add(footprint.Offset as usize)
+                    .cast::<[u8; 4]>()
+                    .read();
+                buffer.Unmap(0, None);
+                rgba
+            }
+        };
+        let mut mip_pixel = None;
+        assert!(
+            host.present_with_compositor(&[(&mipmapped, state)], 10, Compositor::new, |b, f| {
+                mip_pixel = Some(first_pixel(b, f));
+            }).is_some()
+        );
+        assert_eq!(mip_pixel, Some([0, 255, 0, 255]));
+        let mut array_pixel = None;
+        assert!(
+            host.present_with_compositor(&[(&arrayed, state)], 11, Compositor::new, |b, f| {
+                array_pixel = Some(first_pixel(b, f));
+            }).is_some()
+        );
+        assert_eq!(array_pixel, Some([0, 0, 255, 255]));
+    }
 }
 
 #[cfg(test)]
