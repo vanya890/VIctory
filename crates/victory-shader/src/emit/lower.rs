@@ -25,6 +25,7 @@ mod bvh;
 mod shift;
 mod waterfall;
 mod interp;
+mod wave;
 
 type Why = &'static str;
 
@@ -121,15 +122,6 @@ pub(crate) fn lower_with(parts: &Parts, wave: WaveMode) -> Result<Lowered, Shade
             }
             Err(Stop::Fail(e)) => return Err(e),
         }
-    }
-}
-
-pub(crate) fn barrier_mode(writes_uavs: bool, relaxed: bool) -> u32 {
-    match (writes_uavs, relaxed) {
-        (true, false) => 1 | 2 | 8,
-        (true, true) => 2 | 8,
-        (false, false) => 1 | 8,
-        (false, true) => 8,
     }
 }
 
@@ -584,34 +576,9 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
-        let wave64_unsupported = x.native.wave64 && wave.max_lanes < 64 && !wave.wide64;
-        let emulated_wave64 = x.native.wave64 && wave.max_lanes < 64 && wave.wide64;
-        let group_lanes = match &x.native.io {
-            StageIo::Cs(cs) => cs
-                .threads
-                .iter()
-                .try_fold(1u32, |n, &dimension| n.checked_mul(dimension)),
-            StageIo::Ms(ms) => Some(ms.threads),
-            _ => None,
-        };
-        // D3D12 specifies that workloads may rely only on WaveLaneCountMin
-        // when proving that a whole thread group fits in one host wave.
-        let single_wave = group_lanes.is_some_and(|n| n > 0 && n <= wave.min_lanes);
-        let mut relaxed_barriers = HashSet::new();
-        if single_wave && wave.relaxes_divergent_barriers() && !emulated_wave64 {
-            for (b, block) in p.blocks.iter().enumerate() {
-                for (i, inst) in block.insts.iter().enumerate() {
-                    if inst.name() != "s_barrier" {
-                        continue;
-                    }
-                    let divergent = x.st.reach.get(b).is_some_and(|r| *r != Bool::TRUE)
-                        || x.st.guards.get(b).and_then(|g| g.get(i)).is_some_and(|g| *g != Some(Bool::TRUE));
-                    if divergent {
-                        relaxed_barriers.insert((b, i));
-                    }
-                }
-            }
-        }
+        let wave_plan = wave::plan(p, x.st, &x.native.io, x.native.wave64, wave);
+        let wave64_unsupported = wave_plan.wave64_unsupported;
+        let relaxed_barriers = wave_plan.relaxed_barriers;
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
@@ -3577,7 +3544,7 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mode = barrier_mode(self.writes_uavs, self.relaxed_barriers.contains(&(b, i)));
+                let mode = wave::barrier_mode(self.writes_uavs, self.relaxed_barriers.contains(&(b, i)));
                 #[cfg(test)]
                 self.barrier_modes.push(mode);
                 let mode = self.s.m.i32(mode);
