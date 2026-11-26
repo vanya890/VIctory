@@ -258,8 +258,8 @@ impl Snapshot {
     }
 }
 
-/// Snapshot memory kept for reuse. The largest buffers are first, so
-/// best-fit checkout and ordered return need only binary search.
+/// Snapshot memory kept for reuse. Buffers are largest-first; binary
+/// search locates best-fit slots without a full scan and re-sort.
 const POOL_BYTES: usize = 512 << 20;
 
 #[derive(Default)]
