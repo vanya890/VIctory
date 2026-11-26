@@ -589,7 +589,9 @@ extern "system" fn present(
         if !resources.is_empty() {
             let sources: Vec<_> = resources
                 .iter()
-                .map(|(_, copy)| crate::host::PresentPlane::Tracked(copy))
+                .map(|(resource, copy)| {
+                    crate::host::PresentPlane::Tracked(copy, crate::resource::view_format_of(*resource, copy))
+                })
                 .collect();
             let (shown, state) = host.present_planes(&sources, frame);
             #[cfg(feature = "diagnostics")]
