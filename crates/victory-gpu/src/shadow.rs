@@ -1764,7 +1764,10 @@ pub(crate) mod tests {
         }
         copy_back_marks(&[], true);
         // SAFETY: bytes of our pool.
-        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        let read = |at: usize| {
+            // SAFETY: p points into this test's allocated pool and at is within it.
+            unsafe { ((p + at) as *const u8).read_volatile() }
+        };
         assert_eq!((read(10), read(PAGE + 10)), (0xaa, 0), "page 1 held back");
         // SAFETY: a dword of the mapped bitmap.
         assert_eq!(
@@ -1823,6 +1826,7 @@ pub(crate) mod tests {
         );
         // SAFETY: as above.
         assert_eq!(
+            // SAFETY: the test's registered pool still owns the byte at p + 16.
             unsafe { ((p + 16) as *const u8).read_volatile() },
             0x11,
             "title memory untouched"
