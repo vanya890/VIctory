@@ -3556,10 +3556,8 @@ impl Host {
                 list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
                 // SAFETY: the command list has consumed both locations; drop
                 // the COM references we placed in their ManuallyDrop fields.
-                unsafe {
-                    std::mem::ManuallyDrop::drop(&mut dst.pResource);
-                    std::mem::ManuallyDrop::drop(&mut src.pResource);
-                }
+                std::mem::ManuallyDrop::drop(&mut dst.pResource);
+                std::mem::ManuallyDrop::drop(&mut src.pResource);
                 #[cfg(all(test, feature = "diagnostics"))]
                 let capture = {
                     // Inspect what reached the swap chain, before Present.
