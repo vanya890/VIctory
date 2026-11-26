@@ -1299,6 +1299,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Raw interface pointers already retained in `kept`, avoiding repeated
+    /// QueryInterface/AddRef/Release work for the same object on this list.
+    kept_ptrs: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -2595,8 +2598,16 @@ impl HostList {
 
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
+        let raw = object.as_raw() as usize;
+        let mut deferred = self.deferred();
+        if !deferred.kept_ptrs.insert(raw) {
+            return;
+        }
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+            deferred.kept.push(object);
+        } else {
+            // Do not leave a negative entry if QueryInterface failed.
+            deferred.kept_ptrs.remove(&raw);
         }
     }
 
@@ -5681,4 +5692,33 @@ mod removal_cause_tests {
             Some("ID3D12Device::RemoveDevice: possibly at fault")
         );
     }
+    #[test]
+    fn keep_deduplicates_repeated_objects_until_reset() {
+        let host = host();
+        if crate::switch::on("VICTORY_D3D12_WARP") {
+            assert!(host.is_some(), "WARP validation requested but no D3D12 host was created");
+        }
+        let Some(host) = host else { return };
+        let list = host.new_list().unwrap();
+        let (a, _) = host.upload_buffer(256).unwrap();
+        let (b, _) = host.upload_buffer(256).unwrap();
+        for _ in 0..1000 {
+            list.keep(&a);
+        }
+        assert_eq!(list.deferred().kept.len(), 1);
+        assert_eq!(list.deferred().kept_ptrs.len(), 1);
+        list.keep(&b);
+        assert_eq!(list.deferred().kept.len(), 2);
+        assert_eq!(list.deferred().kept_ptrs.len(), 2);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert!(list.deferred().kept.is_empty());
+        assert!(list.deferred().kept_ptrs.is_empty());
+        list.keep(&a);
+        assert_eq!(list.deferred().kept.len(), 1);
+        assert_eq!(list.deferred().kept_ptrs.len(), 1);
+        list.close();
+    }
+
 }
