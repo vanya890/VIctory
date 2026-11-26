@@ -839,7 +839,7 @@ fn code_table_stride_program() -> Vec<u32> {
     w.extend(s_buffer_load(8, 31, 8, 0x14)); // A@0x14: zero
     w.extend(s_buffer_load(8, 32, 12, 0x10)); // B@0x10: zero
     w.extend(s_buffer_load(8, 33, 12, 0xc)); // B@0xc: data
-    // C: unaligned soffset 0xe + immediate 2 truncates to 0xc; immediate 6 to 0x10.
+    // C: unaligned soffset 0xe + immediate 2 truncates to 0xc; next load checks extra alone.
     w.extend([0xF400_0000 | 8 << 18 | 34 << 6 | 8, 40 << 25 | 2]);
     w.extend(s_buffer_load(8, 35, 16, 0xc)); // C: dynamic extra only
     w.extend(s_buffer_load(10, 36, 20, 0xc)); // D dwordx4: data, data, zero, zero
