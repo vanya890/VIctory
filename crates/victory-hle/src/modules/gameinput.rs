@@ -1321,6 +1321,8 @@ mod host {
                 // e.g. for prompts that skip only while the key is held.
                 let (span, every, hold) = match at.split_once('/') {
                     Some((span, rest)) => {
+                        // A repeat period only makes sense over an explicit range.
+                        span.split_once('-')?;
                         let (every, hold) = match rest.split_once('+') {
                             Some((every, hold)) => (time(every)?, time(hold)?),
                             None => (time(rest)?, PRESS),
@@ -1372,10 +1374,12 @@ mod host {
     /// `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in pad's table maps
     /// them to buttons).
     ///
-    /// `VICTORY_KEYS_FILE=<path>`: one key name per line (as above), each
-    /// pressed for 0.2 s once its line is there, in order, so a script
-    /// watching the log can press a key exactly when a screen is ready
-    /// (`Add-Content <path> Enter`).
+    /// `VICTORY_KEYS_FILE=<path>`: one key name per newline-terminated line
+    /// (as above), each pressed for 0.2 s once its line is there, in order,
+    /// so a script watching the log can press a key exactly when a screen is
+    /// ready (`Add-Content <path> Enter`). The file is append-only: do not
+    /// truncate or rewrite it. Incomplete final lines wait for their newline;
+    /// invalid complete names are consumed with a warning.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<Scripted>)> = LazyLock::new(|| {
@@ -1416,16 +1420,45 @@ mod host {
             a.held = None;
         }
         // The file is looked at ten times a second at most.
-        if now - a.looked < Duration::from_millis(100) {
+        if !poll_due(now, &mut a.looked) {
             return None;
         }
-        a.looked = now;
         let text = std::fs::read_to_string(file).ok()?;
-        let name = text.lines().nth(a.done)?.trim().to_owned();
-        a.done += 1;
-        tracing::info!(key = name, "a key was asked for (VICTORY_KEYS_FILE)");
-        a.held = key_named(&name).map(|vk| (now, vk));
-        a.held.map(|(_, vk)| vk)
+        loop {
+            let (line, next) = complete_line_at(&text, a.done)?;
+            a.done = next;
+            let name = line.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let Some(vk) = key_named(name) else {
+                tracing::warn!(line = a.done, key = name, "unknown key in VICTORY_KEYS_FILE; line consumed");
+                continue;
+            };
+            tracing::info!(key = name, "a key was asked for (VICTORY_KEYS_FILE)");
+            a.held = Some((now, vk));
+            return Some(vk);
+        }
+    }
+
+    /// Whether the file poll interval has elapsed; a skipped poll leaves the
+    /// previous timestamp untouched.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn poll_due(now: Instant, looked: &mut Instant) -> bool {
+        if now - *looked < Duration::from_millis(100) {
+            false
+        } else {
+            *looked = now;
+            true
+        }
+    }
+
+    /// Returns the zero-based cursor's complete line and its next value.
+    /// A final unterminated fragment stays invisible until its newline arrives.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn complete_line_at(text: &str, cursor: usize) -> Option<(&str, usize)> {
+        let line = text.split_inclusive('\n').filter_map(|line| line.strip_suffix('\n')).nth(cursor)?;
+        Some((line.strip_suffix('\r').unwrap_or(line), cursor + 1))
     }
 
     #[test]
@@ -1444,12 +1477,58 @@ mod host {
         assert_eq!(held_at(&script, s(3.5)), [b'A']);
         assert_eq!(held_at(&script, s(3.05)), [0x28, b'A']);
         // Long holds with a short release between them; a hold as long as the
-        // period (or zero) is refused.
-        let script = parse_script("2-20/3+2.5:Enter,2-20/1+1:A,2-20/1+0:A");
-        assert_eq!(script.len(), 1);
+        // period (or zero) is refused. A repeat period without a from-to span
+        // is rejected rather than silently becoming a one-shot press.
+        let script = parse_script("2-20/3+2.5:Enter,2-20/1+1:A,2-20/1+0:A,7/1:Enter,7-10/1:Enter,21:Enter");
+        assert_eq!(script.len(), 3);
         assert_eq!(held_at(&script, s(4.4)), [0x0D]);
         assert_eq!(held_at(&script, s(4.6)), Vec::<u8>::new());
-        assert_eq!(held_at(&script, s(5.1)), [0x0D]);
+        assert_eq!(held_at(&script, s(21.1)), [0x0D]);
+    }
+
+    #[test]
+    fn scripted_file_lines_wait_for_newline_and_keep_cursor_stable() {
+        let partial = "Ent";
+        assert_eq!(complete_line_at(partial, 0), None);
+        let completed = "Enter\n";
+        let (line, next) = complete_line_at(completed, 0).unwrap();
+        assert_eq!(line, "Enter");
+        assert_eq!(next, 1);
+        assert_eq!(key_named(line), Some(0x0D));
+
+        let lines = "bad-key\nEnter\n";
+        let (bad, cursor) = complete_line_at(lines, 0).unwrap();
+        assert_eq!(key_named(bad), None);
+        let (good, next) = complete_line_at(lines, cursor).unwrap();
+        assert_eq!(good, "Enter");
+        assert_eq!(key_named(good), Some(0x0D));
+        assert_eq!(next, 2);
+
+        let lines = "\r\nTab\r\n";
+        let (blank, cursor) = complete_line_at(lines, 0).unwrap();
+        assert!(blank.trim().is_empty());
+        let (crlf, next) = complete_line_at(lines, cursor).unwrap();
+        assert_eq!(crlf, "Tab");
+        assert_eq!(key_named(crlf), Some(0x09));
+        assert_eq!(next, 2);
+
+        // A partial append stays pending across throttled polls and becomes
+        // consumable only after both the interval and terminating newline.
+        let start = Instant::now();
+        let mut looked = start;
+        let mut cursor = 0;
+        let first = start + Duration::from_millis(100);
+        assert!(poll_due(first, &mut looked));
+        assert_eq!(complete_line_at("Ent", cursor), None);
+        let appended = first + Duration::from_millis(50);
+        assert!(!poll_due(appended, &mut looked));
+        assert_eq!(cursor, 0);
+        let ready = first + Duration::from_millis(100);
+        assert!(poll_due(ready, &mut looked));
+        let (line, next) = complete_line_at("Enter\n", cursor).unwrap();
+        assert_eq!(line, "Enter");
+        cursor = next;
+        assert_eq!(cursor, 1);
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
