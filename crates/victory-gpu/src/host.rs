@@ -4788,11 +4788,79 @@ mod present_plane_tests {
         };
         let state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
         let render_target_state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let first_pixel =
+            |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: the present copy completed and this footprint names a live RGBA pixel.
+                let rgba = unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u8; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                };
+                (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
+            };
         let typed = make(
             DXGI_FORMAT_R16G16B16A16_UNORM,
             D3D12_RESOURCE_FLAG_NONE,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
         );
+        let row_pitch = 32 * 8;
+        let (upload, data) = host
+            .upload_buffer((row_pitch * 32) as u64)
+            .expect("upload buffer for typed shader resource");
+        // SAFETY: mapped upload memory is large enough for 32 rows at this pitch.
+        unsafe {
+            for y in 0..32 {
+                let row = data.add(y * row_pitch).cast::<u16>();
+                for x in 0..32 {
+                    row.add(x * 4).write(0xffff);
+                    row.add(x * 4 + 1).write(0);
+                    row.add(x * 4 + 2).write(0x8000);
+                    row.add(x * 4 + 3).write(0xffff);
+                }
+            }
+        }
+        let list = host.new_list().unwrap();
+        let source = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: the location borrows the upload resource through execution below.
+            pResource: unsafe { std::mem::transmute_copy(&upload) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R16G16B16A16_UNORM,
+                        Width: 32,
+                        Height: 32,
+                        Depth: 1,
+                        RowPitch: row_pitch as u32,
+                    },
+                },
+            },
+        };
+        let destination = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: the location borrows the typed texture through execution below.
+            pResource: unsafe { std::mem::transmute_copy(&typed) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        // SAFETY: source and destination describe compatible live resources.
+        unsafe { list.list.CopyTextureRegion(&destination, 0, 0, 0, &source, None) };
+        let to_shader = [transition(
+            &typed,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        )];
+        // SAFETY: the typed texture transitions from COPY_DEST to shader-resource state.
+        unsafe { list.list.ResourceBarrier(&to_shader) };
+        list.close();
+        host.execute(&[&list]);
+        let mut converted_pixel = None;
         let converted = host.present_planes_with_compositor(
             &[PresentPlane::Raw(
                 &typed,
@@ -4801,9 +4869,10 @@ mod present_plane_tests {
             )],
             6,
             Compositor::new,
-            |_, _| {},
+            |buffer, footprint| converted_pixel = Some(first_pixel(buffer, footprint)),
         );
         assert!(converted.0.is_some(), "typed UNORM format must enable conversion");
+        assert_eq!(converted_pixel, Some((32, 32, [255, 0, 128, 255])));
 
         // Use a fresh Host so no other parallel test can have cached a
         // compositor with this format and bypass the injected creation error.
