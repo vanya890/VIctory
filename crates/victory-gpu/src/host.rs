@@ -4909,8 +4909,8 @@ mod withholding {
             ((p + 32) as *mut u8).write_volatile(0x22);
         }
         crate::shadow::register(p, p as u64, PAGE as u64);
-        crate::shadow::register(p + 1, p as u64, PAGE as u64);
         let outer = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        crate::shadow::register(p + 1, p as u64, PAGE as u64);
         let inner = crate::shadow::find(p as u64, PAGE as u64).unwrap();
         assert!(!std::sync::Arc::ptr_eq(&outer, &inner));
 
