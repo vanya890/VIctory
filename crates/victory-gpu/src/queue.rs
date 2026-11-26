@@ -221,7 +221,6 @@ impl Holding {
 #[cfg(windows)]
 static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(Holding::new());
 
-#[cfg(windows)]
 #[cfg(all(test, windows))]
 struct HeldLockTestHook {
     thread: std::thread::ThreadId,
@@ -232,6 +231,7 @@ struct HeldLockTestHook {
 static HELD_LOCK_TEST_HOOK: std::sync::Mutex<Option<HeldLockTestHook>> =
     std::sync::Mutex::new(None);
 
+#[cfg(windows)]
 fn held() -> std::sync::MutexGuard<'static, Holding> {
     #[cfg(all(test, windows))]
     {
