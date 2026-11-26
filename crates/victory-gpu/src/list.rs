@@ -731,9 +731,14 @@ fn copy_subresources(desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE
     } else {
         u32::from(desc.DepthOrArraySize.max(1))
     };
-    u32::from(desc.MipLevels.max(1))
-        .saturating_mul(slices)
-        .saturating_mul(planes)
+    texture_subresource_count(desc.MipLevels, slices, planes)
+}
+
+#[cfg(windows)]
+fn texture_subresource_count(mip_levels: u16, slices: u32, planes: u32) -> u32 {
+    u32::from(mip_levels.max(1))
+        .saturating_mul(slices.max(1))
+        .saturating_mul(planes.max(1))
 }
 
 #[cfg(windows)]
@@ -1134,10 +1139,25 @@ extern "system" fn resolve(
     {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
-            D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
+            D3D12_RESOLVE_MODE_AVERAGE, D3D12_RESOURCE_DESC,
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D, ID3D12GraphicsCommandList1,
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
+        // SAFETY: both host resources are live while this command is recorded.
+        let (a, b) = unsafe { (to.GetDesc(), from.GetDesc()) };
+        // Invalid resolve calls make Close() fail with E_INVALIDARG, including
+        // on retail D3D12 without the Debug Layer. Reject them before state
+        // transitions or host-write bookkeeping are recorded.
+        if a.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || b.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || a.SampleDesc.Count != 1
+            || b.SampleDesc.Count < 2
+            || dst_sub >= copy_subresources(&a)
+            || src_sub >= copy_subresources(&b)
+        {
+            return;
+        }
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
         ensure_state(list, dst, RESOLVE_DEST);
@@ -1145,11 +1165,17 @@ extern "system" fn resolve(
         crate::texture::host_writes(list, dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
-        // SAFETY: an open list and live textures; the region is inside both.
+        let mip_size = |d: &D3D12_RESOURCE_DESC, sub: u32| {
+            let mip = sub % u32::from(d.MipLevels.max(1));
+            ((d.Width >> mip).max(1), (u64::from(d.Height) >> mip).max(1))
+        };
+        let (dst_w, dst_h) = mip_size(&a, dst_sub);
+        let (src_w, src_h) = mip_size(&b, src_sub);
+        let format = DXGI_FORMAT(format as i32);
+        // SAFETY: an open list and live 2D textures with valid sample counts
+        // and in-bounds subresources; the region lies inside both mips.
         unsafe {
-            let (a, b) = (to.GetDesc(), from.GetDesc());
-            let format = DXGI_FORMAT(format as i32);
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            if (dst_w, dst_h) == (src_w, src_h) {
                 list.list
                     .ResolveSubresource(&to, dst_sub, &from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
@@ -1157,8 +1183,8 @@ extern "system" fn resolve(
                 let rect = RECT {
                     left: 0,
                     top: 0,
-                    right: a.Width.min(b.Width) as i32,
-                    bottom: a.Height.min(b.Height) as i32,
+                    right: dst_w.min(src_w) as i32,
+                    bottom: dst_h.min(src_h) as i32,
                 };
                 list1.ResolveSubresourceRegion(
                     &to,
@@ -2384,5 +2410,143 @@ mod tests {
         ] {
             assert_eq!(release(obj), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_validates_sample_counts_dimensions_and_subresources() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let make_texture =
+            |dimension: u32, width: u32, height: u32, depth: u16, mips: u16, samples: u32| {
+            let words: [u32; 14] = [
+                dimension,
+                0,
+                0,
+                0,
+                width,
+                0,
+                height,
+                u32::from(depth) | u32::from(mips) << 16,
+                28,
+                samples,
+                0,
+                0,
+                1,
+                0,
+            ];
+            let heap: [u32; 5] = [1, 0, 0, 0, 0];
+            let iid = crate::object::guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let mut out = std::ptr::null();
+            assert_eq!(
+                crate::resource::create_committed(
+                    std::ptr::null(),
+                    heap.as_ptr().cast(),
+                    0,
+                    words.as_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    &iid,
+                    &mut out,
+                ),
+                S_OK
+            );
+            out
+        };
+
+        let single_64 = make_texture(3, 64, 64, 1, 1, 1);
+        let single_64_mips = make_texture(3, 64, 64, 1, 2, 1);
+        let single_128_mips = make_texture(3, 128, 128, 1, 2, 1);
+        let msaa_64 = make_texture(3, 64, 64, 1, 1, 4);
+        let msaa_64_b = make_texture(3, 64, 64, 1, 1, 4);
+        let msaa_128 = make_texture(3, 128, 128, 1, 1, 4);
+        let tex3d = make_texture(4, 64, 64, 2, 1, 1);
+
+        let run_resolve = |name: &str, dst: This, dst_sub: u32, src: This, src_sub: u32| {
+            let null = std::ptr::null();
+            let mut allocator = null;
+            assert_eq!(
+                create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+                S_OK
+            );
+            let mut list = null;
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            let host_l = host_list(list).unwrap();
+            let _ = host.log_messages();
+            resolve(list, dst, dst_sub, src, src_sub, 28);
+            // SAFETY: open host command list; check Close() directly instead of aborting.
+            let closed = unsafe { host_l.list.Close() };
+            assert!(closed.is_ok(), "{name}: Close() failed: {closed:?}");
+            host.execute(&[host_l]);
+            assert_eq!(host.log_messages(), None, "{name}: D3D12 debug errors");
+            let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+            assert_eq!(release(list), 0);
+            assert_eq!(release(allocator), 0);
+        };
+
+        run_resolve("non_msaa_src", single_64, 0, single_64_mips, 0);
+        run_resolve("msaa_dst", msaa_64_b, 0, msaa_64, 0);
+        run_resolve("oob_dst_sub", single_64, 1, msaa_64, 0);
+        run_resolve("oob_src_sub", single_64, 0, msaa_64, 1);
+        run_resolve("tex3d_dst", tex3d, 0, msaa_64, 0);
+
+        run_resolve("valid_same_size", single_64, 0, msaa_64, 0);
+        run_resolve("valid_clipped_region", single_64, 0, msaa_128, 0);
+        run_resolve("valid_mip1_same_size", single_128_mips, 1, msaa_64, 0);
+        run_resolve("valid_mip1_clipped", single_64_mips, 1, msaa_64, 0);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for tex in [
+            single_64,
+            single_64_mips,
+            single_128_mips,
+            msaa_64,
+            msaa_64_b,
+            msaa_128,
+            tex3d,
+        ] {
+            assert_eq!(release(tex), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_subresource_count_includes_format_planes() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_DATA_FORMAT_INFO, D3D12_FEATURE_FORMAT_INFO,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D24_UNORM_S8_UINT;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mut info = D3D12_FEATURE_DATA_FORMAT_INFO {
+            Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+            PlaneCount: 0,
+        };
+        // SAFETY: live device and initialized format-info struct.
+        assert!(unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_INFO,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of_val(&info) as u32,
+            )
+        }
+        .is_ok());
+        assert_eq!(info.PlaneCount, 2);
+        assert_eq!(
+            texture_subresource_count(3, 2, u32::from(info.PlaneCount)),
+            12
+        );
     }
 }
