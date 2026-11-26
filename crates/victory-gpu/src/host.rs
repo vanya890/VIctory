@@ -444,6 +444,15 @@ pub(crate) mod tests {
 
     use super::*;
 
+    #[test]
+    fn lists_without_state_changes_do_not_create_a_prelude() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().expect("ordinary host list");
+        assert!(list.prelude.get().is_none(), "new lists start without a prelude");
+        assert!(list.prelude().is_none(), "no state changes need no prelude");
+        assert!(list.prelude.get().is_none(), "a no-op prelude stays uninitialized");
+    }
+
     /// Shaders that use title memory mark their reads in their own bitmap:
     /// read marks of both bitmaps are taken, each slot once until it is
     /// forgotten, and a forgotten slot's next read is taken again.
@@ -826,8 +835,9 @@ pub(crate) struct HostList {
     /// The draw or dispatch being recorded runs a program using title
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
-    /// The list that runs those transitions just before this one.
-    prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    /// The list that runs those transitions just before this one, made only
+    /// when this list first needs a state prelude.
+    prelude: OnceLock<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// Which list this is, for the name that tells it apart in device-removed
@@ -1128,16 +1138,6 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude_allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let prelude: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &prelude_allocator,
-                None,
-            )?;
-            prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
             Ok(HostList {
@@ -1151,7 +1151,7 @@ impl Host {
                 rebind: false.into(),
                 ours: false.into(),
                 memory_writer: false.into(),
-                prelude: (prelude_allocator, prelude),
+                prelude: OnceLock::new(),
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
@@ -1974,7 +1974,31 @@ impl HostList {
             left();
             return None;
         }
-        let (allocator, list) = &self.prelude;
+        let (allocator, list) = self.prelude.get_or_init(|| {
+            let made = || -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+                let device = &host().expect("the list's host").device;
+                // SAFETY: plain object creation, the first time this list's
+                // prelude has work to do.
+                unsafe {
+                    let allocator: ID3D12CommandAllocator =
+                        device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list = device.CreateCommandList(
+                        0,
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        &allocator,
+                        None,
+                    )?;
+                    list.Close()?;
+                    Ok((allocator, list))
+                }
+            };
+            match made() {
+                Ok(prelude) => prelude,
+                Err(e) => fail(format_args!(
+                    "a host state prelude was not made ({e}); host memory may be exhausted"
+                )),
+            }
+        });
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
