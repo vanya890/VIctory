@@ -32,6 +32,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: D3D12 WARP list-release lifetime regressions
+        env:
+          VICTORY_D3D12_WARP: "1"
+          VICTORY_D3D12_DEBUG: "1"
+        run: cargo test -p victory-gpu --features diagnostics --lib --locked list::tests::concurrent_list_release -- --nocapture --test-threads=1
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
