@@ -285,13 +285,21 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// recently bound RTV view takes precedence; for a typeless host copy without
 /// a recorded view, fall back to the title resource's own format.
 pub(crate) fn view_format(this: This) -> Option<u32> {
+    let copy = host_copy(this)?;
+    view_format_of(this, &copy)
+}
+
+/// The typed RTV format for this exact retained host copy. PresentX uses
+/// this form so eviction cannot make the format lookup inspect a replacement
+/// texture between pinning the copy and recording the presentation.
+#[cfg(windows)]
+pub(crate) fn view_format_of(this: This, copy: &HostTexture) -> Option<u32> {
     if this.is_null() {
         return None;
     }
     let own = pc_format(resource(this).desc.format);
-    let host = host_resource(this)?;
-    // SAFETY: a live resource.
-    let format = unsafe { host.GetDesc() }.Format.0 as u32;
+    // SAFETY: the retained HostTexture owns a live COM resource.
+    let format = unsafe { copy.texture.GetDesc() }.Format.0 as u32;
     let recorded = resource(this)
         .rtv_format
         .load(std::sync::atomic::Ordering::Relaxed);
