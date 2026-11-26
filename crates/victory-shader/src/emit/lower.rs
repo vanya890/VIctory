@@ -4225,7 +4225,7 @@ impl<'a> Lower<'a> {
             V::Const(_)
                 if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
             {
-                Some(*offset as u32)
+                Some(total_offset)
             }
             _ => None,
         };
