@@ -1154,6 +1154,48 @@ pub(crate) mod tests {
         release(second);
     }
 
+    /// The batch path replays lazy slots and covers both the 256-slot
+    /// batch boundary and the small per-handle tail.
+    #[cfg(windows)]
+    #[test]
+    fn descriptor_copies_mirror_batched_slots_before_and_after_host_creation() {
+        let null = std::ptr::null();
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 261,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let mut h = null;
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut h), S_OK);
+        let dst = heap(h).start;
+        let mut source = [[0u64; 2]; 261];
+        let src = source.as_mut_ptr() as u64;
+        for i in [0, 255, 256, 260] {
+            create_sampler(null, &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], src + i * 16);
+        }
+        copy_simple(null, 261, dst, src, SAMPLERS);
+        assert_eq!(heap(h).pending.lock().unwrap().len(), 261);
+        if crate::host::host().is_some() {
+            let host = heap(h).host().expect("host sampler heap");
+            for i in [0, 255, 256, 260] {
+                assert!(host.made(i));
+            }
+            // SAFETY: these are full descriptors in the live source and destination.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src as *const u8, (dst + 16) as *mut u8, 16);
+                (dst as *mut [u64; 2]).write_unaligned([0; 2]);
+            }
+            assert!(host.made(0));
+            assert!(!host.made(1));
+            copy_simple(null, 261, dst, dst, SAMPLERS);
+            assert!(!host.made(0), "a raw write cleared slot 0");
+            assert!(host.made(1), "a raw write installed slot 1");
+            assert!(host.made(260), "the tail descriptor survives");
+        }
+        release(h);
+    }
+
     /// The underlying descriptor copy retains memmove semantics for both
     /// overlap directions, and self-copy still exercises the mirror path.
     #[test]
