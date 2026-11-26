@@ -6,7 +6,7 @@
 //! near `1.0`, turn-range reduction for `v_sin_*`/`v_cos_*`, and denormal
 //! operands of `v_mul_legacy_f32`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -2411,4 +2411,167 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
             inp[0], inp[1],
         );
     });
+}
+
+/// AMD RDNA2 ISA Guide (Scalar Memory Operations): `s_buffer_load_dword*`
+/// ignores the two LSBs of `soffset` and immediate `offset` independently
+/// before summing. With `soffset = 3` and `offset = 3`, the load must read
+/// dword 0 (`(3 & !3) + (3 & !3) = 0`), not dword 1 (`(3 + 3) >> 2 = 1`).
+#[test]
+fn s_buffer_load_truncates_terms_independently() {
+    let words = [
+        s_mov_b32(5, 0x80),                         // s[4:5] = table offset 0
+        0xF408_0202,                                // s_load_dwordx4 s[8:11], s[4:5], 0x0 (UAV)
+        125 << 25,
+        0xF408_0302,                                // s_load_dwordx4 s[12:15], s[4:5], 0x20 (SRV)
+        125 << 25 | 0x20,
+        0xBF8C_C07F,                                // s_waitcnt lgkmcnt(0)
+        0xF420_0406,                                // s_buffer_load_dword s16, s[12:15], s0, offset:3
+        0x0000_0003,
+        0xF420_0446,                                // s_buffer_load_dword s17, s[12:15], s0, offset:7
+        0x0000_0007,
+        0xBF8C_C07F,                                // s_waitcnt lgkmcnt(0)
+        vop1(0x001, 0, sgpr(16)),                   // v0 = s16
+        vop1(0x001, 1, sgpr(17)),                   // v1 = s17
+        buffer_store_dword(0, 8, 0)[0],
+        buffer_store_dword(0, 8, 0)[1],
+        buffer_store_dword(1, 8, 4)[0],
+        buffer_store_dword(1, 8, 4)[1],
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+    let (p, st) = range::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = st.unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .unwrap();
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation");
+    }
+
+    let src_data = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+    let views = [
+        View::RawUav(2),
+        View::Buffer {
+            data: &src_data,
+            stride: Stride::Raw,
+        },
+    ];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        for (soffset, want0, want1) in [
+            (3u32, 0x1111_1111u32, 0x2222_2222u32),
+            (7u32, 0x2222_2222u32, 0x3333_3333u32),
+        ] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => soffset,
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(out[0][0], want0, "{label}: soffset={soffset} offset=3");
+            assert_eq!(out[0][1], want1, "{label}: soffset={soffset} offset=7");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
