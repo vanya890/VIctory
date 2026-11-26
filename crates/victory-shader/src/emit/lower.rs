@@ -23,6 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 mod bvh;
 mod shift;
 mod waterfall;
+mod interp;
 
 type Why = &'static str;
 
@@ -2745,30 +2746,8 @@ impl<'a> Lower<'a> {
 
     /// [`Self::write`] of a dword already placed (SDWA applied).
     fn write_placed(&mut self, inst: &Inst, reg: Reg, x: V, guard: Option<V>) {
-        let Some(new) = inst.write(reg) else { return };
-        let x = match (guard, reg) {
-            (Some(g), Reg::V(_)) => {
-                let o = inst.read(reg);
-                let read = o.is_some_and(|o| self.read_phis.contains(&o));
-                let old = match o.map(|o| self.i32_of(o)) {
-                    Some(Ok(o)) => o,
-                    // The validator refuses reads of undef.
-                    _ => self.s.m.i32(0),
-                };
-                // What lanes keep is zero where it has no DXIL form (as
-                // above), so keeping a phi does not make it live.
-                if let Some(o) = o.filter(|_| !read) {
-                    self.read_phis.remove(&o);
-                }
-                self.s.m.select(self.cur, g, x, old)
-            }
-            _ => x,
-        };
-        self.vals.insert(new, Val::I32(x));
+        self.write_placed_with_old(inst, reg, x, guard, inst.read(reg));
     }
-
-    /// The SDWA destination selection: a byte or word, and what the other
-    /// bits get (0 zeros, 1 the sign above the field, 2 the old bits).
     fn sdwa_dst(inst: &Inst) -> Option<(u8, u8)> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
@@ -6868,48 +6847,8 @@ impl<'a> Lower<'a> {
     /// half, or its high half with op_sel bit 3 (or an SDWA WORD_1 select);
     /// the other half is kept (GFX10).
     fn write_half(&mut self, inst: &Inst, x: V, guard: Option<V>) -> Result<(), Why> {
-        let Fields::Valu(v) = &inst.fields else {
-            unreachable!()
-        };
-        let Some(Operand::Vector { reg, .. }) = v.dst else {
-            return Err("a 16-bit result outside a VGPR");
-        };
-        let mut high = v.opsel >> 3 & 1 != 0;
-        // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
-        let mut keep = true;
-        if let Some(sd) = v.sdwa {
-            match (sd.dst_sel, sd.dst_unused) {
-                (4, 2) => {}
-                (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
-                _ => return Err("an SDWA destination of a 16-bit operation"),
-            }
-        }
-        let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) if keep => o,
-            _ => self.s.m.i32(0),
-        };
-        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
-        let x = self.s.m.bin(c, Bin::And, x, low);
-        let r = if high {
-            let o = self.s.m.bin(c, Bin::And, old, low);
-            let x = self.s.m.bin(c, Bin::Shl, x, k16);
-            self.s.m.bin(c, Bin::Or, o, x)
-        } else {
-            let keep = self.s.m.i32(0xFFFF_0000);
-            let o = self.s.m.bin(c, Bin::And, old, keep);
-            self.s.m.bin(c, Bin::Or, o, x)
-        };
-        self.write_placed(inst, Reg::V(reg), r, guard);
-        Ok(())
+        self.write_half_with_old(inst, x, guard, None)
     }
-
-    /// 16-bit operations, computed in f32 or i32: f16 sums, differences and
-    /// products are exact there and round once to f16 (f32 has the 2 x 11 +
-    /// 2 bits that make double rounding harmless); `None` if `name` is none.
     fn valu16(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Option<Result<(), Why>> {
         const FLOAT2: &[&str] = &[
             "v_add_f16",
@@ -8112,6 +8051,8 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = dst else {
             return Err("an interpolation");
         };
+        let guard = self.guard(site.0, site.1)?;
+        let old = guard.and_then(|_| self.interp_old(inst, site, reg, interp));
         // A channel of an input element, interpolated as `mode` says.
         let channel = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
             let (id, col) = l
@@ -8162,7 +8103,7 @@ impl<'a> Lower<'a> {
                     // omod and clamp are part of the f16 instruction; op_sel[3]
                     // picks the destination half.
                     let lo = self.half_modifiers(inst, lo);
-                    return self.write_half(inst, lo, None);
+                    return self.write_half_with_old(inst, lo, guard, old);
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
                     let z = self.s.m.i32(0);
@@ -8177,7 +8118,13 @@ impl<'a> Lower<'a> {
             }
         };
         // A pixel interpolates in every lane; guards only hide inactive ones.
-        self.write(inst, Reg::V(reg), x, None);
+        self.write_placed_with_old(
+            inst,
+            Reg::V(reg),
+            x,
+            guard,
+            old.or_else(|| inst.read(Reg::V(reg))),
+        );
         Ok(())
     }
 
