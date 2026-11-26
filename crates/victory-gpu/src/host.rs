@@ -1468,7 +1468,7 @@ impl Host {
                     || self.fence.SetEventOnCompletion(*submitted, self.event),
                     || WaitForSingleObject(self.event, INFINITE),
                     *submitted,
-                    || self.fence.GetCompletedValue(),
+                    || unsafe { self.fence.GetCompletedValue() },
                 )
             };
             if let Err(error) = completion {
