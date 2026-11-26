@@ -2539,9 +2539,10 @@ fn s_buffer_load_truncates_terms_independently() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) if warp => panic!("{label}: required WARP adapter unavailable: {e}"),
+            Err(_) => continue,
         };
         let (root, pso) = host.compute_pipeline(&shader).unwrap();
         for (soffset, want0, want1) in [
