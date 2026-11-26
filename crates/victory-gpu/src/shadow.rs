@@ -1668,13 +1668,18 @@ pub(crate) mod tests {
     /// ranges declared it, and nothing else does.
     #[test]
     fn snapshots_cover_the_declared_ranges_and_writes_go_back_once() {
+        let warp_requested = crate::switch::on("VICTORY_D3D12_WARP");
         let p = crate::watch::tests::pool(4);
         let len = 4 * PAGE;
         register(p, p as u64, len as u64);
         let Some(copy) = find(p as u64, len as u64) else {
             unregister(p, p as u64);
+            assert!(!warp_requested, "WARP was requested but no host snapshot copy was created");
             return; // no host GPU here
         };
+        if warp_requested {
+            eprintln!("WARP host device created; validating fragmented snapshot copy-back");
+        }
         copy.update(p, len);
         let bytes = |s: &Shadow| s.before.lock().unwrap().bytes.len();
         copy.writing(p + 16, 64, false);
@@ -1688,6 +1693,11 @@ pub(crate) mod tests {
         // The GPU writes inside two ranges.
         copy.write_host((p + 20) as u64, &[1, 2, 3]);
         copy.write_host((p + PAGE + 5) as u64, &[9]);
+        // The title concurrently changes a sibling fragment of the same
+        // 64 KiB page. A dirty GPU fragment must not make the whole page
+        // clean while this title write is still absent from the host copy.
+        // SAFETY: this is a byte in the registered pool allocation.
+        unsafe { ((p + PAGE + 0x8000) as *mut u8).write_volatile(0x55) };
         assert_eq!(copy.copy_back(p + 16, 64), 64, "the range's part of the piece");
         assert_eq!(copy.copy_back(p + PAGE, 2 * PAGE), PAGE, "the piece written");
         assert_eq!(copy.copy_back(p + PAGE, PAGE), 0, "compared once");
@@ -1697,6 +1707,12 @@ pub(crate) mod tests {
         // SAFETY: our pool.
         let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
+        assert_eq!(title(p + PAGE + 0x8000), 0x55, "the concurrent title write survives fragmented copy-back");
+        assert_eq!(
+            copy.read_host((p + PAGE + 0x8000) as u64, 1),
+            [0x55],
+            "the host copy is synchronized before the page is marked taken"
+        );
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
         unregister(p, p as u64);
     }
