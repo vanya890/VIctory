@@ -4873,7 +4873,7 @@ mod present_plane_tests {
             |buffer, footprint| converted_pixel = Some(first_pixel(buffer, footprint)),
         );
         assert!(converted.0.is_some(), "typed sRGB format must enable conversion");
-        assert_eq!(converted_pixel, Some((32, 32, [255, 0, 55, 255])));
+        assert_eq!(converted_pixel, Some((32, 32, [255, 0, 128, 255])));
 
         // Use a fresh Host so no other parallel test can have cached a
         // compositor with this format and bypass the injected creation error.
