@@ -152,8 +152,8 @@ pub(crate) extern "system" fn wait(
             WAITS[1].fetch_add(1, Ordering::Relaxed);
         }
     }
-    // A frame begun on a time-out takes no tick: its flip still does.
-    if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
+    // A token-on-timeout origin poll starts a frame without consuming a tick.
+    if origin && (hr == S_OK || (hr == TIMEOUT && flags & TOKEN_ON_TIMEOUT != 0)) {
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
         if !token.is_null() {
