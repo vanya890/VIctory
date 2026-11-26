@@ -2720,6 +2720,7 @@ mod tests {
         let first = host_copy(read).expect("a host texture");
         // SAFETY: a live resource.
         assert_ne!(
+            // SAFETY: first owns a live COM reference to the host texture.
             unsafe { first.texture.GetDesc() }.Flags.0 as u32 & UNORDERED,
             0,
             "the memory's uses"
