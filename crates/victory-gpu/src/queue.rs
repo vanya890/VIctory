@@ -124,11 +124,11 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         for &l in lists {
             for segment in crate::list::segments(l) {
                 let waits = segment.waits();
-                held.push(this as usize, Item::Segment(segment, waits));
+                held.push(this, Item::Segment(segment, waits));
             }
         }
         account().submissions += 1;
-        pump(&mut held, Why::Submission);
+        pump(held, Why::Submission);
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
@@ -176,12 +176,50 @@ impl Drop for KeptFence {
     }
 }
 
-/// Every queue's held work.
+/// Every queue's held work, pinning each queue object while its FIFO is
+/// non-empty so releasing a queue with pending work neither frees it before
+/// `kind(queue)` runs nor lets a newly created queue alias its address.
 #[cfg(windows)]
-type Holding = crate::hold::Held<std::sync::Arc<crate::host::HostList>, KeptFence>;
+struct Holding {
+    held: crate::hold::Held<std::sync::Arc<crate::host::HostList>, KeptFence>,
+    pinned: Vec<usize>,
+}
 
 #[cfg(windows)]
-static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(crate::hold::Held::new());
+impl Holding {
+    const fn new() -> Self {
+        Holding { held: crate::hold::Held::new(), pinned: Vec::new() }
+    }
+
+    fn push(&mut self, queue: This, item: Item<std::sync::Arc<crate::host::HostList>, KeptFence>) {
+        let key = queue as usize;
+        if !self.pinned.contains(&key) {
+            object::add_ref(queue);
+            self.pinned.push(key);
+        }
+        self.held.push(key, item);
+    }
+
+    fn holds_work(&self, queue: usize) -> bool {
+        self.held.holds_work(queue)
+    }
+
+    fn take_drained(&mut self) -> Vec<This> {
+        let mut drained = Vec::new();
+        self.pinned.retain(|&q| {
+            if self.held.holds_work(q) {
+                true
+            } else {
+                drained.push(q as This);
+                false
+            }
+        });
+        drained
+    }
+}
+
+#[cfg(windows)]
+static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(Holding::new());
 
 #[cfg(windows)]
 fn held() -> std::sync::MutexGuard<'static, Holding> {
@@ -191,7 +229,7 @@ fn held() -> std::sync::MutexGuard<'static, Holding> {
 /// Runs held work that may run now (`why` for the frame line).
 pub(crate) fn pump_held(why: Why) {
     #[cfg(windows)]
-    pump(&mut held(), why);
+    pump(held(), why);
     #[cfg(not(windows))]
     let _ = why;
 }
@@ -200,8 +238,8 @@ pub(crate) fn pump_held(why: Why) {
 /// value, our timer).
 pub(crate) fn pump_held_if_free(why: Why) {
     #[cfg(windows)]
-    if let Ok(mut held) = HELD.try_lock() {
-        pump(&mut held, why);
+    if let Ok(held) = HELD.try_lock() {
+        pump(held, why);
     }
     #[cfg(not(windows))]
     let _ = why;
@@ -215,13 +253,13 @@ pub(crate) fn pump_held_if_free(why: Why) {
 const VALVE: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[cfg(windows)]
-fn pump(held: &mut Holding, why: Why) {
-    if held.is_empty() {
+fn pump(mut guard: std::sync::MutexGuard<'static, Holding>, why: Why) {
+    if guard.held.is_empty() {
         return;
     }
     let Some(host) = crate::host::host() else { return };
     let read = read_value;
-    for (queue, waits) in held.force_older_than(VALVE) {
+    for (queue, waits) in guard.held.force_older_than(VALVE) {
         account().forced += 1;
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
     }
@@ -240,11 +278,8 @@ fn pump(held: &mut Holding, why: Why) {
         crate::fence::set(f.as_this(), value);
         drop(f);
     };
-    let pumped = held.pump(&mut crate::hold::World {
-        read: &read,
-        fence: &fence,
-        run: &mut run,
-        signal: &mut signal,
+    let pumped = guard.held.pump(&mut crate::hold::World {
+        read: &read, fence: &fence, run: &mut run, signal: &mut signal,
     });
     if pumped.segments > 0 || pumped.unknown > 0 {
         let mut a = account();
@@ -256,11 +291,17 @@ fn pump(held: &mut Holding, why: Why) {
             a.released.push((kind(queue), waited, why));
         }
     }
-    // Once work stays held, a timer tests it every 2 ms: memory the title
-    // writes from the CPU, or the valve, may let it go with no call of ours.
-    // The pump already knows whether any queue remains blocked. Avoid
-    // re-reading the same wait words just to decide whether to start polling.
-    if !pumped.blocked {
+    // Resolve all queue metadata while pins and the HELD guard are alive.
+    let drained = guard.take_drained();
+    // Pumped::blocked is the final queue-state result. Do not re-read wait
+    // words by calling blocked() again on the hot path.
+    let has_blocked = pumped.blocked;
+    drop(guard);
+    // Final COM Release may acquire PRIVATE; never do it while holding HELD.
+    for queue in drained {
+        release(queue);
+    }
+    if !has_blocked {
         return;
     }
     static TIMER: std::sync::Once = std::sync::Once::new();
@@ -310,12 +351,59 @@ fn account() -> std::sync::MutexGuard<'static, Account> {
 
 /// The frame line of held work: what waited, how long and what released it,
 /// and what is still held at the present, with the waits that do not hold.
+#[cfg(all(test, windows))]
+struct AccountFrameTestHook {
+    queue: usize,
+    thread: std::thread::ThreadId,
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(all(test, windows))]
+static ACCOUNT_FRAME_TEST_HOOK: std::sync::Mutex<Option<AccountFrameTestHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, windows))]
+fn pause_account_frame_for_queue(queue: usize) {
+    let thread = std::thread::current().id();
+    let hook = {
+        let mut hook = ACCOUNT_FRAME_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if hook
+            .as_ref()
+            .is_some_and(|hook| hook.queue == queue && hook.thread == thread)
+        {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        let _ = hook.entered.send(());
+        let _ = hook.resume.recv_timeout(std::time::Duration::from_secs(5));
+    }
+}
+
 #[cfg(windows)]
 fn account_frame(frame: u64) {
     let (cuts, early) = crate::list::take_cuts();
     let (fence_waits, fence_waited) = crate::fence::take_waited();
     let a = std::mem::take(&mut *account());
-    let blocked = held().blocked(&read_value);
+    let blocked: Vec<_> = {
+        let guard = held();
+        let blocked = guard.held.blocked(&read_value);
+        #[cfg(all(test, windows))]
+        for (queue, _, _, _) in &blocked {
+            // The test pauses here after wait-word reads and kind(queue), while
+            // HELD still pins the queue and excludes a concurrent pump.
+            pause_account_frame_for_queue(*queue);
+        }
+        blocked
+            .into_iter()
+            .map(|(queue, items, waited, unmet)| (kind(queue), items, waited, unmet))
+            .collect()
+    };
     if a.released.is_empty() && blocked.is_empty() && a.forced == 0 && a.unknown == 0 && a.mappings == 0 {
         return;
     }
@@ -346,16 +434,16 @@ fn account_frame(frame: u64) {
         "held work released this frame (queue type, ms, by): {:?}",
         a.released.iter().map(|(k, d, w)| (k, d.as_secs_f64() * 1e3, w)).collect::<Vec<_>>()
     );
-    for (queue, items, waited, unmet) in &blocked {
+    for (queue_kind, items, waited, unmet) in &blocked {
         let level_warn = blocked.len() > 1;
         let unmet: Vec<String> = unmet
             .iter()
             .map(|w| format!("{:#x} cmp {} {:#x} (is {:?})", w.address, w.comparison, w.reference, read_value(w.address, w.bytes)))
             .collect();
         if level_warn {
-            tracing::warn!(frame, queue = kind(*queue), items, waited_ms = waited.as_millis(), ?unmet, "two or more queues hold work at the present");
+            tracing::warn!(frame, queue = *queue_kind, items, waited_ms = waited.as_millis(), ?unmet, "two or more queues hold work at the present");
         } else {
-            tracing::info!(frame, queue = kind(*queue), items, waited_ms = waited.as_millis(), ?unmet, "a queue holds work at the present");
+            tracing::info!(frame, queue = *queue_kind, items, waited_ms = waited.as_millis(), ?unmet, "a queue holds work at the present");
         }
     }
     if a.forced > 0 || a.unknown > 0 || a.mappings > 0 {
@@ -421,12 +509,12 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     {
         let mut held = held();
         if held.holds_work(this as usize) {
-            held.push(this as usize, Item::Signal(KeptFence::new(fence), value));
+            held.push(this, Item::Signal(KeptFence::new(fence), value));
         } else {
             crate::fence::set(fence, value);
         }
         // Another queue may wait for this fence.
-        pump(&mut held, Why::Signal);
+        pump(held, Why::Signal);
     }
     #[cfg(not(windows))]
     {
@@ -444,8 +532,8 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if crate::host::host().is_some() {
         let mut held = held();
         if crate::fence::value(fence) < value {
-            held.push(this as usize, Item::FenceWait(KeptFence::new(fence), value));
-            pump(&mut held, Why::Wait);
+            held.push(this, Item::FenceWait(KeptFence::new(fence), value));
+            pump(held, Why::Wait);
         }
     }
     #[cfg(not(windows))]
@@ -1306,6 +1394,301 @@ mod tests {
         for obj in [
             list_a1, list_b1, list_b2, list_b3, list_a3, alloc, queue_a, queue_b, buf,
         ] {
+            assert_eq!(slot::<Release>(obj, 0x10)(obj), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn released_queue_stays_alive_until_held_work_drains() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let null = std::ptr::null();
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+        type Release = extern "system" fn(This) -> u32;
+        const GREATER_EQUAL: u32 = 7;
+
+        let mut words = Box::new([0u64; 2]);
+        let gate_ptr = (&raw mut words[0]) as u64;
+        let done_ptr = (&raw mut words[1]) as u64;
+        struct Unblock(u64);
+        impl Drop for Unblock {
+            fn drop(&mut self) {
+                // SAFETY: `words` outlives this guard; unblock any held wait on panic.
+                unsafe { (self.0 as *mut u64).write_volatile(1) };
+                pump_held(Why::Fence);
+            }
+        }
+        let _unblock = Unblock(gate_ptr);
+
+        let compute_desc = QueueDesc {
+            kind: 2,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let graphics_desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut q1, mut allocator, mut l1, mut l2) = (null, null, null, null);
+        assert_eq!(create(null, &compute_desc, &QUEUE_IIDS[0], &mut q1), S_OK);
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 2, allocator, null, &list_iid, &mut l1),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut l2),
+            S_OK
+        );
+
+        // `q1` waits for `gate >= 1`, then writes `done = 42`.
+        crate::list::wait64(l1, gate_ptr, GREATER_EQUAL, 1, 0);
+        crate::list::write64(l1, done_ptr, 42, 0, 0);
+        assert_eq!(slot::<Close>(l1, 0x48)(l1), S_OK);
+        slot::<Execute>(q1, 0x50)(q1, 1, &l1);
+        assert_eq!(
+            // SAFETY: `words` is live.
+            unsafe { (done_ptr as *const u64).read_volatile() },
+            0,
+            "q1 stays held while gate == 0"
+        );
+
+        // Title legally releases `q1` while its held work is still pending.
+        let q1_addr = q1 as usize;
+        let refs_left = slot::<Release>(q1, 0x10)(q1);
+
+        // The extra COM reference keeps q1 allocated, so a replacement queue
+        // cannot reuse its address before the held work drains.
+        let mut q2 = null;
+        assert_eq!(
+            create(null, &graphics_desc, &QUEUE_IIDS[0], &mut q2),
+            S_OK
+        );
+        assert_ne!(
+            q2 as usize, q1_addr,
+            "a queue with pending HELD work must remain allocated"
+        );
+
+        // `q2` writes `gate = 1` with no waits — must run immediately and unblock `q1`.
+        crate::list::write64(l2, gate_ptr, 1, 0, 0);
+        assert_eq!(slot::<Close>(l2, 0x48)(l2), S_OK);
+        slot::<Execute>(q2, 0x50)(q2, 1, &l2);
+
+        // SAFETY: `words` is live and submissions are synchronous once unblocked.
+        let gate_after = unsafe { (gate_ptr as *const u64).read_volatile() };
+        // SAFETY: `words` is live and `q1` completes synchronously when unblocked.
+        let done_after = unsafe { (done_ptr as *const u64).read_volatile() };
+        assert_eq!(
+            (gate_after, done_after, q2 as usize != q1_addr, refs_left),
+            (1, 42, true, 1),
+            "q2 must not deadlock behind or alias released q1 while HELD pins q1"
+        );
+        assert_eq!(host.log_messages(), None);
+
+        assert_eq!(slot::<Release>(q2, 0x10)(q2), 0);
+        for obj in [l1, l2, allocator] {
+            assert_eq!(slot::<Release>(obj, 0x10)(obj), 0);
+        }
+        assert!(
+            !held().pinned.contains(&q1_addr),
+            "HELD must release its pin once q1 drains"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn held_queue_pinning_handles_multiple_items_signals_waits_and_concurrent_accounting() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let null = std::ptr::null();
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+        type Signal = extern "system" fn(This, This, u64) -> HRESULT;
+        type Wait = extern "system" fn(This, This, u64) -> HRESULT;
+        type FenceSignal = extern "system" fn(This, u64) -> HRESULT;
+        type FenceCompleted = extern "system" fn(This) -> u64;
+        type Release = extern "system" fn(This) -> u32;
+        const GREATER_EQUAL: u32 = 7;
+
+        let mut words = Box::new([0u64; 3]);
+        let gate_ptr = (&raw mut words[0]) as u64;
+        let out1_ptr = (&raw mut words[1]) as u64;
+        let out2_ptr = (&raw mut words[2]) as u64;
+
+        let copy_desc = QueueDesc {
+            kind: 3,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut q, mut allocator, mut l1, mut l2, mut fence) = (null, null, null, null, null);
+        assert_eq!(create(null, &copy_desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 3, allocator, null, &list_iid, &mut l1),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 3, allocator, null, &list_iid, &mut l2),
+            S_OK
+        );
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+            S_OK
+        );
+
+        // Enqueue two held lists plus a held Signal on the same queue: HELD must
+        // add exactly one reference for the queue, not one per item.
+        crate::list::wait64(l1, gate_ptr, GREATER_EQUAL, 1, 0);
+        crate::list::write64(l1, out1_ptr, 11, 0, 0);
+        assert_eq!(slot::<Close>(l1, 0x48)(l1), S_OK);
+        crate::list::write64(l2, out2_ptr, 22, 0, 0);
+        assert_eq!(slot::<Close>(l2, 0x48)(l2), S_OK);
+
+        slot::<Execute>(q, 0x50)(q, 1, &l1);
+        slot::<Execute>(q, 0x50)(q, 1, &l2);
+        assert_eq!(slot::<Signal>(q, signal_slot(q))(q, fence, 7), S_OK);
+
+        let q_addr = q as usize;
+        assert_eq!(
+            slot::<Release>(q, 0x10)(q),
+            1,
+            "multiple held items pin the queue once"
+        );
+        assert!(held().pinned.contains(&q_addr));
+
+        // Pause account_frame after its blocked-wait snapshot, while it still
+        // owns HELD. The pump must not drain/release q until that snapshot has
+        // copied the queue kind and released the guard.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let account_queue = q_addr;
+        let account_thread = std::thread::spawn(move || {
+            *ACCOUNT_FRAME_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(AccountFrameTestHook {
+                    queue: account_queue,
+                    thread: std::thread::current().id(),
+                    entered: entered_tx,
+                    resume: resume_rx,
+                });
+            account_frame(900);
+        });
+        let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let held_locked = matches!(
+            HELD.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+
+        let (pump_started_tx, pump_started_rx) = std::sync::mpsc::channel();
+        let (pump_done_tx, pump_done_rx) = std::sync::mpsc::channel();
+        let pump_thread = std::thread::spawn(move || {
+            pump_started_tx.send(()).unwrap();
+            pump_held(Why::Fence);
+            pump_done_tx.send(()).unwrap();
+        });
+        let pump_started = pump_started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        let pump_finished_while_locked = pump_done_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_ok();
+
+        // account_frame has already read gate_ptr, and pump cannot read it
+        // until HELD is released, so this write is not concurrent with either.
+        unsafe { (gate_ptr as *mut u64).write_volatile(1) };
+        let resumed = resume_tx.send(());
+        let account_result = account_thread.join();
+        let pump_result = pump_thread.join();
+        // Drain even on a failed assertion so the global HELD state is clean.
+        pump_held(Why::Fence);
+        let leftover_hook = ACCOUNT_FRAME_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+
+        assert!(entered.is_ok(), "account_frame did not reach the blocked snapshot");
+        assert!(held_locked, "account_frame did not hold HELD at the snapshot hook");
+        assert!(pump_started, "pump thread did not start");
+        assert!(!pump_finished_while_locked, "pump completed while account_frame held HELD");
+        assert!(resumed.is_ok(), "account_frame pause hook was not waiting");
+        assert!(account_result.is_ok(), "account_frame thread panicked");
+        assert!(pump_result.is_ok(), "pump thread panicked");
+        assert!(leftover_hook.is_none(), "account_frame test hook was not consumed");
+
+        // SAFETY: `words` is live and `q` has drained.
+        assert_eq!(unsafe { (out1_ptr as *const u64).read_volatile() }, 11);
+        // SAFETY: `words` is live and `q` has drained.
+        assert_eq!(unsafe { (out2_ptr as *const u64).read_volatile() }, 22);
+        assert_eq!(slot::<FenceCompleted>(fence, 0x40)(fence), 7);
+        assert!(
+            !held().pinned.contains(&q_addr),
+            "pin is removed and released once q drains"
+        );
+
+        // Queue pinned by `Item::FenceWait` also stays alive until the fence is signaled.
+        let (mut q_wait, mut fence2) = (null, null);
+        assert_eq!(create(null, &copy_desc, &QUEUE_IIDS[0], &mut q_wait), S_OK);
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence2),
+            S_OK
+        );
+        let wait_slot = signal_slot(q_wait) + 8;
+        assert_eq!(slot::<Wait>(q_wait, wait_slot)(q_wait, fence2, 5), S_OK);
+        let q_wait_addr = q_wait as usize;
+        assert_eq!(
+            slot::<Release>(q_wait, 0x10)(q_wait),
+            1,
+            "pending FenceWait pins the queue"
+        );
+        assert_eq!(slot::<FenceSignal>(fence2, 0x50)(fence2, 5), S_OK);
+        assert!(
+            !held().pinned.contains(&q_wait_addr),
+            "pin is released once FenceWait completes"
+        );
+        assert_eq!(host.log_messages(), None);
+
+        for obj in [l1, l2, allocator, fence, fence2] {
             assert_eq!(slot::<Release>(obj, 0x10)(obj), 0);
         }
     }
