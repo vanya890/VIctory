@@ -281,15 +281,57 @@ pub(crate) fn family(format: u32) -> u32 {
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
-/// The format a view of a title texture must name when its host copy is
-/// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
-/// the host copy is typed.
+#[cfg(windows)]
+/// The typed RTV format to use when presenting a title texture. The most
+/// recently bound RTV view takes precedence for typeless host copies; otherwise
+/// use the title resource's own format only when it is a valid typed view.
+/// Returns None when no safe typed view can be inferred.
 pub(crate) fn view_format(this: This) -> Option<u32> {
+    let copy = host_copy(this)?;
+    view_format_of(this, &copy)
+}
+
+/// The typed RTV format for this exact retained host copy. PresentX uses
+/// this form so eviction cannot make the format lookup inspect a replacement
+/// texture between pinning the copy and recording the presentation.
+#[cfg(windows)]
+pub(crate) fn view_format_of(this: This, copy: &HostTexture) -> Option<u32> {
+    if this.is_null() {
+        return None;
+    }
     let own = pc_format(resource(this).desc.format);
-    let host = host_resource(this)?;
-    // SAFETY: a live resource.
-    let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own).then_some(own)
+    // SAFETY: the retained HostTexture owns a live COM resource.
+    let format = unsafe { copy.texture.GetDesc() }.Format.0 as u32;
+    let recorded = resource(this)
+        .rtv_format
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let typeless = crate::host::is_typeless_color_format(
+        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
+    );
+    if recorded != 0 && (format != own || typeless) {
+        Some(recorded)
+    } else if format != own && !crate::host::is_typeless_color_format(
+        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(own as i32),
+    ) {
+        Some(own)
+    } else {
+        None
+    }
+}
+
+/// Records the actual typed RTV format at OMSetRenderTargets time. The
+/// resource description alone cannot distinguish UNORM/SNORM/FLOAT views of
+/// a typeless texture.
+#[cfg(windows)]
+pub(crate) fn record_rtv_view_format(this: This, format: Option<u32>) {
+    if this.is_null() {
+        return;
+    }
+    if let Some(format) = format.filter(|&format| format != 0) {
+        resource(this)
+            .rtv_format
+            .store(format, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -785,6 +827,9 @@ struct Resource {
     /// The creation's initial state and clear value, for the host texture.
     #[cfg(windows)]
     made_with: (u32, Option<[u32; 5]>),
+    /// The most recently bound typed RTV view, used when presenting typeless resources.
+    #[cfg(windows)]
+    rtv_format: std::sync::atomic::AtomicU32,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1795,6 +1840,8 @@ fn hand_out_resource(
         #[cfg(windows)]
         // SAFETY: the title passes a whole clear value (or null).
         made_with: (state, (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() })),
+        #[cfg(windows)]
+        rtv_format: std::sync::atomic::AtomicU32::new(0),
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
