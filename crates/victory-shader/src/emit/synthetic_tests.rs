@@ -222,11 +222,15 @@ fn gathers_at_a_level_match_the_hardware() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (requested, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+            eprintln!("no SM 6.6 {requested} device; skipped");
             continue;
         };
+        let label = format!(
+            "{requested} requested, {} selected",
+            if host.is_warp() { "WARP" } else { "hardware" }
+        );
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         let out = host
