@@ -1303,6 +1303,7 @@ mod tests {
             .iter()
             .find(|i| i.name() == "v_movreld_b32")
             .unwrap();
+        assert!(!relative.writes.is_empty(), "the destination-relative instruction must define VGPR values");
         assert!(
             relative
                 .writes
