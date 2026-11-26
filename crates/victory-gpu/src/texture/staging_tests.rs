@@ -101,3 +101,26 @@ fn staging_suballocations_in_a_smaller_d3d12_buffer_do_not_overlap() {
         );
     }
 }
+
+#[test]
+fn staging_reuses_small_chunks_after_large_requests() {
+    let mut chunks = Chunks::new();
+    let small = 2 << 20;
+    let large = 8 << 20;
+
+    // Force a smaller chunk first, then a larger chunk in the same submission.
+    chunks
+        .take(small, |bytes| (bytes == small).then_some((bytes as usize, 0x1000)))
+        .unwrap();
+    chunks
+        .take(large, |bytes| (bytes == large).then_some((bytes as usize, 0x2000)))
+        .unwrap();
+    chunks.recycle();
+
+    // Reuse the large chunk first. The next, smaller request must then find
+    // the retained small chunk instead of trying another driver allocation.
+    let (buffer, _, _) = chunks.take(large, |_| panic!("large chunk should be reused")).unwrap();
+    assert_eq!(buffer, large as usize);
+    let (buffer, _, _) = chunks.take(1 << 20, |_| panic!("small chunk should be reused")).unwrap();
+    assert_eq!(buffer, small as usize);
+}
