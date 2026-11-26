@@ -2505,12 +2505,10 @@ mod tests {
         let before = textures_at_changes(memory).load(Acquire);
         let mut textures = LiveTextures::new();
         textures.insert(memory, 0x1000);
-        textures_at_changed(memory);
         let inserted = textures_at_changes(memory).load(Acquire);
         assert!(inserted > before, "insertion invalidates cached negative answers");
 
         assert!(textures.remove(memory, 0x1000));
-        textures_at_changed(memory);
         let removed = textures_at_changes(memory).load(Acquire);
         assert!(removed > inserted, "removal invalidates cached negative answers");
         assert!(!textures.remove(memory, 0x1000), "removing an absent entry is a no-op");
