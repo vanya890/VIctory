@@ -402,7 +402,7 @@ pub(crate) fn upload_copy(
     if !list.first_use(copy.texture.as_raw() as usize) {
         return;
     }
-    let Some(staging) = staging(resource, &copy.texture) else {
+    let Some(staging) = staging_copy(resource, &copy.texture, copy) else {
         return;
     };
     list.defer_texture(staging, copy.clone());
@@ -839,6 +839,15 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 /// (one for all title textures of its memory).
 pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let copy = crate::resource::host_copy(resource)?;
+    staging_copy(resource, texture, &copy)
+}
+
+/// Gets staging state for the exact host copy already pinned by the caller.
+fn staging_copy(
+    resource: This,
+    texture: &ID3D12Resource,
+    copy: &Arc<crate::resource::HostTexture>,
+) -> Option<Arc<Staging>> {
     let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = held.as_ref() {
         return Some(s.clone());
