@@ -913,10 +913,16 @@ mod tests {
 
         // A snapshot without a prebuilt change must not clear a concurrent one.
         let mut added = 2;
-        let mut prebuilt_changed = false;
+        let mut prebuilt_changed = true;
         restore_full_save_dirty(&mut added, &mut prebuilt_changed, 7, false);
         assert_eq!(added, 9);
-        assert!(!prebuilt_changed);
+        assert!(prebuilt_changed);
+
+        // A captured prebuilt change must be restored even if no newer one
+        // arrived while the snapshot was being written.
+        let mut prebuilt_changed = false;
+        restore_full_save_dirty(&mut 0, &mut prebuilt_changed, 0, true);
+        assert!(prebuilt_changed);
     }
 
     #[test]
