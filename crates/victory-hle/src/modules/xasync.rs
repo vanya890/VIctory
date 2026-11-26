@@ -867,8 +867,9 @@ fn finalize(call: &Arc<Call>, block: *mut AsyncBlock, result: HRESULT, required_
     }
     // Serialize the public status transition with block lookup/reuse. A
     // non-waiting status reader may observe the store below and immediately
-    // zero/reuse the block; XAsyncBegin must then see either the completed
-    // old call or no old call, never a published status with done=false.
+    // zero/reuse the block. XAsyncBegin consults CALLS before deciding whether
+    // the previous call is complete, so keep this lock until result/status,
+    // done, and any required removal are one consistent publication.
     let mut calls = lock(&CALLS);
     let key = block as usize;
     let current = calls
