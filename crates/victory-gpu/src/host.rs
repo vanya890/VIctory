@@ -2785,10 +2785,38 @@ impl Host {
 /// family's.
 fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
-        27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
-        87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
-        23..=25 => DXGI_FORMAT_R10G10B10A2_UNORM,
-        9..=14 => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        28 | 29 | 31 => DXGI_FORMAT_R8G8B8A8_UNORM,
+        87 | 88 | 91 | 93 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        24 => DXGI_FORMAT_R10G10B10A2_UNORM,
+        10 | 11 | 13 => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        // Typeless resources and integer primaries need a typed view or an
+        // explicit conversion path; never reinterpret their bits as UNORM.
+        _ => return None,
+    })
+}
+
+/// Whether a color resource format is typeless and therefore needs the
+/// actual typed view format supplied by the title.
+fn is_typeless_color_format(format: DXGI_FORMAT) -> bool {
+    matches!(format.0, 1 | 5 | 9 | 15 | 23 | 27 | 33 | 39 | 48 | 53 | 60 | 90 | 92)
+}
+
+/// Whether a raw copy would reinterpret component encoding and must instead
+/// pass through the fullscreen compositor.
+fn needs_format_conversion(src: DXGI_FORMAT, dst: DXGI_FORMAT) -> bool {
+    matches!((src.0, dst.0), (11 | 13, 10) | (31, 28) | (88 | 93, 87))
+}
+
+/// The typed SRV format for a presented plane. Typeless resources are
+/// rejected by the plane's SRV lookup unless the caller supplies the actual
+/// typed view format used to render the pixels.
+fn compositor_srv_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+    Some(match format.0 {
+        2 | 6 | 10 | 11 | 13 | 16 | 24 | 26 | 28 | 31 | 34 | 35 | 37 | 41 | 49 | 51 | 54 | 56
+        | 58 | 61 | 63 | 67 | 85 | 86 | 87 | 88 | 89 => format,
+        29 => DXGI_FORMAT_R8G8B8A8_UNORM,
+        90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        92 | 93 => DXGI_FORMAT_B8G8R8X8_UNORM,
         _ => return None,
     })
 }
