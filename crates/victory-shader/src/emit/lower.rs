@@ -252,7 +252,7 @@ struct Lower<'a> {
     writes_uavs: bool,
     /// Barriers in a proven single-wave group need fences but no group sync.
     relaxed_barriers: HashSet<(usize, usize)>,
-    /// Native wave64 programs are refused when the host cannot support 64 lanes.
+    /// Programs requiring native Wave64 lane semantics are refused when unsupported by the host.
     wave64_unsupported: bool,
     /// Barrier modes emitted by the test translation.
     #[cfg(test)]
@@ -581,9 +581,6 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
-        let wave_plan = wave::plan(p, x.st, &x.native.io, x.native.wave64, wave);
-        let wave64_unsupported = wave_plan.wave64_unsupported;
-        let relaxed_barriers = wave_plan.relaxed_barriers;
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
@@ -631,6 +628,19 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
+        // Gate native Wave64 only when this translation actually needs
+        // 64-lane semantics. The native metadata bit alone is not sufficient:
+        // unrestricted shaders can lower to wave-size-agnostic DXIL.
+        let wave_plan = wave::plan(
+            p,
+            x.st,
+            &x.native.io,
+            x.native.wave64,
+            wave,
+            s.wave_size == Some(64),
+        );
+        let wave64_unsupported = wave_plan.wave64_unsupported;
+        let relaxed_barriers = wave_plan.relaxed_barriers;
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
