@@ -23,6 +23,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+      - name: Test coordination triage scripts
+        run: python -B -I -m unittest discover -s scripts -p 'test_coordination_triage.py' -v
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2

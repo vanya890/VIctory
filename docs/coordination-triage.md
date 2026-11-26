@@ -4,7 +4,8 @@ The `Coordination triage` workflow produces a read-only snapshot of open upstrea
 
 ## What it checks
 
-- exact PR head SHA and base SHA observed from GitHub metadata;
+- exact PR head SHA from GitHub metadata (a head mismatch during fetch is skipped);
+- whether the PR's recorded base SHA is current, behind, diverged, or unavailable relative to the fetched upstream `main`; stale-base PRs are still analyzed against current upstream `main`;
 - whether the PR head is already an ancestor of fork `dev`;
 - whether a non-mutating `git merge-tree` succeeds against upstream `main` and fork `dev`;
 - stable patch-id plus identical merge-tree evidence for exact duplicate candidates;
@@ -18,7 +19,7 @@ The `Coordination triage` workflow produces a read-only snapshot of open upstrea
 - does not resolve conflicts or reuse `rerere` automatically;
 - does not treat an overlap hint as proof of duplication or a merge recommendation.
 
-The Markdown summary appears in the Actions run. Full JSON and Markdown are retained as a 14-day artifact. Reports are snapshots: always recheck the exact head/base SHA before acting.
+The Markdown summary appears in the Actions run. Full JSON and Markdown are retained as a 14-day artifact. Reports are snapshots: always recheck the exact head/base SHA before acting. GitHub's PR `baseRefOid` is the recorded base commit and can be old; a mismatch with current upstream `main` means the PR base is stale, not that the scan raced. The report still evaluates mergeability against the pinned current `main` and records how many commits behind the recorded base is when ancestry permits.
 
 ## Triggers
 
