@@ -1843,7 +1843,7 @@ impl HostList {
         {
             return None;
         }
-        let wanted = legal_state(&texture, wanted);
+        let wanted = copy.legal(wanted);
         self.track(copy, wanted).map(|before| (texture, before))
     }
 
@@ -1875,7 +1875,7 @@ impl HostList {
         copy: &std::sync::Arc<crate::resource::HostTexture>,
         wanted: u32,
     ) -> Option<D3D12_RESOURCE_BARRIER> {
-        let wanted = legal_state(&copy.texture, wanted);
+        let wanted = copy.legal(wanted);
         let before = self.track(copy, wanted)?;
         Some(transition(
             &copy.texture,
