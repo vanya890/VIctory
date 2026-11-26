@@ -2784,12 +2784,109 @@ impl Host {
 /// family's.
 fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
-        27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
-        87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
-        23..=25 => DXGI_FORMAT_R10G10B10A2_UNORM,
-        9..=14 => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        28 | 29 | 31 => DXGI_FORMAT_R8G8B8A8_UNORM,
+        87 | 88 | 91 | 93 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        24 => DXGI_FORMAT_R10G10B10A2_UNORM,
+        10 | 11 | 13 => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        // Typeless resources and integer primaries need a typed view or an
+        // explicit conversion path; never reinterpret their bits as UNORM.
         _ => return None,
     })
+}
+
+/// Whether a color resource format is typeless and therefore needs the
+/// actual typed view format supplied by the title.
+fn is_typeless_color_format(format: DXGI_FORMAT) -> bool {
+    matches!(format.0, 1 | 5 | 9 | 15 | 23 | 27 | 33 | 39 | 48 | 53 | 60 | 90 | 92)
+}
+
+/// Whether a raw copy would reinterpret component encoding and must instead
+/// pass through the fullscreen compositor.
+fn needs_format_conversion(src: DXGI_FORMAT, dst: DXGI_FORMAT) -> bool {
+    matches!((src.0, dst.0), (11 | 13, 10) | (31, 28) | (88 | 93, 87))
+}
+
+/// The typed SRV format for a presented plane. Typeless resources are
+/// rejected by the plane's SRV lookup unless the caller supplies the actual
+/// typed view format used to render the pixels.
+fn compositor_srv_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+    Some(match format.0 {
+        2 | 6 | 10 | 11 | 13 | 16 | 24 | 26 | 28 | 31 | 34 | 35 | 37 | 41 | 49 | 51 | 54 | 56
+        | 58 | 61 | 63 | 67 | 85 | 86 | 87 | 88 | 89 => format,
+        29 => DXGI_FORMAT_R8G8B8A8_UNORM,
+        90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        92 | 93 => DXGI_FORMAT_B8G8R8X8_UNORM,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod present_format_tests {
+    use super::*;
+
+    #[test]
+    fn primary_format_mapping_rejects_integer_and_ambiguous_typeless_formats() {
+        assert_eq!(swap_format(DXGI_FORMAT_R8G8B8A8_UINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R8G8B8A8_SINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R16G16B16A16_UINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R16G16B16A16_SINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R10G10B10A2_UINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R8G8B8A8_TYPELESS), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R16G16B16A16_TYPELESS), None);
+        assert_eq!(swap_format(DXGI_FORMAT_B8G8R8X8_TYPELESS), None);
+        assert_eq!(
+            swap_format(DXGI_FORMAT_B8G8R8X8_UNORM),
+            Some(DXGI_FORMAT_B8G8R8A8_UNORM)
+        );
+    }
+
+    #[test]
+    fn compositor_uses_typed_views_and_requires_numeric_conversion() {
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R16G16B16A16_UNORM),
+            Some(DXGI_FORMAT_R16G16B16A16_UNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R16G16B16A16_SNORM),
+            Some(DXGI_FORMAT_R16G16B16A16_SNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R8G8B8A8_SNORM),
+            Some(DXGI_FORMAT_R8G8B8A8_SNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R8G8B8A8_UINT),
+            None
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R16G16B16A16_UINT),
+            None
+        );
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_R16G16B16A16_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        ));
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_R16G16B16A16_SNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        ));
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_R8G8B8A8_SNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        ));
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_B8G8R8X8_UNORM,
+            DXGI_FORMAT_B8G8R8A8_UNORM
+        ));
+        assert!(!needs_format_conversion(
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        ));
+        assert!(!needs_format_conversion(
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        ));
+    }
 }
 
 const BUFFERS: u32 = 2;
@@ -3196,28 +3293,54 @@ impl Meter {
 
 /// A texture presented by [`Host::present_planes`].
 pub(crate) enum PresentPlane<'a> {
-    /// A title texture whose tracked host state is read under `Host::submitted`.
-    Tracked(&'a crate::resource::HostTexture),
+    /// A title texture, its tracked host state, and the typed RTV format used
+    /// by the title when the host resource itself is typeless. Callers obtain
+    /// the override with `resource::view_format(title_resource)`.
+    Tracked(&'a crate::resource::HostTexture, Option<u32>),
     /// A raw host texture in a known state (tests).
     #[cfg(all(test, feature = "diagnostics"))]
-    Raw(&'a ID3D12Resource, u32),
+    Raw(&'a ID3D12Resource, u32, Option<u32>),
 }
 
 impl<'a> PresentPlane<'a> {
     fn texture(&self) -> &'a ID3D12Resource {
         match self {
-            Self::Tracked(copy) => &copy.texture,
+            Self::Tracked(copy, _) => &copy.texture,
             #[cfg(all(test, feature = "diagnostics"))]
-            Self::Raw(texture, _) => texture,
+            Self::Raw(texture, _, _) => texture,
         }
     }
 
     fn state(&self) -> u32 {
         match self {
-            Self::Tracked(copy) => copy.state.load(Ordering::Relaxed),
+            Self::Tracked(copy, _) => copy.state.load(Ordering::Relaxed),
             #[cfg(all(test, feature = "diagnostics"))]
-            Self::Raw(_, state) => *state,
+            Self::Raw(_, state, _) => *state,
         }
+    }
+
+    fn view_format(&self) -> Option<DXGI_FORMAT> {
+        match self {
+            Self::Tracked(_, format) => format.map(|f| DXGI_FORMAT(f as i32)),
+            #[cfg(all(test, feature = "diagnostics"))]
+            Self::Raw(_, _, format) => format.map(|f| DXGI_FORMAT(f as i32)),
+        }
+    }
+
+    /// The format a compositor may safely sample. A typeless resource needs
+    /// the actual typed view that produced its pixels; a denied-SRV resource
+    /// cannot be sampled at all.
+    fn srv_format(&self) -> Option<DXGI_FORMAT> {
+        // SAFETY: this plane owns a live host resource.
+        let desc = unsafe { self.texture().GetDesc() };
+        if desc.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 != 0 {
+            return None;
+        }
+        let format = self.view_format().unwrap_or(desc.Format);
+        if self.view_format().is_none() && is_typeless_color_format(format) {
+            return None;
+        }
+        compositor_srv_format(format)
     }
 }
 
@@ -3231,7 +3354,7 @@ impl Host {
     pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
         let planes: Vec<_> = planes
             .iter()
-            .map(|&(texture, state)| PresentPlane::Raw(texture, state))
+            .map(|&(texture, state)| PresentPlane::Raw(texture, state, None))
             .collect();
         self.present_planes(&planes, frame).0
     }
@@ -3264,7 +3387,7 @@ impl Host {
     ) -> Option<bool> {
         let planes: Vec<_> = planes
             .iter()
-            .map(|&(texture, state)| PresentPlane::Raw(texture, state))
+            .map(|&(texture, state)| PresentPlane::Raw(texture, state, None))
             .collect();
         self.present_planes_with_compositor(&planes, frame, create_compositor, inspect)
             .0
@@ -3287,10 +3410,29 @@ impl Host {
         let fallback_state = || first.state();
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
-        let Some(format) = swap_format(primary_desc.Format) else {
-            tracing::warn!(format = primary_desc.Format.0, "cannot present this format");
+        let primary_format = first.view_format().unwrap_or(primary_desc.Format);
+        let Some(format) = swap_format(primary_format) else {
+            tracing::warn!(format = primary_format.0, "cannot present this format");
             return (None, fallback_state());
         };
+        let conversion_required = needs_format_conversion(primary_format, format);
+        let sampleable: Vec<_> = planes
+            .iter()
+            .take(MAX_PLANES as usize)
+            .filter_map(|plane| plane.srv_format().map(|srv| (plane, srv)))
+            .collect();
+        let primary_sampleable = sampleable
+            .first()
+            .is_some_and(|(plane, _)| plane.texture().as_raw() == primary.as_raw());
+        if conversion_required && !primary_sampleable {
+            tracing::warn!(
+                format = primary_format.0,
+                "cannot convert a primary plane that has no legal shader-resource view"
+            );
+            return (None, fallback_state());
+        }
+        let mut use_compositor = primary_sampleable
+            && (conversion_required || sampleable.len() > 1);
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let Presentation { presenter, retry } = &mut *presentation;
         if presenter.is_none() && !retry.ready(Instant::now()) {
@@ -3301,26 +3443,31 @@ impl Host {
             .and_then(|p| p.compositor.as_ref())
             .map(|c| c.format);
         let mut new_compositor = None;
-        let planes = if planes.len() > 1 && cached_format != Some(format) {
+        if use_compositor && cached_format != Some(format) {
             match create_compositor(&self.device, format) {
-                Ok(c) => {
-                    new_compositor = Some(c);
-                    planes
+                Ok(c) => new_compositor = Some(c),
+                Err(e) if conversion_required => {
+                    tracing::warn!(
+                        error = %e,
+                        format = format.0,
+                        "cannot present a primary plane that requires format conversion"
+                    );
+                    return (None, fallback_state());
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "presenting the primary plane after compositor initialization failed");
-                    &planes[..1]
+                    use_compositor = false;
                 }
             }
-        } else {
-            planes
-        };
+        }
         let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
-        for plane in &planes[1..] {
-            // SAFETY: live resource.
-            let d = unsafe { plane.texture().GetDesc() };
-            width = width.max(d.Width as u32);
-            height = height.max(d.Height);
+        if use_compositor {
+            for (plane, _) in &sampleable[1..] {
+                // SAFETY: each sampleable plane holds a live host resource.
+                let d = unsafe { plane.texture().GetDesc() };
+                width = width.max(d.Width as u32);
+                height = height.max(d.Height);
+            }
         }
         if presenter.is_none() {
             *presenter = match retry
@@ -3372,15 +3519,15 @@ impl Host {
             // Serialize tracked state reads, barrier recording, and execution
             // with `Host::execute` so `p.copy` matches the live GPU state.
             let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-            let planes: Vec<(&ID3D12Resource, u32)> = planes
+            let primary_state = first.state();
+            let sampleable_states: Vec<(&ID3D12Resource, u32, DXGI_FORMAT)> = sampleable
                 .iter()
-                .map(|plane| (plane.texture(), plane.state()))
+                .map(|(plane, format)| (plane.texture(), plane.state(), *format))
                 .collect();
-            let primary_state = planes[0].1;
             p.copy.reset();
             let list = &p.copy.list;
-            let (capture, probe) = if planes.len() == 1 {
-                let (texture, state) = planes[0];
+            let (capture, probe) = if !use_compositor {
+                let (texture, state) = (primary, primary_state);
                 let state = D3D12_RESOURCE_STATES(state as i32);
                 let mut before = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
@@ -3392,7 +3539,21 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
                 list.ResourceBarrier(&before);
-                list.CopyResource(&back, texture);
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&back),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
                 #[cfg(all(test, feature = "diagnostics"))]
                 let capture = {
                     // Inspect what reached the swap chain, before Present.
@@ -3432,7 +3593,8 @@ impl Host {
                 list.ResourceBarrier(&after);
                 (capture, probe)
             } else {
-                let comp = p.compositor.as_ref().expect("compositor was prepared for multiple planes");
+                let comp = p.compositor.as_ref().expect("compositor was prepared for the primary conversion or multiple planes");
+                let planes = &sampleable_states;
                 let rtv = comp.rtv_heap.GetCPUDescriptorHandleForHeapStart();
                 self.device.CreateRenderTargetView(
                     &back,
@@ -3450,12 +3612,10 @@ impl Host {
                 );
                 let srv_cpu_base = comp.srv_heap.GetCPUDescriptorHandleForHeapStart();
                 let srv_gpu_base = comp.srv_heap.GetGPUDescriptorHandleForHeapStart();
-                let count = planes.len().min(MAX_PLANES as usize);
+                let count = planes.len();
                 let mut before = Vec::with_capacity(count + 1);
                 let mut after = Vec::with_capacity(count);
-                for (i, &(tex, state)) in planes[..count].iter().enumerate() {
-                    let d = tex.GetDesc();
-                    let srv_fmt = swap_format(d.Format).unwrap_or(d.Format);
+                for (i, &(tex, state, srv_fmt)) in planes.iter().enumerate() {
                     let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
                         ptr: srv_cpu_base.ptr + i * comp.srv_stride as usize,
                     };
@@ -3480,7 +3640,7 @@ impl Host {
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
                         && planes[..i]
                             .iter()
-                            .all(|(earlier, _)| earlier.as_raw() != tex.as_raw())
+                            .all(|(earlier, _, _)| earlier.as_raw() != tex.as_raw())
                     {
                         before.push(transition(
                             tex,
@@ -4441,6 +4601,396 @@ mod present_plane_tests {
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
+
+    #[test]
+    fn present_primary_bgrx_uses_typed_view_and_integer_primary_is_rejected() {
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX format test: no D3D12 device");
+            return;
+        };
+        let make = |format: DXGI_FORMAT| -> ID3D12Resource {
+            let mut texture = None;
+            // SAFETY: live device and a valid 2D render-target description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 32,
+                            Height: 32,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: format,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+            }
+            texture.unwrap()
+        };
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let bgrx = make(DXGI_FORMAT_B8G8R8X8_TYPELESS);
+        let list = host.new_list().unwrap();
+        let rtv = host.rtv(
+            &bgrx,
+            Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: DXGI_FORMAT_B8G8R8X8_UNORM,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_RTV { MipSlice: 0, PlaneSlice: 0 },
+                },
+            }),
+        );
+        // SAFETY: live typed RTV on an open list.
+        unsafe { list.list.ClearRenderTargetView(rtv, &[0.0, 1.0, 0.0, 1.0], None) };
+        list.close();
+        host.execute(&[&list]);
+
+        let mut pixel = None;
+        let shown = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(
+                &bgrx,
+                state,
+                Some(DXGI_FORMAT_B8G8R8X8_UNORM.0 as u32),
+            )],
+            4,
+            Compositor::new,
+            |buffer, footprint| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: the present copy completed; footprint names a live RGBA pixel.
+                pixel = Some(unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u8; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                });
+            },
+        );
+        assert!(shown.0.is_some(), "typeless BGRX with its actual typed RTV must composite");
+        assert_eq!(pixel, Some([0, 255, 0, 255]));
+
+        let integer = make(DXGI_FORMAT_R8G8B8A8_UINT);
+        let mut compositor_attempted = false;
+        let rejected = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(&integer, state, None)],
+            5,
+            |_, _| {
+                compositor_attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |_, _| {},
+        );
+        assert!(rejected.0.is_none(), "integer primary formats must not be reinterpreted as UNORM");
+        assert!(!compositor_attempted);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn present_conversion_requires_typed_view_and_shader_resource_access() {
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX typed-view test: no D3D12 device");
+            return;
+        };
+        let make = |format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS| -> ID3D12Resource {
+            let mut texture = None;
+            // SAFETY: live device and a valid 2D resource description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 32,
+                            Height: 32,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: format,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Flags: flags,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+            }
+            texture.unwrap()
+        };
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let typeless = make(
+            DXGI_FORMAT_R16G16B16A16_TYPELESS,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        );
+        let list = host.new_list().unwrap();
+        let rtv = host.rtv(
+            &typeless,
+            Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: DXGI_FORMAT_R16G16B16A16_UNORM,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_RTV { MipSlice: 0, PlaneSlice: 0 },
+                },
+            }),
+        );
+        // SAFETY: live typed RTV on an open list.
+        unsafe { list.list.ClearRenderTargetView(rtv, &[1.0, 0.5, 0.0, 1.0], None) };
+        list.close();
+        host.execute(&[&list]);
+
+        let mut pixel = None;
+        let converted = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(
+                &typeless,
+                state,
+                Some(DXGI_FORMAT_R16G16B16A16_UNORM.0 as u32),
+            )],
+            6,
+            Compositor::new,
+            |buffer, footprint| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: completed present copy; footprint points to one RGBA16F texel.
+                pixel = Some(unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u16; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                });
+            },
+        );
+        assert!(converted.0.is_some(), "typed UNORM RTV metadata must enable conversion");
+        let [red, green, blue, alpha] = pixel.expect("converted primary pixel");
+        assert_eq!((red, blue, alpha), (0x3c00, 0x0000, 0x3c00));
+        assert!(matches!(green, 0x37ff | 0x3800), "expected ~0.5 as f16, got {green:#06x}");
+
+        let mut attempted = false;
+        let failed = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(
+                &typeless,
+                state,
+                Some(DXGI_FORMAT_R16G16B16A16_UNORM.0 as u32),
+            )],
+            7,
+            |_, _| {
+                attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |_, _| panic!("conversion-required primary must not be copied raw"),
+        );
+        assert!(attempted);
+        assert!(failed.0.is_none(), "failed compositor must not raw-copy mismatched texels");
+
+        let ambiguous = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(&typeless, state, None)],
+            8,
+            |_, _| panic!("typeless primary without its actual view must be rejected"),
+            |_, _| panic!("ambiguous typeless primary must not be presented"),
+        );
+        assert!(ambiguous.0.is_none());
+
+        let denied = make(
+            DXGI_FORMAT_R16G16B16A16_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+                | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+        );
+        let mut denied_attempted = false;
+        let rejected = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(&denied, state, None)],
+            9,
+            |_, _| {
+                denied_attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |_, _| panic!("DENY_SHADER_RESOURCE primary must not be sampled or copied raw"),
+        );
+        assert!(rejected.0.is_none());
+        assert!(!denied_attempted);
+
+        let direct_primary = make(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        );
+        let denied_overlay = make(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+                | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+        );
+        let setup = host.new_list().unwrap();
+        // SAFETY: live render-target views on an open list.
+        unsafe {
+            setup.list.ClearRenderTargetView(
+                host.rtv(&direct_primary, None),
+                &[1.0, 0.0, 0.0, 1.0],
+                None,
+            );
+            setup.list.ClearRenderTargetView(
+                host.rtv(&denied_overlay, None),
+                &[0.0, 1.0, 0.0, 1.0],
+                None,
+            );
+        }
+        setup.close();
+        host.execute(&[&setup]);
+        let mut direct_pixel = None;
+        let mut overlay_compositor_attempted = false;
+        let direct = host.present_planes_with_compositor(
+            &[
+                PresentPlane::Raw(&direct_primary, state, None),
+                PresentPlane::Raw(&denied_overlay, state, None),
+            ],
+            10,
+            |_, _| {
+                overlay_compositor_attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |buffer, footprint| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: the present copy completed; footprint names a live RGBA pixel.
+                direct_pixel = Some(unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u8; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                });
+            },
+        );
+        assert!(direct.0.is_some(), "the legal primary plane remains presentable");
+        assert!(!overlay_compositor_attempted, "a DENY_SHADER_RESOURCE overlay is not sampled");
+        assert_eq!(direct_pixel, Some([255, 0, 0, 255]));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn present_single_plane_copies_subresource_zero_of_mipmapped_and_array_textures() {
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX subresource test: no D3D12 device");
+            return;
+        };
+        let make = |mips: u16, array: u16, color: [f32; 4]| -> ID3D12Resource {
+            let mut texture = None;
+            // SAFETY: live device and a valid 2D render-target description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 32,
+                            Height: 32,
+                            DepthOrArraySize: array,
+                            MipLevels: mips,
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+                let texture = texture.unwrap();
+                let desc = D3D12_RENDER_TARGET_VIEW_DESC {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    ViewDimension: if array > 1 {
+                        D3D12_RTV_DIMENSION_TEXTURE2DARRAY
+                    } else {
+                        D3D12_RTV_DIMENSION_TEXTURE2D
+                    },
+                    Anonymous: if array > 1 {
+                        D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2DArray: D3D12_TEX2D_ARRAY_RTV {
+                                MipSlice: 0,
+                                FirstArraySlice: 0,
+                                ArraySize: 1,
+                                PlaneSlice: 0,
+                            },
+                        }
+                    } else {
+                        D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_RTV { MipSlice: 0, PlaneSlice: 0 },
+                        }
+                    },
+                };
+                let list = host.new_list().unwrap();
+                list.list.ClearRenderTargetView(host.rtv(&texture, Some(&desc)), &color, None);
+                list.close();
+                host.execute(&[&list]);
+                texture
+            }
+        };
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let mipmapped = make(3, 1, [0.0, 1.0, 0.0, 1.0]);
+        let arrayed = make(1, 2, [0.0, 0.0, 1.0, 1.0]);
+        let first_pixel = |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the present copy completed; footprint names a live RGBA pixel.
+            unsafe {
+                buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                let rgba = mapped
+                    .cast::<u8>()
+                    .add(footprint.Offset as usize)
+                    .cast::<[u8; 4]>()
+                    .read();
+                buffer.Unmap(0, None);
+                rgba
+            }
+        };
+        let mut mip_pixel = None;
+        assert!(
+            host.present_with_compositor(&[(&mipmapped, state)], 10, Compositor::new, |b, f| {
+                mip_pixel = Some(first_pixel(b, f));
+            }).is_some()
+        );
+        assert_eq!(mip_pixel, Some([0, 255, 0, 255]));
+        let mut array_pixel = None;
+        assert!(
+            host.present_with_compositor(&[(&arrayed, state)], 11, Compositor::new, |b, f| {
+                array_pixel = Some(first_pixel(b, f));
+            }).is_some()
+        );
+        assert_eq!(array_pixel, Some([0, 0, 255, 255]));
+    }
 }
 
 #[cfg(test)]
@@ -4524,8 +5074,8 @@ mod present_state_sync_tests {
             let _ = tests::issued();
             let (_, state) = host.present_planes_with_compositor(
                 &[
-                    PresentPlane::Tracked(&scene_copy),
-                    PresentPlane::Tracked(&overlay_copy),
+                    PresentPlane::Tracked(&scene_copy, None),
+                    PresentPlane::Tracked(&overlay_copy, None),
                 ],
                 1,
                 |_, _| {
@@ -4565,8 +5115,8 @@ mod present_state_sync_tests {
             let _ = tests::issued();
             let (shown, state) = host.present_planes_with_compositor(
                 &[
-                    PresentPlane::Tracked(&scene_copy),
-                    PresentPlane::Tracked(&overlay_copy),
+                    PresentPlane::Tracked(&scene_copy, None),
+                    PresentPlane::Tracked(&overlay_copy, None),
                 ],
                 2,
                 |device, format| {
