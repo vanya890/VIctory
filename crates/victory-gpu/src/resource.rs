@@ -304,10 +304,17 @@ pub(crate) fn view_format_of(this: This, copy: &HostTexture) -> Option<u32> {
     let recorded = resource(this)
         .rtv_format
         .load(std::sync::atomic::Ordering::Relaxed);
-    if recorded != 0 {
+    let typeless = crate::host::is_typeless_color_format(
+        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
+    );
+    if recorded != 0 && (format != own || typeless) {
         Some(recorded)
+    } else if format != own && !crate::host::is_typeless_color_format(
+        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(own as i32),
+    ) {
+        Some(own)
     } else {
-        (format != own).then_some(own)
+        None
     }
 }
 
