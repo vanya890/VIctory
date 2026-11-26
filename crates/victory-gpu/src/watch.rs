@@ -87,6 +87,12 @@ pub(crate) fn clean_bit(bit: Option<u32>) -> bool {
     bit.is_some_and(|bit| DIRTY[bit as usize / 64].load(Ordering::Acquire) & 1 << (bit % 64) == 0)
 }
 
+/// The change tracker's word `word` (64 page bits), for callers that scan
+/// a layout's dirty copies a word at a time instead of loading each bit.
+pub(crate) fn dirty_word(word: usize) -> u64 {
+    DIRTY.get(word).map_or(0, |w| w.load(Ordering::Acquire))
+}
+
 impl Drop for Changed {
     fn drop(&mut self) {
         if let Some(bit) = self.2 {
