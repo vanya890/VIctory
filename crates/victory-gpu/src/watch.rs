@@ -404,7 +404,9 @@ fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
     if watched(start & !(4096 - 1), end - (start & !(4096 - 1))) {
         return (first..last).collect();
     }
-    let (mut runtime, mut other) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+    let mut pages = Vec::new();
+    let mut run_start = first;
+    let mut scanned_end = first;
     let mut at = start & !(4096 - 1);
     while at < end {
         // SAFETY: plain data filled in by the query.
@@ -416,10 +418,17 @@ fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
         let next = (info.BaseAddress as usize + info.RegionSize).max(at + 1).min(end);
         let ours = watched(at, next - at)
             || views && info.Type != MEM_IMAGE && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
-        (if ours { &mut runtime } else { &mut other }).extend(at / PAGE..next.div_ceil(PAGE));
+        scanned_end = next.div_ceil(PAGE);
+        if !ours {
+            // Regions arrive in address order. Finish the run before the
+            // first page this region touches and resume past its last page.
+            pages.extend(run_start..at / PAGE);
+            run_start = scanned_end;
+        }
         at = next;
     }
-    runtime.difference(&other).copied().collect()
+    pages.extend(run_start..scanned_end);
+    pages
 }
 
 impl Drop for Tracked {
@@ -1072,6 +1081,28 @@ pub(crate) mod tests {
         drop(t);
         free(foreign);
         free(pool);
+    }
+
+    #[test]
+    fn runtime_pages_excludes_a_page_split_by_a_private_region() {
+        // SAFETY: a private reservation of ours, with one 4 KiB part committed.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        let private = base + PAGE + 4096;
+        // SAFETY: the requested page is inside the reservation above.
+        let committed = unsafe { VirtualAlloc(private as *const _, 4096, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(committed as usize, private);
+        let mixed = runtime_pages(base + 1, base + 4 * PAGE - 1, true);
+        let before = runtime_pages(base + PAGE, private, true);
+        let after = runtime_pages(private + 4096, base + 2 * PAGE, true);
+        let without_views = runtime_pages(base, base + 4 * PAGE, false);
+        free(base);
+
+        let first = base / PAGE;
+        assert_eq!(mixed, [first, first + 2, first + 3]);
+        assert_eq!(before, [first + 1]);
+        assert_eq!(after, [first + 1]);
+        assert!(without_views.is_empty());
     }
 
     /// A tracker's dirty bit goes back when it goes, and the next tracker
