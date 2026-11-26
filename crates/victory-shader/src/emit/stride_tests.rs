@@ -905,9 +905,10 @@ fn scalar_buffer_loads_of_a_code_table_keep_num_records_with_stride_and_soffset(
         .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) if warp => panic!("{label}: required WARP adapter unavailable: {e}"),
+            Err(_) => continue,
         };
         let (root, pso) = host
             .compute_pipeline(&shader)
@@ -970,9 +971,10 @@ fn scalar_buffer_loads_of_a_code_table_read_zero_past_num_records() {
         .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) if warp => panic!("{label}: required WARP adapter unavailable: {e}"),
+            Err(_) => continue,
         };
         let (root, pso) = host
             .compute_pipeline(&shader)
