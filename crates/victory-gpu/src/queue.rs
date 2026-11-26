@@ -426,8 +426,8 @@ fn account_frame(frame: u64) {
         let blocked = guard.held.blocked(&read_value);
         #[cfg(all(test, windows))]
         for (queue, _, _, _) in &blocked {
-            // The test pauses here after wait-word reads and kind(queue), while
-            // HELD still pins the queue and excludes a concurrent pump.
+            // The test pauses immediately before kind(queue), after wait-word
+            // reads, while HELD still pins the queue and excludes a concurrent pump.
             pause_account_frame_for_queue(*queue);
         }
         blocked
