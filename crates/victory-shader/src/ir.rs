@@ -397,17 +397,16 @@ fn restores(blocks: &[Block], vgprs: u16) -> HashMap<Value, Value> {
                     Some(Operand::Vector { reg, .. }) => Some(*reg),
                     _ => None,
                 };
-                if let (Some(base), Some(delta)) = (base, m0) {
-                    let reg = u32::from(base) + delta;
-                    if reg < u32::from(vgprs)
-                        && let Ok(reg) = u8::try_from(reg)
+                if let (Some(base), Some(delta)) = (base, m0)
+                    && let Some(reg) = u32::from(base).checked_add(delta)
+                    && reg < u32::from(vgprs)
+                    && let Ok(reg) = u8::try_from(reg)
+                {
+                    let mut found = parked.iter().filter(|((r, _), _)| *r == reg);
+                    if let (Some((_, &scalar)), None) = (found.next(), found.next())
+                        && let Some((_, result)) = inst.writes.first()
                     {
-                        let mut found = parked.iter().filter(|((r, _), _)| *r == reg);
-                        if let (Some((_, &scalar)), None) = (found.next(), found.next())
-                            && let Some((_, result)) = inst.writes.first()
-                        {
-                            out.insert(*result, scalar);
-                        }
+                        out.insert(*result, scalar);
                     }
                 }
             }
