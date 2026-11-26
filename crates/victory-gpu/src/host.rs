@@ -4748,7 +4748,7 @@ mod present_state_sync_tests {
             let (shown, state) = host.present_planes_with_compositor(
                 &[
                     PresentPlane::Tracked(&scene_copy, None),
-                    PresentPlane::Tracked(&overlay_copy),
+                    PresentPlane::Tracked(&overlay_copy, None),
                 ],
                 2,
                 |device, format| {
