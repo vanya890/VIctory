@@ -1793,6 +1793,11 @@ mod tests {
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
 
+    /// Guarded `v_interp_mov_f32`, `v_interp_p1_f32` + `v_interp_p2_f32`
+    /// (sharing `vdst`), and `v_interp_p2_f16` (both with a separate `vdst`
+    /// and sharing `vdst` with `v_interp_p1ll_f16`) must preserve inactive
+    /// lanes' prior `vdst` values under straight-line EXEC narrowing.
+    #[cfg(windows)]
     #[test]
     fn guarded_interpolation_preserves_inactive_lanes() {
         use super::bitcode::{Attr, Term};
