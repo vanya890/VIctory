@@ -2232,14 +2232,41 @@ mod tests {
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
+        let warp_requested = crate::switch::on("VICTORY_D3D12_WARP");
         let Some(heap) = HostHeap::new(false, 4) else {
+            assert!(!warp_requested, "WARP was requested but no host view heap was created");
             return; // no host GPU
         };
-        // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
-        // SAFETY: plain queries of live heaps.
+        if warp_requested {
+            eprintln!("WARP host device created; checking descriptor heap invariants");
+        }
+        // The heap holds the title's slots and the dynamic range it took.
+        // `HEAP_VIEWS` is above the 1,000,000 shader-visible cap, so capped
+        // hosts take `MIN_DYNAMIC`; the stride and mark tables still cover
+        // every index a translated shader can reach.
+        // SAFETY: plain queries of live heaps and their mapped resources.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            assert_eq!(heap.count, 4);
+            assert!(heap.dynamic >= MIN_DYNAMIC, "the small dynamic range at least");
+            let total = heap.heap.GetDesc().NumDescriptors;
+            assert!(
+                total >= heap.count + heap.dynamic,
+                "the heap holds at least the title's slots and dynamic range: {total} of {}",
+                heap.count + heap.dynamic
+            );
+            let views = victory_shader::emit::HEAP_VIEWS;
+            let strides = heap.strides.as_ref().expect("a view-stride table");
+            let marks = heap.marks.as_ref().expect("a view-mark table");
+            assert_eq!(
+                strides.0.GetDesc().Width,
+                u64::from(heap.count.max(views)) * 4,
+                "a stride for every index a shader can reach"
+            );
+            assert_eq!(
+                marks.0.GetDesc().Width,
+                u64::from(heap.count.max(views)) * 8,
+                "two dwords of marks for every index a shader can reach"
+            );
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }

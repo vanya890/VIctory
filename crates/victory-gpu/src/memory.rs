@@ -1008,9 +1008,17 @@ void main(uint3 id : SV_DispatchThreadID) {
     fn lists_share_a_table_and_copies_keep_their_views() {
         let _guard = gpu_test_lock();
         use crate::watch::PAGE;
+        let warp_requested = crate::switch::on("VICTORY_D3D12_WARP");
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
+            assert!(
+                !warp_requested,
+                "WARP was requested but the host device or view heap was unavailable"
+            );
             return; // no host GPU here
         };
+        if warp_requested {
+            eprintln!("WARP host device created; checking page-table copy-pair invariants");
+        }
         let (root, pso) = pipeline(SOURCE);
         let (out, at) = host.shared_buffer(256).unwrap();
         // SAFETY: a live buffer.
@@ -1072,7 +1080,16 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&lists[0], &lists[1]]);
         assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
-        assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
+        // One pair per copy, inside the heap. Where it sits depends on the
+        // host: the reserved range past dynamic slots where the heap has
+        // room for it, else a dynamic slot (a capped heap may have no tail).
+        // SAFETY: a live heap.
+        let capacity = unsafe { views.heap.GetDesc().NumDescriptors };
+        assert_ne!(pairs.0, pairs.1, "a pair per copy");
+        assert!(
+            pairs.0 < capacity && pairs.1 < capacity,
+            "inside the heap: {pairs:?} of {capacity}"
+        );
         // A second submission, after a third copy came.
         let c = copy(memory[2], 1);
         for list in &lists {
