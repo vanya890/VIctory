@@ -1335,8 +1335,6 @@ fn current(this: This) -> bool {
 }
 
 /// A host texture of host description `d` in GPU memory, castable to
-/// [`castable`]'s formats (colour textures, through the enhanced-barrier
-/// creation; it starts in the common state) where the host takes that.
 #[cfg(windows)]
 thread_local! {
     static OUT_OF_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1344,6 +1342,8 @@ thread_local! {
     static FAIL_NEXT: std::cell::Cell<Option<windows::core::HRESULT>> = const { std::cell::Cell::new(None) };
 }
 
+/// [`castable`]'s formats (colour textures, through the enhanced-barrier
+/// creation; it starts in the common state) where the host takes that.
 #[cfg(windows)]
 fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<HostTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
