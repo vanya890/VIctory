@@ -190,11 +190,135 @@ impl Pool {
     }
 }
 
+/// One registered monitor callback and its live invocations.
+struct Monitor {
+    token: u64,
+    context: usize,
+    callback: usize,
+    /// Unregistered: no new invocation may start; the entry stays until
+    /// every in-flight invocation returns so `XTaskQueueUnregisterMonitor`
+    /// can wait for them.
+    removed: bool,
+    /// Threads currently executing this monitor callback (one entry per
+    /// active frame, supporting recursive delivery on the same thread).
+    running: Vec<std::thread::ThreadId>,
+}
+
+#[derive(Default)]
+struct Monitors {
+    entries: Mutex<Vec<Monitor>>,
+    done: Condvar,
+}
+
+impl Monitors {
+    fn register(&self, token: u64, context: usize, callback: usize) {
+        lock(&self.entries).push(Monitor {
+            token,
+            context,
+            callback,
+            removed: false,
+            running: Vec::new(),
+        });
+    }
+
+    fn notify(&self, queue: *const Queue, port: u32) {
+        // Snapshot currently registered tokens so monitors added mid-callback
+        // are not invoked for an earlier submission, while re-checking each
+        // entry right before calling it so a monitor unregistered meanwhile
+        // never starts.
+        let tokens: Vec<u64> = {
+            let entries = lock(&self.entries);
+            if entries.is_empty() {
+                return;
+            }
+            entries
+                .iter()
+                .filter(|m| !m.removed)
+                .map(|m| m.token)
+                .collect()
+        };
+        let me = std::thread::current().id();
+        for token in tokens {
+            let invocation = {
+                let mut entries = lock(&self.entries);
+                entries
+                    .iter_mut()
+                    .find(|m| m.token == token && !m.removed)
+                    .map(|m| {
+                        m.running.push(me);
+                        (m.context, m.callback)
+                    })
+            };
+            let Some((context, callback)) = invocation else {
+                continue;
+            };
+            struct Active<'a> {
+                monitors: &'a Monitors,
+                token: u64,
+                thread: std::thread::ThreadId,
+            }
+            impl Drop for Active<'_> {
+                fn drop(&mut self) {
+                    let mut entries = lock(&self.monitors.entries);
+                    if let Some(pos) = entries.iter().position(|m| m.token == self.token) {
+                        let entry = &mut entries[pos];
+                        if let Some(i) = entry.running.iter().position(|&t| t == self.thread) {
+                            entry.running.swap_remove(i);
+                        }
+                        if entry.removed && entry.running.is_empty() {
+                            entries.remove(pos);
+                            self.monitors.done.notify_all();
+                        }
+                    }
+                }
+            }
+            let _active = Active {
+                monitors: self,
+                token,
+                thread: me,
+            };
+            // SAFETY: stored from a `MonitorCallback` in `XTaskQueueRegisterMonitor`.
+            let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
+            callback(context as *mut c_void, queue, port);
+        }
+    }
+
+    fn unregister(&self, token: u64) {
+        let me = std::thread::current().id();
+        let mut entries = lock(&self.entries);
+        let Some(pos) = entries.iter().position(|m| m.token == token) else {
+            return;
+        };
+        entries[pos].removed = true;
+        if entries[pos].running.is_empty() {
+            entries.remove(pos);
+            return;
+        }
+        // A thread already inside this monitor callback cannot wait for itself
+        // (or another thread simultaneously self-unregistering) without
+        // deadlocking; external callers wait until every active invocation
+        // returns and removes the entry.
+        // A callback cannot wait for itself, or two concurrent callbacks
+        // self-unregistering together could deadlock. In this reentrant case
+        // unregister only prevents future starts; other invocations may still
+        // be running when it returns. The caller must keep the shared context
+        // alive until those already-entered callbacks have returned.
+        if entries[pos].running.contains(&me) {
+            return;
+        }
+        drop(
+            self.done
+                .wait_while(entries, |entries| entries.iter().any(|m| m.token == token))
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+    }
+}
+
 /// A queue handle is `Arc::into_raw` of this; duplicating and closing a
 /// handle add and drop a reference.
 pub struct Queue {
     ports: [Arc<Port>; 2],
-    monitors: Mutex<Vec<(u64, usize, usize)>>,
+    monitors: Monitors,
     terminated: AtomicBool,
     /// Delayed callbacks still waiting out their delay, in submission
     /// order: terminating the queue cancels them with the queued ones.
@@ -205,7 +329,7 @@ impl Queue {
     fn new(ports: [Arc<Port>; 2]) -> Arc<Queue> {
         Arc::new(Queue {
             ports,
-            monitors: Mutex::default(),
+            monitors: Monitors::default(),
             terminated: AtomicBool::new(false),
             delayed: Mutex::default(),
         })
@@ -247,13 +371,7 @@ impl Queue {
 
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
         self.ports[port as usize].submit(task);
-        // Copied out: a monitor may unregister itself.
-        let monitors = lock(&self.monitors).clone();
-        for (_, context, callback) in monitors {
-            // SAFETY: stored from a `MonitorCallback` in `register_monitor`.
-            let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
-            callback(context as *mut c_void, Arc::as_ptr(self), port);
-        }
+        self.monitors.notify(Arc::as_ptr(self), port);
     }
 }
 
@@ -435,15 +553,16 @@ pub fn XTaskQueueRegisterMonitor(
         return E_INVALIDARG;
     }
     let id = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-    lock(&queue.monitors).push((id, context as usize, callback as usize));
+    // Publish the token before the monitor can be observed by another thread.
     // SAFETY: checked non-null.
     unsafe { token.write(id) };
+    queue.monitors.register(id, context as usize, callback as usize);
     S_OK
 }
 
 pub fn XTaskQueueUnregisterMonitor(handle: *const Queue, token: u64) {
     if let Some(queue) = queue(handle) {
-        lock(&queue.monitors).retain(|m| m.0 != token);
+        queue.monitors.unregister(token);
     }
 }
 
@@ -1702,4 +1821,17 @@ mod tests {
         assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
         *CLEANED.lock().unwrap() = None;
     }
-}
+
+
+    /// `XTaskQueueUnregisterMonitor` must wait for any in-flight invocation of
+    /// that monitor to return before returning itself, so the title can safely
+    /// free the monitor's context immediately afterwards.
+    #[test]
+    fn unregister_monitor_waits_for_in_flight_callbacks() {
+        struct State {
+            entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            proceed: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+            destroyed: AtomicBool,
+            saw_destroyed: AtomicBool,
+            calls: AtomicU32,
+        }
