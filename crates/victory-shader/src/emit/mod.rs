@@ -410,11 +410,18 @@ impl Default for WaveMode {
     }
 }
 
+fn parse_wave_wide(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 impl WaveMode {
     pub fn new(min_lanes: u32, max_lanes: u32) -> Self {
-        let wide64 = std::env::var("VICTORY_WAVE_WIDE")
-            .ok()
-            .is_some_and(|v| !v.trim().is_empty() && v.trim() != "0");
+        let wide64 = parse_wave_wide(std::env::var("VICTORY_WAVE_WIDE").ok().as_deref());
         let group_sync = match std::env::var("VICTORY_GROUP_SYNC")
             .ok()
             .as_deref()
@@ -793,6 +800,17 @@ mod tests {
             },
             wave,
         )
+    }
+
+    #[test]
+    fn wave_wide_switch_requires_an_explicit_truthy_value() {
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(parse_wave_wide(Some(value)), "{value:?}");
+        }
+        for value in ["", "0", "false", "no", "off", "enabled", "2"] {
+            assert!(!parse_wave_wide(Some(value)), "{value:?}");
+        }
+        assert!(!parse_wave_wide(None));
     }
 
     #[test]
