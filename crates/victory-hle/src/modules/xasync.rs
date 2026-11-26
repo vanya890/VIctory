@@ -2468,12 +2468,15 @@ mod tests {
     #[test]
     fn status_publication_is_atomic_with_async_block_reuse() {
         static CLEANUPS: AtomicU32 = AtomicU32::new(0);
+        static CALL_UNDER_TEST: Mutex<Option<Arc<Call>>> = Mutex::new(None);
 
         extern "system" fn first(op: u32, data: *const ProviderData) -> HRESULT {
             match op {
                 OP_BEGIN => {
                     // SAFETY: provider data is valid for this callback.
-                    XAsyncComplete(unsafe { (*data).block }, S_OK, 1);
+                    let block = unsafe { (*data).block };
+                    *CALL_UNDER_TEST.lock().unwrap() = call(block);
+                    XAsyncComplete(block, S_OK, 1);
                 }
                 OP_CLEANUP => {
                     CLEANUPS.fetch_add(1, Ordering::SeqCst);
@@ -2495,6 +2498,7 @@ mod tests {
         }
 
         CLEANUPS.store(0, Ordering::SeqCst);
+        *CALL_UNDER_TEST.lock().unwrap() = None;
         let mut block = AsyncBlock {
             queue: std::ptr::null(),
             context: std::ptr::null_mut(),
@@ -2520,6 +2524,11 @@ mod tests {
         // releases CALLS / publishes done.
         entered.wait();
         assert_eq!(XAsyncGetStatus(address as *mut AsyncBlock, false), S_OK);
+        let old_call = CALL_UNDER_TEST.lock().unwrap().clone().unwrap();
+        assert!(
+            old_call.done.try_lock().is_err(),
+            "the call's done lock must remain held until status publication is complete"
+        );
         assert!(CALLS.try_lock().is_err(), "CALLS must stay locked through publication");
         let (status_word, size_word) = words(&mut block);
         status_word.store(0, Ordering::SeqCst);
