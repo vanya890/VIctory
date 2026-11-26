@@ -752,6 +752,119 @@ mod tests {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
     }
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    fn lower_wave_mode(
+        words: &[u32],
+        wave: WaveMode,
+        wave64: bool,
+        threads: u32,
+    ) -> Result<lower::Lowered, ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads: [threads, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, wave64, 256)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        lower::lower_with(
+            &lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                view_marks: false,
+            },
+            wave,
+        )
+    }
+
+    #[test]
+    fn barrier_modes_preserve_required_fences() {
+        assert_eq!(lower::barrier_mode(false, false), 1 | 8);
+        assert_eq!(lower::barrier_mode(false, true), 8);
+        assert_eq!(lower::barrier_mode(true, false), 1 | 2 | 8);
+        assert_eq!(lower::barrier_mode(true, true), 2 | 8);
+    }
+
+    #[test]
+    fn divergent_barrier_relaxation_uses_minimum_wave_width() {
+        let words = [
+            0x7D84_0480,
+            0xBE84_3C6A,
+            0xBF86_0001,
+            0xBF8A_0000,
+            S_ENDPGM,
+        ];
+        // Even though the adapter advertises max=64, a min=16 adapter
+        // cannot prove a 32-thread group fits in one wave.
+        let narrow_min =
+            lower_wave_mode(&words, WaveMode::with_range(16, 64, false, GroupSync::Auto), false, 32)
+                .unwrap();
+        assert_eq!(narrow_min.barrier_modes, [1 | 8]);
+
+        let min32 =
+            lower_wave_mode(&words, WaveMode::with_range(32, 64, false, GroupSync::Auto), false, 32)
+                .unwrap();
+        assert_eq!(min32.barrier_modes, [8]);
+
+        let strict =
+            lower_wave_mode(&words, WaveMode::with_range(32, 64, false, GroupSync::Strict), false, 32)
+                .unwrap();
+        assert_eq!(strict.barrier_modes, [1 | 8]);
+
+        let wide =
+            lower_wave_mode(&words, WaveMode::with_range(32, 64, true, GroupSync::Auto), false, 32)
+                .unwrap();
+        assert_eq!(wide.barrier_modes, [1 | 8]);
+    }
+
+    #[test]
+    fn wave64_is_gated_by_maximum_host_width_unless_explicitly_enabled() {
+        assert!(matches!(
+            lower_wave_mode(
+                &[S_ENDPGM],
+                WaveMode::with_range(32, 32, false, GroupSync::Auto),
+                true,
+                32,
+            ),
+            Err(ShaderError::Unsupported { .. })
+        ));
+        assert!(
+            lower_wave_mode(
+                &[S_ENDPGM],
+                WaveMode::with_range(32, 64, false, GroupSync::Auto),
+                true,
+                32,
+            )
+            .is_ok()
+        );
+        assert!(
+            lower_wave_mode(
+                &[S_ENDPGM],
+                WaveMode::with_range(32, 32, true, GroupSync::Auto),
+                true,
+                32,
+            )
+            .is_ok()
+        );
+    }
     use super::container::SigElement;
     use super::shader::Shader;
     use super::*;
