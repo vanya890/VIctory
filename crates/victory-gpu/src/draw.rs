@@ -1984,12 +1984,14 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
             if let Some(a) = crate::resource::alias_source(*resource as This) {
                 crate::texture::alias_copy(list, &a, *resource as This);
             }
-            if let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(&t)
-            {
-                crate::texture::upload(list, *resource as This, &t);
+            // Pin one host copy for both upload and state transition:
+            // eviction cannot make the two operations target different textures.
+            if let Some(copy) = crate::resource::host_copy(*resource as This) {
+                if copy.title_written() {
+                    crate::texture::upload_copy(list, *resource as This, &copy);
+                }
+                crate::list::ensure_copy_state(list, &copy, SHADER_RESOURCE);
             }
-            crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
