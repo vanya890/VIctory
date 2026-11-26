@@ -35,3 +35,5 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      - name: Tests, all features
+        run: cargo test --workspace --all-features --locked
