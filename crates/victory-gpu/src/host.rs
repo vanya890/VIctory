@@ -1740,10 +1740,10 @@ impl Host {
         // Drop bitmap-held pages not already covered by a declared withheld
         // range; otherwise the same physical page would be retaken twice.
         for (_copy, page) in held_pages {
-            if !withheld
-                .iter()
-                .any(|(_, address, len)| page_overlaps_range(page, *address, *len))
-            {
+            if held_page_needs_drop(
+                page,
+                withheld.iter().map(|(_, address, len)| (*address, *len)),
+            ) {
                 crate::memory::drop_withheld(page, crate::watch::PAGE);
             }
         }
@@ -4842,6 +4842,15 @@ fn page_overlaps_range(page: usize, address: usize, len: usize) -> bool {
         && page < address.saturating_add(len)
 }
 
+fn held_page_needs_drop(
+    page: usize,
+    withheld_ranges: impl IntoIterator<Item = (usize, usize)>,
+) -> bool {
+    !withheld_ranges
+        .into_iter()
+        .any(|(address, len)| page_overlaps_range(page, address, len))
+}
+
 #[cfg(test)]
 mod withholding {
     fn host_or_skip() -> Option<&'static super::Host> {
@@ -4977,11 +4986,20 @@ mod withholding {
     fn held_page_drop_is_deduplicated_against_withheld_ranges() {
         use crate::watch::PAGE;
         let page = PAGE * 4;
-        assert!(super::page_overlaps_range(page, page, PAGE));
-        assert!(super::page_overlaps_range(page, page + PAGE - 1, 1));
-        assert!(!super::page_overlaps_range(page, page + PAGE, PAGE));
-        assert!(!super::page_overlaps_range(page, page - PAGE, PAGE));
-        assert!(!super::page_overlaps_range(page, page, 0));
+        assert!(!super::held_page_needs_drop(page, [(page, PAGE)]));
+        assert!(!super::held_page_needs_drop(
+            page,
+            [(page + PAGE - 1, 1)]
+        ));
+        assert!(super::held_page_needs_drop(
+            page,
+            [(page + PAGE, PAGE)]
+        ));
+        assert!(super::held_page_needs_drop(
+            page,
+            [(page - PAGE, PAGE)]
+        ));
+        assert!(super::held_page_needs_drop(page, []));
     }
 
     /// A withheld page is retaken only after an overlapping ordinary
