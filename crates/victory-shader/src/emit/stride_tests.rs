@@ -841,7 +841,7 @@ fn code_table_stride_program() -> Vec<u32> {
     w.extend(s_buffer_load(8, 33, 12, 0xc)); // B@0xc: data
     // C: unaligned soffset 0xe + immediate 2 truncates to 0xc; immediate 6 to 0x10.
     w.extend([0xF400_0000 | 8 << 18 | 34 << 6 | 8, 40 << 25 | 2]);
-    w.extend([0xF400_0000 | 8 << 18 | 35 << 6 | 8, 40 << 25 | 6]);
+    w.extend(s_buffer_load(8, 35, 16, 0xc)); // C: dynamic extra only
     w.extend(s_buffer_load(10, 36, 20, 0xc)); // D dwordx4: data, data, zero, zero
     w.push(0xBE8A_0302); // s_mov_b32 s10, s2 — reuse s10, the UAV table
     w.push(0xBE8B_0380); // s_mov_b32 s11, 0
@@ -912,7 +912,7 @@ fn scalar_buffer_loads_of_a_code_table_keep_num_records_with_stride_and_soffset(
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        for (dynamic_extra, c_value) in [(0u32, 0xC0DE_0003u32), (4, 0)] {
+        for (dynamic_extra, c_value) in [(0u32, 0xC0DE_0003u32), (4, 0), (0xffff_fff8, 0)] {
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
                 ud[u.index as usize] = match (u.root, u.slot) {
@@ -941,13 +941,13 @@ fn scalar_buffer_loads_of_a_code_table_keep_num_records_with_stride_and_soffset(
                     0,
                     0xC0DE_0003,
                     c_value,
-                    0,
+                    c_value,
                     0xC0DE_0003,
                     0xC0DE_0004,
                     0,
                     0
                 ],
-                "{label}: dynamic extra {dynamic_extra}, stride 4/1, unaligned soffset 0xe + imm 2/6, wide load"
+                "{label}: dynamic extra {dynamic_extra}, stride 4/1, unaligned soffset 0xe + imm 2, dynamic extra-only, overflow, wide load"
             );
         }
         ran += 1;
