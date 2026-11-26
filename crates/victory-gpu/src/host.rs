@@ -2796,7 +2796,7 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 /// Whether a color resource format is typeless and therefore needs the
 /// actual typed view format supplied by the title.
-fn is_typeless_color_format(format: DXGI_FORMAT) -> bool {
+pub(crate) fn is_typeless_color_format(format: DXGI_FORMAT) -> bool {
     matches!(format.0, 1 | 5 | 9 | 15 | 23 | 27 | 33 | 39 | 48 | 53 | 60 | 90 | 92)
 }
 
