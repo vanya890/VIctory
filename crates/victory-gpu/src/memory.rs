@@ -1008,8 +1008,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     fn lists_share_a_table_and_copies_keep_their_views() {
         let _guard = gpu_test_lock();
         use crate::watch::PAGE;
-        let warp_requested =
-            std::env::var("VICTORY_D3D12_WARP").is_ok_and(|value| value != "0");
+        let warp_requested = crate::switch::on("VICTORY_D3D12_WARP");
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             assert!(
                 !warp_requested,
