@@ -100,7 +100,26 @@ pub(crate) struct State {
     fixed: Fixed,
 }
 
-/// Identity key for the host copies whose target states were last ensured.
+/// Whether the pinned host copies still match the last target-state ensure.
+/// This checks the existing vectors in place: a cache hit must not allocate.
+fn target_ensure_matches<T>(
+    ensured: &Option<(Vec<usize>, usize, u64)>,
+    targets: &[std::sync::Arc<T>],
+    depth: Option<&std::sync::Arc<T>>,
+    generation: u64,
+) -> bool {
+    let Some((old_targets, old_depth, old_generation)) = ensured else {
+        return false;
+    };
+    *old_generation == generation
+        && *old_depth == depth.map_or(0, |copy| std::sync::Arc::as_ptr(copy) as usize)
+        && old_targets.len() == targets.len()
+        && old_targets.iter().zip(targets).all(|(old, copy)| {
+            *old == std::sync::Arc::as_ptr(copy) as usize
+        })
+}
+
+/// The identity key retained after a target-state ensure.
 fn target_ensure_key<T>(
     targets: &[std::sync::Arc<T>],
     depth: Option<&std::sync::Arc<T>>,
@@ -674,12 +693,12 @@ impl State {
         }
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
-        let key = target_ensure_key(
+        if !target_ensure_matches(
+            &self.ensured,
             &self.target_copies,
             self.depth_copy.as_ref(),
             list.states_generation(),
-        );
-        if self.ensured.as_ref() != Some(&key) {
+        ) {
             for copy in &self.target_copies {
                 crate::list::ensure_copy_state(list, copy, RENDER_TARGET);
             }
@@ -4785,10 +4804,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         let first = std::sync::Arc::new(());
         let replacement = std::sync::Arc::new(());
         let targets = [first.clone()];
-        let key = target_ensure_key(&targets, None, 7);
-        assert_eq!(key, target_ensure_key(&targets, None, 7));
-        assert_ne!(key, target_ensure_key(&[replacement], None, 7));
-        assert_ne!(key, target_ensure_key(&targets, None, 8));
+        let key = Some(target_ensure_key(&targets, None, 7));
+        assert!(target_ensure_matches(&key, &targets, None, 7));
+        assert!(!target_ensure_matches(&key, &[replacement], None, 7));
+        assert!(!target_ensure_matches(&key, &targets, None, 8));
     }
 
     /// A draw read must use the same pinned host copy for upload and state.
