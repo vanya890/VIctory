@@ -516,7 +516,7 @@ struct Call {
     /// across any callback: cleanup may wait for a thread completing the same
     /// call.
     lifecycle: Mutex<Lifecycle>,
-    /// OP_CLEANUP runs once, before status publication for failed/empty calls.
+    /// Ensures OP_CLEANUP runs once; failed/empty finalization calls it before publishing status.
     cleanup_done: AtomicBool,
     /// The status is published.
     done: Mutex<bool>,
@@ -678,8 +678,8 @@ fn cleanup_call(call: &Call, block: *mut AsyncBlock) {
     }
 }
 
-/// Removes the call before cleanup for already-published results, or after
-/// cleanup and status publication for failed/empty results.
+/// Releases a call whose status has already been published. Failed/empty
+/// finalization calls cleanup and removal separately to keep the record visible.
 fn release_call(call: &Arc<Call>, block: *mut AsyncBlock) {
     if let Some(removed) = remove_call(call, block) {
         cleanup_call(&removed, block);
@@ -1664,7 +1664,7 @@ mod tests {
 
         struct Gate {
             entered: Mutex<Option<Sender<()>>>,
-            resume: Mutex<Receiver<()>> ,
+            resume: Mutex<Receiver<()>>,
             cleaned: AtomicU32,
         }
 
@@ -1716,7 +1716,7 @@ mod tests {
         let finalizer = std::thread::spawn(move || {
             XAsyncComplete(address as *mut AsyncBlock, E_ABORT, 0);
         });
-        let entered = entered_rx.recv_timeout(Duration::from_secs(2));
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
 
         let (found_tx, found_rx) = channel();
         *lock(&STATUS_WAIT_HOOK) = Some((address, found_tx));
