@@ -281,6 +281,7 @@ pub(crate) fn family(format: u32) -> u32 {
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
+#[cfg(windows)]
 /// The typed RTV format to use when presenting a title texture. The most
 /// recently bound RTV view takes precedence; for a typeless host copy without
 /// a recorded view, fall back to the title resource's own format.
