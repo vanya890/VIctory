@@ -340,6 +340,16 @@ fn write_full_save(
     write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes())
 }
 
+fn restore_full_save_dirty(
+    added: &mut u64,
+    prebuilt_changed: &mut bool,
+    saved_added: u64,
+    saved_prebuilt_changed: bool,
+) {
+    *added = added.saturating_add(saved_added);
+    *prebuilt_changed |= saved_prebuilt_changed;
+}
+
 /// Writes the library and/or the early list if pipelines were added or first
 /// used since the last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
@@ -366,13 +376,18 @@ pub(crate) fn save(now: bool) {
                     // SAFETY: a buffer of the size the library asks for.
                     match unsafe { l.library.Serialize(&mut bytes) } {
                         Ok(()) => {
-                            l.added = 0;
-                            l.prebuilt_changed = false;
+                            // Retain the dirty state until the corresponding files
+                            // are durable. New pipelines/prebuilt keys may arrive
+                            // while the snapshot is written, so restore only this
+                            // snapshot's counts if disk persistence fails.
+                            let saved_added = std::mem::take(&mut l.added);
+                            let saved_prebuilt_changed =
+                                std::mem::replace(&mut l.prebuilt_changed, false);
                             // Kept beside the bytes it holds for (also when a run adds
                             // pipelines).
                             let prebuilt =
                                 (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                            (used_changed, Some((bytes, prebuilt)))
+                            (used_changed, Some((bytes, prebuilt, saved_added, saved_prebuilt_changed)))
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "host pipeline library not serialised");
@@ -391,7 +406,7 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used = used().as_ref().map(Used::list).unwrap_or_default();
-    let Some((blob, prebuilt)) = library_data else {
+    let Some((blob, prebuilt, saved_added, saved_prebuilt_changed)) = library_data else {
         if need_early {
             match write_early_list(dir, &used) {
                 Ok(()) => tracing::info!(early = used.len(), "early pipeline list saved"),
@@ -420,6 +435,17 @@ pub(crate) fn save(now: bool) {
             "host pipeline library saved"
         ),
         Err(e) => {
+            // The serialized snapshot did not become a complete on-disk cache.
+            // Re-arm its dirty state without discarding changes made by workers
+            // while the files were being written.
+            let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
+            restore_full_save_dirty(
+                &mut l.added,
+                &mut l.prebuilt_changed,
+                saved_added,
+                saved_prebuilt_changed,
+            );
+            drop(l);
             if need_early {
                 USED_CHANGED.store(true, Ordering::Relaxed);
             }
@@ -873,6 +899,24 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());
+    }
+
+    #[test]
+    fn failed_full_save_restores_only_its_dirty_snapshot() {
+        // A worker can add more pipelines while the serialized snapshot is
+        // being written. Retrying must preserve both the old and new work.
+        let mut added = 3;
+        let mut prebuilt_changed = true;
+        restore_full_save_dirty(&mut added, &mut prebuilt_changed, 5, true);
+        assert_eq!(added, 8);
+        assert!(prebuilt_changed);
+
+        // A snapshot without a prebuilt change must not clear a concurrent one.
+        let mut added = 2;
+        let mut prebuilt_changed = false;
+        restore_full_save_dirty(&mut added, &mut prebuilt_changed, 7, false);
+        assert_eq!(added, 9);
+        assert!(!prebuilt_changed);
     }
 
     #[test]
