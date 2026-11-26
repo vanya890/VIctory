@@ -422,25 +422,36 @@ extern "system" fn allocator_reset(_: This) -> HRESULT {
     S_OK
 }
 
+#[cfg(windows)]
+impl Drop for List {
+    fn drop(&mut self) {
+        // A queue may still hold some of its host lists; they are its own,
+        // and the last of them takes what the list owned. Doing the handoff
+        // in Drop ensures it runs once on the atomic final release rather
+        // than racing concurrent Release calls.
+        let held = self
+            .hosts
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rfind(|h| std::sync::Arc::strong_count(h) > 1)
+            .cloned();
+        if held.is_some() {
+            EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(
+                "a list released while a queue still holds part of it: that part runs on its own"
+            );
+            let uploads = std::mem::take(self.uploads.get_mut().unwrap_or_else(|e| e.into_inner()));
+            let state = std::mem::take(self.state.get_mut().unwrap_or_else(|e| e.into_inner()));
+            leave(held, uploads, state);
+        }
+    }
+}
+
 extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
 extern "system" fn list_release(this: This) -> u32 {
-    // A queue may still hold some of its host lists; they are its own, and
-    // the last of them takes what the list owned.
-    #[cfg(windows)]
-    if !this.is_null() && object::refs(this) == 1 {
-        // SAFETY: the title passes one of our lists.
-        let list = unsafe { &*this.cast::<List>() };
-        let held = list.hosts.lock().unwrap_or_else(|e| e.into_inner()).iter().rfind(|h| std::sync::Arc::strong_count(h) > 1).cloned();
-        if held.is_some() {
-            EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!("a list released while a queue still holds part of it: that part runs on its own");
-            let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-            let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
-            leave(held, uploads, state);
-        }
-    }
     object::release_boxed::<List>(this)
 }
 extern "system" fn list_type(this: This) -> u32 {
@@ -2553,5 +2564,165 @@ mod tests {
             texture_subresource_count(3, 2, u32::from(info.PlaneCount)),
             12
         );
+    }
+
+
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_list_release_while_held_keeps_upload_memory_alive() {
+        use std::sync::{Arc, Barrier};
+
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let add_ref = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x08)(o);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        for round in 0..128 {
+            let mut list = null;
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            let upload = allocate_upload(list, 64, 16);
+            assert!(!upload.is_null());
+            // SAFETY: 64 bytes of newly allocated upload memory.
+            unsafe { upload.write_bytes(0x5a, 64) };
+            assert_eq!(close(list), S_OK);
+            // Simulate a queue holding this list's host segment (`strong_count == 2`).
+            let held = segments(list);
+            assert_eq!(held.len(), 1);
+            assert_eq!(add_ref(list), 2);
+
+            let list_addr = list as usize;
+            let barrier = Arc::new(Barrier::new(2));
+            let b2 = Arc::clone(&barrier);
+            let other = std::thread::spawn(move || {
+                let l = list_addr as This;
+                b2.wait();
+                slot::<extern "system" fn(This) -> u32>(l, 0x10)(l)
+            });
+            barrier.wait();
+            let r1 = release(list);
+            let r2 = other.join().expect("second releaser finished");
+            assert!(
+                (r1 == 0 && r2 == 1) || (r1 == 1 && r2 == 0),
+                "round {round}: expected one final release, got ({r1}, {r2})"
+            );
+
+            assert!(
+                !held[0].is_empty(),
+                "round {round}: held host list must own the released list's deferred cleanup"
+            );
+            assert!(
+                crate::texture::committed(upload, 64),
+                "round {round}: upload memory was freed while a queue still held the host list"
+            );
+            // SAFETY: checked committed above; the held host list owns it.
+            let sample = unsafe { std::slice::from_raw_parts(upload, 64) };
+            assert!(sample.iter().all(|&b| b == 0x5a));
+
+            held[0].reset();
+            assert!(
+                held[0].is_empty(),
+                "round {round}: resetting the finished host list must drop the handed-off state"
+            );
+            drop(held);
+        }
+
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_list_release_while_queued_preserves_upload_until_execution() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let queue_desc = [2u32, 0, 0, 0];
+        let mut queue = null;
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let add_ref = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x08)(o);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let execute = slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50);
+
+        for round in 0..32u64 {
+            let mut list = null;
+            assert_eq!(
+                create_list(null, 0, 2, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            let upload = allocate_upload(list, 64, 16);
+            assert!(!upload.is_null());
+            let payload: [u64; 8] =
+                std::array::from_fn(|i| 0x5245_4c53_0000_0000u64 ^ (round << 16) ^ (i as u64 + 1));
+            // SAFETY: 64 bytes of newly allocated 16-byte-aligned upload memory.
+            unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr().cast::<u8>(), upload, 64) };
+
+            let dst = crate::resource::test_buffer(64);
+            let (dst_ptr, _) = crate::resource::buffer_bytes(dst).expect("test buffer bytes");
+            // SAFETY: 64 bytes of test buffer memory.
+            unsafe { dst_ptr.write_bytes(0, 64) };
+
+            let wait_word = Box::new(AtomicU64::new(0));
+            const EQUAL: u32 = 3;
+            wait64(list, std::ptr::from_ref(&*wait_word) as u64, EQUAL, 1, 0);
+            copy_memory(list, dst_ptr as u64, upload as u64, 64, 0);
+            assert_eq!(close(list), S_OK);
+            execute(queue, 1, &list);
+
+            assert_eq!(add_ref(list), 2);
+            let list_addr = list as usize;
+            let barrier = Arc::new(Barrier::new(2));
+            let b2 = Arc::clone(&barrier);
+            let other = std::thread::spawn(move || {
+                let l = list_addr as This;
+                b2.wait();
+                slot::<extern "system" fn(This) -> u32>(l, 0x10)(l)
+            });
+            barrier.wait();
+            let r1 = release(list);
+            let r2 = other.join().expect("second releaser finished");
+            assert!((r1 == 0 && r2 == 1) || (r1 == 1 && r2 == 0));
+
+            wait_word.store(1, Ordering::Release);
+            crate::queue::pump_held(crate::queue::Why::Submission);
+
+            let mut got = [0u64; 8];
+            // SAFETY: 64 bytes of destination buffer after the held segment ran.
+            unsafe { std::ptr::copy_nonoverlapping(dst_ptr, got.as_mut_ptr().cast::<u8>(), 64) };
+            assert_eq!(
+                got, payload,
+                "round {round}: queued copy missed upload bytes after concurrent list release"
+            );
+            assert_eq!(release(dst), 0);
+        }
+
+        assert_eq!(release(allocator), 0);
+        assert_eq!(release(queue), 0);
     }
 }
