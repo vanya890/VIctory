@@ -717,10 +717,18 @@ pub(crate) mod tests {
 
     use super::*;
 
+    fn prelude_test_host() -> Option<&'static Host> {
+        let host = host();
+        if crate::switch::on("VICTORY_D3D12_WARP") {
+            assert!(host.is_some(), "WARP validation requested but no D3D12 WARP host was created");
+        }
+        host
+    }
+
     /// Lists without transitions keep their prelude pool empty.
     #[test]
     fn lists_without_state_changes_do_not_create_a_prelude() {
-        let Some(host) = host() else { return };
+        let Some(host) = prelude_test_host() else { return };
         let list = host.new_list().expect("ordinary host list");
         assert!(list.preludes.lock().unwrap_or_else(|e| e.into_inner()).free.is_empty());
         assert!(list.prelude().is_none(), "no state changes need no prelude");
@@ -732,7 +740,7 @@ pub(crate) mod tests {
     /// each use: resetting the first pair before it runs would lose its moves.
     #[test]
     fn a_second_use_gets_its_own_prelude() {
-        let Some(host) = host() else { return };
+        let Some(host) = prelude_test_host() else { return };
         let list = host.new_list().unwrap();
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
