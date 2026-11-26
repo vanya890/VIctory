@@ -693,25 +693,46 @@ impl HostHeap {
     /// would, with one lock of each kind for them all instead of two per slot
     /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
     pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
+        /// Slots looked at in one pass. A world frame syncs hundreds of
+        /// thousands of them, and holding their records in vectors costs more
+        /// than reading them (`run perf3`: one Vec of them all, ~75 ms).
+        const PASS: u32 = 512;
         let at = |i: u32| start + u64::from(i) * step;
-        // SAFETY: records in title heap memory the caller found mapped.
-        let records: Vec<[u32; 3]> =
-            (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
-        let current = views_current(&records);
-        let stale: Vec<u32> = {
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            (first..last)
-                .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
-                    Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
-                    Some(&m) => m != 0,
-                    None => true,
-                })
-                .map(|(i, _)| i)
-                .collect()
-        };
-        for i in stale {
-            self.mirror(i, at(i), false);
+        let mut records = [[0u32; 3]; PASS as usize];
+        let mut current = [false; PASS as usize];
+        let mut stale = [0u32; PASS as usize];
+        let mut from = first;
+        while from < last {
+            let to = (from + PASS).min(last);
+            let n = (to - from) as usize;
+            let records = &mut records[..n];
+            for (i, record) in (from..to).zip(records.iter_mut()) {
+                // SAFETY: records in title heap memory the caller found mapped.
+                *record = unsafe { (at(i) as *const [u32; 3]).read_unaligned() };
+            }
+            let current = &mut current[..n];
+            views_current(records, current);
+            let mut differing = 0;
+            {
+                let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                for ((i, &[_, view, generation]), &current) in
+                    (from..to).zip(records.iter()).zip(current.iter())
+                {
+                    let differs = match made.get(i as usize) {
+                        Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
+                        Some(&m) => m != 0,
+                        None => true,
+                    };
+                    if differs {
+                        stale[differing] = i;
+                        differing += 1;
+                    }
+                }
+            }
+            for &i in &stale[..differing] {
+                self.mirror(i, at(i), false);
+            }
+            from = to;
         }
     }
 

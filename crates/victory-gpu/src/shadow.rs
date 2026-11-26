@@ -75,8 +75,11 @@ pub(crate) struct Shadow {
     /// the runtime's, copied whole each time).
     tracked: Option<crate::watch::Tracked>,
     /// Ranges shaders of a submission not yet copied back may be writing:
-    /// title memory there is older than the copy.
+    /// title memory there is older than the copy, and how many there are,
+    /// read without the lock (a world submission refreshes thousands of
+    /// ranges, and most find none).
     pending: Mutex<std::collections::HashSet<(usize, usize)>>,
+    pending_len: std::sync::atomic::AtomicUsize,
     /// The copy's bytes before the submission ran where its shaders write:
     /// what the GPU wrote differs. Disjoint segments (offset, bytes) in
     /// order, and the 64 KiB pieces (by title address) already compared.
@@ -260,6 +263,7 @@ impl Shadow {
             len,
             tracked,
             pending: Mutex::default(),
+            pending_len: std::sync::atomic::AtomicUsize::new(0),
             before: Mutex::default(),
             marks,
             base: slice.map_or(0, |s| s.offset),
@@ -324,10 +328,18 @@ impl Shadow {
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
     pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((address, address + len));
+        // The counter is the fast path's hint for "nothing pending": it has
+        // to move *inside* the lock that `pending` moves under, or a reader
+        // (another thread's copy-back) sees 0 while a range is already in the
+        // set and takes the snapshot path without it - a range that then has
+        // no snapshot, and a count that drifts below the set's size.
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if pending.insert((address, address + len)) {
+                self.pending_len
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+        }
         if marked && let Some(t) = &self.tracked {
             t.arm(address, address + len);
             return;
@@ -464,7 +476,10 @@ impl Shadow {
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.remove(&(address, address + len));
+        if pending.remove(&(address, address + len)) {
+            self.pending_len
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
         if pending.is_empty() {
             compared.clear();
             for (_, bytes) in segments.drain(..) {
@@ -567,14 +582,23 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        // Most ranges refreshed in a submission have none: ask the count
+        // first, not the lock.
+        let mut busy: Vec<(usize, usize)> = if self
+            .pending_len
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            Vec::new()
+        } else {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect()
+        };
         if self.tracked.is_some() {
             return self.update_tracked(from, to, !busy.is_empty());
         }

@@ -809,7 +809,18 @@ impl State {
             // their addresses go into the page table.
             let mut roots = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // A shader's user data is a handful of dwords, and this runs
+                // for every stage of every draw: on the stack, unless a
+                // title ever asks for more.
+                const INLINE: usize = 64;
+                let mut inline = [0u32; INLINE];
+                let mut longer = Vec::new();
+                let values: &mut [u32] = if dwords as usize <= INLINE {
+                    &mut inline[..dwords as usize]
+                } else {
+                    longer.resize(dwords as usize, 0);
+                    &mut longer
+                };
                 for u in &t.host.user_data {
                     if u.root == RootType::Descriptor
                         && u.dword == 0
