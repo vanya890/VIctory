@@ -1400,6 +1400,7 @@ pub(crate) mod tests {
         drop(write);
         // SAFETY: the bytes just read.
         assert_eq!(
+            // SAFETY: the successful read just initialized these 13 bytes in the live view.
             unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) },
             b"from the disk"
         );
