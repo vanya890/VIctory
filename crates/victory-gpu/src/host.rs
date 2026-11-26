@@ -68,11 +68,11 @@ mod submission_completion_tests {
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
 
     use windows::Win32::Foundation::{
-        ERROR_INVALID_HANDLE, HANDLE, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        E_FAIL, ERROR_INVALID_HANDLE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
     use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-    use windows::core::{E_FAIL, Error, HRESULT};
+    use windows::core::{Error, HRESULT};
 
     use super::confirm_submission_completion;
 
