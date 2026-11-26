@@ -401,11 +401,14 @@ pub struct WaveMode {
 
 impl Default for WaveMode {
     fn default() -> Self {
+        // Public translation wrappers have no adapter capabilities. Do not
+        // claim a minimum wave width or relax group barriers without proof;
+        // keep the legacy Wave64 capability ceiling for native translation.
         Self {
-            min_lanes: 64,
+            min_lanes: 0,
             max_lanes: 64,
             wide64: false,
-            group_sync: GroupSync::Auto,
+            group_sync: GroupSync::Strict,
         }
     }
 }
@@ -878,6 +881,79 @@ mod tests {
         )
         .unwrap();
         assert!(!lowered.wave_ops);
+        assert_eq!(lowered.wave_size, None);
+    }
+
+    #[test]
+    fn wave64_lds_only_group_fitting_host_wave32_does_not_require_wave64() {
+        let words = [
+            0x7D84_0480,
+            0xBE84_3C6A,
+            0xBF86_0001,
+            0xBF8A_0000,
+            S_ENDPGM,
+        ];
+        let lowered = lower_wave_mode(
+            &words,
+            WaveMode::with_range(32, 32, false, GroupSync::Auto),
+            true,
+            32,
+        )
+        .unwrap();
+        assert_eq!(lowered.wave_size, None);
+        assert_eq!(lowered.barrier_modes, [8]);
+    }
+
+    #[test]
+    fn wave64_lds_only_group_spanning_host_wave32_requires_wave64() {
+        let words = [
+            0x7D84_0480,
+            0xBE84_3C6A,
+            0xBF86_0001,
+            0xBF8A_0000,
+            S_ENDPGM,
+        ];
+        assert!(matches!(
+            lower_wave_mode(
+                &words,
+                WaveMode::with_range(32, 32, false, GroupSync::Auto),
+                true,
+                64,
+            ),
+            Err(ShaderError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn non_waterfall_readfirstlane_requires_native_wave64() {
+        // This readfirstlane result is not consumed by descriptor waterfall
+        // lowering, so it observes the console's native lane mapping.
+        let words = [0x7E00_0503, S_ENDPGM];
+        assert!(matches!(
+            lower_wave_mode_with_rsrc2(
+                &words,
+                WaveMode::with_range(32, 32, false, GroupSync::Auto),
+                true,
+                32,
+                0,
+            ),
+            Err(ShaderError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn default_wave_mode_does_not_relax_barriers_without_host_capabilities() {
+        let words = [
+            0x7D84_0480,
+            0xBE84_3C6A,
+            0xBF86_0001,
+            0xBF8A_0000,
+            S_ENDPGM,
+        ];
+        let lowered = lower_wave_mode(&words, WaveMode::default(), false, 64).unwrap();
+        assert_eq!(WaveMode::default().min_lanes, 0);
+        assert_eq!(WaveMode::default().group_sync, GroupSync::Strict);
+        assert_eq!(lowered.barrier_modes, [1 | 8]);
     }
 
     #[test]
