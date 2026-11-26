@@ -4812,6 +4812,27 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 
     #[test]
+    fn a_cut_to_a_fresh_list_forgets_ensured_targets() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let first = host.new_list().unwrap();
+        let second = host.new_list().unwrap();
+        assert_eq!(
+            first.states_generation(),
+            second.states_generation(),
+            "two fresh lists may read the same generation"
+        );
+        let mut state = State::default();
+        state.ensured = Some((vec![1], 0, first.states_generation()));
+        state.cut(&second);
+        assert!(
+            state.ensured.is_none(),
+            "the memo names the old list's state map"
+        );
+    }
+
+    #[test]
     fn target_ensure_key_tracks_host_copy_identity_and_generation() {
         let first = std::sync::Arc::new(());
         let replacement = std::sync::Arc::new(());
