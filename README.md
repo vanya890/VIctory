@@ -35,7 +35,7 @@ Tested on one machine: Windows 11, AMD RX 6700 XT (12 GB).
 > moment). The latest runs, several minutes each in the world, did not, but
 > it is not ruled out; a run can also end on a GPU fault (`crashes.log`). A
 > diagnostics build with `VICTORY_D3D12_WARP=1` renders on the software
-> adapter instead (too slow to reach the world in minutes). The optional `VICTORY_NO_TDR=1` switch (any value except `0` turns it on) disables the timeout only for VIctory's direct queue; it is not a performance tweak. If the GPU really hangs, Windows may not recover on the usual timeout and the display can remain unresponsive until the process is killed or the PC is restarted. Leave it unset unless diagnosing workloads that legitimately exceed the watchdog window.
+> adapter instead (too slow to reach the world in minutes). The optional `VICTORY_NO_TDR=1` switch (any value except `0` turns it on) disables the timeout only for VIctory's direct queue; it is not a performance tweak. If the GPU really hangs, Windows may not recover on the usual timeout and the display can remain unresponsive until the process is killed or the PC is restarted. Leave it unset unless diagnosing workloads that legitimately exceed the watchdog window; set it to `0` to explicitly retain normal TDR behavior.
 
 What each part does today and what it still needs:
 
