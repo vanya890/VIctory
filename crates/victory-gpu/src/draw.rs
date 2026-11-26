@@ -450,6 +450,10 @@ impl State {
                 resource: record.resource as usize,
                 desc: record.desc(),
             };
+            crate::resource::record_rtv_view_format(
+                record.resource,
+                target.desc.as_ref().map(|desc| desc.Format.0 as u32),
+            );
             snapshot.push(target);
             resolved.push((target, texture));
         }
@@ -4260,6 +4264,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         let depth_a = make_committed_target(40, 2, 1); // D32_FLOAT + ALLOW_DEPTH_STENCIL
         let depth_b = make_committed_target(40, 2, 1);
         let rt_arr = make_committed_target(28, 1, 2); // 2-slice Texture2DArray
+        let typeless_rt = make_committed_target(9, 1, 1); // R16G16B16A16_TYPELESS
+        let typed_unorm_rtv: [u32; 6] = [11, 4, 0, 0, 0, 0]; // R16G16B16A16_UNORM, Texture2D
 
         let (rtv_heap, rtv_slot) = make_cpu_heap(2, 2);
         let (dsv_heap, dsv_slot) = make_cpu_heap(3, 2);
@@ -4296,6 +4302,21 @@ void main(uint3 id : SV_DispatchThreadID) {
             crate::object::slot::<Viewports>(list, 0xa8)(list, 1, &vp);
             crate::object::slot::<Scissors>(list, 0xb0)(list, 1, &sc);
         };
+
+        // Bind a typed RTV to a typeless resource and verify PresentX metadata
+        // records the actual view format rather than the typeless GetDesc() format.
+        crate::descriptor::create_rtv(null, typeless_rt, &typed_unorm_rtv, rtv_slot);
+        crate::object::slot::<SetTargets>(list, 0x190)(list, 1, &rtv_slot, 0, std::ptr::null::<u64>());
+        assert_eq!(
+            crate::resource::view_format(typeless_rt),
+            Some(11),
+            "the most recently bound RTV format must be retained for PresentX"
+        );
+        assert_eq!(crate::object::slot::<Close>(list, 0x48)(list), S_OK);
+        assert_eq!(
+            crate::object::slot::<Reset>(list, 0x50)(list, alloc, null),
+            S_OK
+        );
 
         // Case 1: RTV descriptor slot overwritten with `rt_b` before mid-list Wait64 cut.
         crate::descriptor::create_rtv(null, rt_a, std::ptr::null(), rtv_slot);
@@ -4455,7 +4476,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
 
         for obj in [
-            list, alloc, queue, rtv_heap, dsv_heap, rt_a, rt_b, depth_a, depth_b, rt_arr, wait_buf,
+            list, alloc, queue, rtv_heap, dsv_heap, rt_a, rt_b, depth_a, depth_b, rt_arr, typeless_rt, wait_buf,
         ] {
             assert_eq!(crate::object::slot::<Release>(obj, 0x10)(obj), 0);
         }
