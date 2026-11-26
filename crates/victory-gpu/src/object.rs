@@ -89,7 +89,8 @@ pub(crate) fn try_add_ref(this: This) -> bool {
         .is_ok()
 }
 
-/// An object's reference count.
+/// An object's reference count, exposed to regression tests.
+#[cfg(test)]
 pub(crate) fn refs(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     unsafe { &*this }.refs.load(Ordering::Acquire)
