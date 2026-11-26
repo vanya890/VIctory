@@ -1639,9 +1639,21 @@ impl<'a> Lower<'a> {
             self.read_phis.insert(v);
         }
         let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
+        let lane_mask = self.lane_bits.contains_key(&v)
+            || self
+                .x
+                .st
+                .highs
+                .get(&v)
+                .is_some_and(|lo| self.lane_bits.contains_key(lo));
         match self.vals.get(&v) {
-            Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
-                return self.mask_dword(v).map(Val::I32);
+            Some(&Val::Missing(_)) | None if self.mask_ok && (is_mask || lane_mask) => {
+                let data = if is_mask {
+                    self.mask_dword(v)
+                } else {
+                    self.lane_bits_dword(v)
+                };
+                return data.map(Val::I32);
             }
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
@@ -1810,6 +1822,35 @@ impl<'a> Lower<'a> {
         let mask = self.s.m.i32(0xFFFF);
         let hi = self.s.m.bin(self.cur, Bin::And, hi, mask);
         Ok(self.memory(lo, hi, bytes, write, active))
+    }
+
+    /// A lane predicate kept by a carry or compare, read as a mask dword.
+    fn lane_bits_dword(&mut self, v: Value) -> Result<V, Why> {
+        let (lo, high) = match self.x.st.highs.get(&v) {
+            Some(&lo) => (lo, true),
+            None => (v, false),
+        };
+        let bit = *self.lane_bits.get(&lo).ok_or(LANE_MASK)?;
+        let (low, upper) = match self.ballots.get(&lo) {
+            Some(&xy) => xy,
+            None => {
+                let at = match self.def_block.get(&lo) {
+                    None => self.s.entry,
+                    Some(&b) if b == self.cur_ir => self.cur,
+                    Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+                };
+                let i32t = self.s.t.i32;
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let r = self
+                    .s
+                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+                self.s.flags |= flags::WAVE_OPS;
+                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                self.ballots.insert(lo, xy);
+                xy
+            }
+        };
+        Ok(if high { upper } else { low })
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
@@ -11046,6 +11087,18 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn a_carry_predicate_is_materialized_when_read_as_a_mask_dword() {
+        let carry = [
+            0xD400_0000 | 0x30F << 16 | 106 << 8 | 5,
+            258 << 9 | 257,
+        ];
+        let select = [0xD400_0000 | 0x101 << 16 | 7, 106 << 18 | 1 << 9];
+        let lowered = lower_valu(&[carry[0], carry[1], select[0], select[1]])
+            .expect("a carry lane predicate read as a scalar mask");
+        assert!(lowered.wave_ops);
     }
 
     #[test]
