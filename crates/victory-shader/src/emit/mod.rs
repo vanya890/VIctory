@@ -377,6 +377,87 @@ pub struct Options {
     pub view_marks: bool,
 }
 
+/// How group barriers are emitted when the host can prove a group fits in one
+/// SIMD wave.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum GroupSync {
+    #[default]
+    Auto,
+    Strict,
+    Relaxed,
+}
+
+/// Host wave capabilities and explicit compatibility switches.
+///
+/// The minimum lane count is used for single-wave workload proofs. The
+/// maximum is used only to decide whether a native wave64 shader can run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WaveMode {
+    pub min_lanes: u32,
+    pub max_lanes: u32,
+    pub wide64: bool,
+    pub group_sync: GroupSync,
+}
+
+impl Default for WaveMode {
+    fn default() -> Self {
+        Self {
+            min_lanes: 64,
+            max_lanes: 64,
+            wide64: false,
+            group_sync: GroupSync::Auto,
+        }
+    }
+}
+
+impl WaveMode {
+    pub fn new(min_lanes: u32, max_lanes: u32) -> Self {
+        let wide64 = std::env::var("VICTORY_WAVE_WIDE")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty() && v.trim() != "0");
+        let group_sync = match std::env::var("VICTORY_GROUP_SYNC")
+            .ok()
+            .as_deref()
+            .unwrap_or("auto")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "strict" | "on" | "1" => GroupSync::Strict,
+            "relaxed" | "off" | "0" => GroupSync::Relaxed,
+            _ => GroupSync::Auto,
+        };
+        Self::with_range(min_lanes, max_lanes, wide64, group_sync)
+    }
+
+    pub fn with(host_lanes: u32, wide64: bool, group_sync: GroupSync) -> Self {
+        Self::with_range(host_lanes, host_lanes, wide64, group_sync)
+    }
+
+    pub fn with_range(
+        min_lanes: u32,
+        max_lanes: u32,
+        wide64: bool,
+        group_sync: GroupSync,
+    ) -> Self {
+        let (min_lanes, max_lanes) = if min_lanes > 0 && max_lanes >= min_lanes {
+            (min_lanes, max_lanes)
+        } else {
+            (0, 0)
+        };
+        Self {
+            min_lanes,
+            max_lanes,
+            wide64,
+            group_sync,
+        }
+    }
+
+    pub fn relaxes_divergent_barriers(&self) -> bool {
+        !self.wide64 && self.group_sync != GroupSync::Strict
+    }
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, without write marks.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -385,6 +466,15 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] made as `options` say.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    translate_with_wave(container, options, WaveMode::default())
+}
+
+/// `translate_with` made with explicit host wave capabilities.
+pub fn translate_with_wave(
+    container: &[u8],
+    options: Options,
+    wave: WaveMode,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -408,7 +498,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    emit_with_wave(&c, &native, &p, &st, &io, &res, options, wave)
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.
@@ -432,6 +522,21 @@ pub fn emit_with(
     io: &io::Io,
     res: &resource::Resources,
     options: Options,
+) -> Result<HostShader, ShaderError> {
+    emit_with_wave(c, native, p, st, io, res, options, WaveMode::default())
+}
+
+/// `emit_with` made with explicit host wave capabilities.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_with_wave(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+    wave: WaveMode,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -500,14 +605,14 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let l = match lower::lower_with(&parts(st, res), wave) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            lower::lower_with(&parts(&st, &res), wave)?
         }
         l => l?,
     };
