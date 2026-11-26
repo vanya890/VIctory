@@ -2821,6 +2821,75 @@ fn compositor_srv_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
+#[cfg(test)]
+mod present_format_tests {
+    use super::*;
+
+    #[test]
+    fn primary_format_mapping_rejects_integer_and_ambiguous_typeless_formats() {
+        assert_eq!(swap_format(DXGI_FORMAT_R8G8B8A8_UINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R8G8B8A8_SINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R16G16B16A16_UINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R16G16B16A16_SINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R10G10B10A2_UINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R8G8B8A8_TYPELESS), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R16G16B16A16_TYPELESS), None);
+        assert_eq!(swap_format(DXGI_FORMAT_B8G8R8X8_TYPELESS), None);
+        assert_eq!(
+            swap_format(DXGI_FORMAT_B8G8R8X8_UNORM),
+            Some(DXGI_FORMAT_B8G8R8A8_UNORM)
+        );
+    }
+
+    #[test]
+    fn compositor_uses_typed_views_and_requires_numeric_conversion() {
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R16G16B16A16_UNORM),
+            Some(DXGI_FORMAT_R16G16B16A16_UNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R16G16B16A16_SNORM),
+            Some(DXGI_FORMAT_R16G16B16A16_SNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R8G8B8A8_SNORM),
+            Some(DXGI_FORMAT_R8G8B8A8_SNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R8G8B8A8_UINT),
+            None
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R16G16B16A16_UINT),
+            None
+        );
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_R16G16B16A16_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        ));
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_R16G16B16A16_SNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        ));
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_R8G8B8A8_SNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        ));
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_B8G8R8X8_UNORM,
+            DXGI_FORMAT_B8G8R8A8_UNORM
+        ));
+        assert!(!needs_format_conversion(
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        ));
+        assert!(!needs_format_conversion(
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        ));
+    }
+}
+
 const BUFFERS: u32 = 2;
 const MAX_PLANES: u32 = 8;
 
