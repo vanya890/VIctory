@@ -1771,6 +1771,7 @@ pub(crate) mod tests {
         assert_eq!((read(10), read(PAGE + 10)), (0xaa, 0), "page 1 held back");
         // SAFETY: a dword of the mapped bitmap.
         assert_eq!(
+            // SAFETY: memory.data points to the live mapped bitmap; this dword is in range.
             unsafe { *(memory.data as *const u32).add((base + 1) / 32) } & 1 << ((base + 1) % 32),
             0,
             "cleared"
