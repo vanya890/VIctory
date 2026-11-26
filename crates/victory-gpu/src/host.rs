@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{E_FAIL, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
@@ -20,6 +20,176 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCSTR, PCWSTR, s, w};
+
+
+/// Confirms that a submitted command list has actually completed before any
+/// GPU-written data is read back or resources are retired.
+fn confirm_submission_completion(
+    signal: windows::core::Result<()>,
+    set_event: impl FnOnce() -> windows::core::Result<()>,
+    wait: impl FnOnce() -> WAIT_EVENT,
+    submitted: u64,
+    completed_value: impl FnOnce() -> u64,
+) -> windows::core::Result<()> {
+    signal?;
+    set_event()?;
+
+    // Preserve GetLastError from WAIT_FAILED: no other Win32 call may run
+    // between WaitForSingleObject and Error::from_thread().
+    let result = wait();
+    if result == WAIT_FAILED {
+        return Err(windows::core::Error::from_thread());
+    }
+    if result != WAIT_OBJECT_0 {
+        return Err(windows::core::Error::new(
+            E_FAIL,
+            format!("host submission event wait returned {:#x}", result.0),
+        ));
+    }
+
+    let completed = completed_value();
+    // D3D12 reserves UINT64_MAX as the device-removed fence value. Check it
+    // before the monotonic comparison, where it would otherwise look complete.
+    if completed == u64::MAX {
+        return Err(windows::core::Error::from_hresult(DXGI_ERROR_DEVICE_REMOVED));
+    }
+    if completed < submitted {
+        return Err(windows::core::Error::new(
+            E_FAIL,
+            format!("host submission fence completed {completed}, expected at least {submitted}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod submission_completion_tests {
+    use std::cell::Cell;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+
+    use windows::Win32::Foundation::{
+        ERROR_INVALID_HANDLE, HANDLE, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    use windows::core::{E_FAIL, Error, HRESULT};
+
+    use super::confirm_submission_completion;
+
+    const SUBMITTED: u64 = 7;
+
+    #[test]
+    fn signaled_wait_at_or_past_target_confirms_completion() {
+        for completed in [SUBMITTED, SUBMITTED + 1] {
+            // SAFETY: create a private, initially signaled auto-reset event.
+            let event = unsafe { CreateEventW(None, false, true, None) }.unwrap();
+            // SAFETY: this test owns the newly created handle.
+            let _owned = unsafe { OwnedHandle::from_raw_handle(event.0) };
+            let result = confirm_submission_completion(
+                Ok(()),
+                || Ok(()),
+                // SAFETY: the owned event remains live throughout the wait.
+                || unsafe { WaitForSingleObject(event, 0) },
+                SUBMITTED,
+                || completed,
+            );
+            result.unwrap();
+        }
+    }
+
+    #[test]
+    fn signal_failure_stops_before_event_registration_or_wait() {
+        let set_event_called = Cell::new(false);
+        let wait_called = Cell::new(false);
+        let result = confirm_submission_completion(
+            Err(Error::new(E_FAIL, "signal failed")),
+            || {
+                set_event_called.set(true);
+                Ok(())
+            },
+            || {
+                wait_called.set(true);
+                WAIT_OBJECT_0
+            },
+            SUBMITTED,
+            || panic!("failed signal queried the fence"),
+        );
+        assert!(result.is_err());
+        assert!(!set_event_called.get());
+        assert!(!wait_called.get());
+    }
+
+    #[test]
+    fn event_registration_failure_stops_before_wait() {
+        let wait_called = Cell::new(false);
+        let result = confirm_submission_completion(
+            Ok(()),
+            || Err(Error::new(E_FAIL, "SetEventOnCompletion failed")),
+            || {
+                wait_called.set(true);
+                WAIT_OBJECT_0
+            },
+            SUBMITTED,
+            || panic!("failed event registration queried the fence"),
+        );
+        assert!(result.is_err());
+        assert!(!wait_called.get());
+    }
+
+    #[test]
+    fn failed_wait_preserves_the_win32_error() {
+        // SAFETY: Win32 rejects a null handle without dereferencing it.
+        let wait = unsafe { WaitForSingleObject(HANDLE::default(), 0) };
+        assert_eq!(wait, WAIT_FAILED);
+        let result = confirm_submission_completion(
+            Ok(()),
+            || Ok(()),
+            || wait,
+            SUBMITTED,
+            || panic!("failed wait queried the fence"),
+        );
+        assert_eq!(
+            result.unwrap_err().code(),
+            HRESULT::from_win32(ERROR_INVALID_HANDLE.0)
+        );
+    }
+
+    #[test]
+    fn unexpected_wait_result_is_rejected_without_querying_fence() {
+        let result = confirm_submission_completion(
+            Ok(()),
+            || Ok(()),
+            || WAIT_TIMEOUT,
+            SUBMITTED,
+            || panic!("unexpected wait queried the fence"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn incomplete_fence_is_rejected() {
+        let result = confirm_submission_completion(
+            Ok(()),
+            || Ok(()),
+            || WAIT_OBJECT_0,
+            SUBMITTED,
+            || SUBMITTED - 1,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn device_removed_sentinel_is_not_treated_as_completion() {
+        let result = confirm_submission_completion(
+            Ok(()),
+            || Ok(()),
+            || WAIT_OBJECT_0,
+            SUBMITTED,
+            || u64::MAX,
+        );
+        assert_eq!(result.unwrap_err().code(), DXGI_ERROR_DEVICE_REMOVED);
+    }
+}
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -1289,19 +1459,23 @@ impl Host {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
+            // SAFETY: lists are closed; this queue, fence and event belong
+            // to the host, and the submission mutex serializes their use.
+            let completion = unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-                }
+                confirm_submission_completion(
+                    self.queue.Signal(&self.fence, *submitted),
+                    || self.fence.SetEventOnCompletion(*submitted, self.event),
+                    || WaitForSingleObject(self.event, INFINITE),
+                    *submitted,
+                    || self.fence.GetCompletedValue(),
+                )
+            };
+            if let Err(error) = completion {
+                fail(format_args!(
+                    "host GPU submission {} did not complete: {error}",
+                    *submitted
+                ));
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
