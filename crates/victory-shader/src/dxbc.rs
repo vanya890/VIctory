@@ -84,8 +84,20 @@ impl<'a> Container<'a> {
             return Err(ShaderError::Malformed("implausible part count"));
         }
         let mut parts = Vec::with_capacity(count);
+        // The part table itself has to fit, and every part starts after it:
+        // an offset inside the header or the table names container metadata
+        // (offset 0 reads back the `DXBC` magic as a FourCC).
+        let table_end = HEADER_SIZE + 4 * count;
+        if data.len() < table_end {
+            return Err(ShaderError::Malformed("part table out of bounds"));
+        }
         for i in 0..count {
             let offset = u32_at(data, HEADER_SIZE + 4 * i)? as usize;
+            if offset < table_end {
+                return Err(ShaderError::Malformed(
+                    "part offset inside the header or part table",
+                ));
+            }
             let fourcc = FourCC(
                 data.get(offset..offset + 4)
                     .ok_or(ShaderError::Malformed("part header out of bounds"))?
@@ -180,5 +192,38 @@ mod tests {
         assert!(Container::parse(&bytes).is_err());
         bytes.truncate(last);
         assert!(Container::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_part_offsets_inside_the_header_or_table() {
+        // Offset zero names the container magic: the old parser read `DXBC`
+        // back as a part FourCC.
+        let mut bytes = build(&[(FourCC::SFI0, &[1, 2, 3, 4])]);
+        bytes[0x20..0x24].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            Container::parse(&bytes).unwrap_err(),
+            ShaderError::Malformed("part offset inside the header or part table")
+        );
+
+        // One that lands inside the part table itself.
+        let mut bytes = build(&[(FourCC::SFI0, &[1, 2, 3, 4]), (FourCC::HASH, &[9; 20])]);
+        let table_end = 0x20 + 4 * 2;
+        bytes[0x20..0x24].copy_from_slice(&((table_end - 4) as u32).to_le_bytes());
+        assert_eq!(
+            Container::parse(&bytes).unwrap_err(),
+            ShaderError::Malformed("part offset inside the header or part table")
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_part_offset_table() {
+        let mut bytes = build(&[(FourCC::SFI0, &[1, 2, 3, 4]), (FourCC::HASH, &[9; 20])]);
+        // Keep the declared container valid, but make it end before the
+        // second offset-table entry.
+        bytes[0x18..0x1C].copy_from_slice(&((HEADER_SIZE + 4) as u32).to_le_bytes());
+        assert_eq!(
+            Container::parse(&bytes).unwrap_err(),
+            ShaderError::Malformed("part table out of bounds")
+        );
     }
 }
