@@ -4387,6 +4387,106 @@ mod present_plane_tests {
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
+
+    #[test]
+    fn present_primary_bgrx_uses_typed_view_and_integer_primary_is_rejected() {
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX format test: no D3D12 device");
+            return;
+        };
+        let make = |format: DXGI_FORMAT| -> ID3D12Resource {
+            let mut texture = None;
+            // SAFETY: live device and a valid 2D render-target description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 32,
+                            Height: 32,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: format,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+            }
+            texture.unwrap()
+        };
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let bgrx = make(DXGI_FORMAT_B8G8R8X8_TYPELESS);
+        let list = host.new_list().unwrap();
+        let rtv = host.rtv(
+            &bgrx,
+            Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: DXGI_FORMAT_B8G8R8X8_UNORM,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_RTV { MipSlice: 0, PlaneSlice: 0 },
+                },
+            }),
+        );
+        // SAFETY: live typed RTV on an open list.
+        unsafe { list.list.ClearRenderTargetView(rtv, &[0.0, 1.0, 0.0, 1.0], None) };
+        list.close();
+        host.execute(&[&list]);
+
+        let mut pixel = None;
+        let shown = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(
+                &bgrx,
+                state,
+                Some(DXGI_FORMAT_B8G8R8X8_UNORM.0 as u32),
+            )],
+            4,
+            Compositor::new,
+            |buffer, footprint| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: the present copy completed; footprint names a live RGBA pixel.
+                pixel = Some(unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u8; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                });
+            },
+        );
+        assert!(shown.0.is_some(), "typeless BGRX with its actual typed RTV must composite");
+        assert_eq!(pixel, Some([0, 255, 0, 255]));
+
+        let integer = make(DXGI_FORMAT_R8G8B8A8_UINT);
+        let mut compositor_attempted = false;
+        let rejected = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(&integer, state, None)],
+            5,
+            |_, _| {
+                compositor_attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |_, _| {},
+        );
+        assert!(rejected.0.is_none(), "integer primary formats must not be reinterpreted as UNORM");
+        assert!(!compositor_attempted);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
 }
 
 #[cfg(test)]
