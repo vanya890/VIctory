@@ -4866,7 +4866,7 @@ mod present_plane_tests {
             &[PresentPlane::Raw(
                 &typed,
                 state,
-                Some(DXGI_FORMAT_R16G16B16A16_UNORM.0 as u32),
+                Some(DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32),
             )],
             6,
             Compositor::new,
