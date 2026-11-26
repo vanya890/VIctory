@@ -1841,7 +1841,7 @@ fn hand_out_resource(
         // SAFETY: the title passes a whole clear value (or null).
         made_with: (state, (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() })),
         #[cfg(windows)]
-        rtv_format: 0.into(),
+        rtv_format: std::sync::atomic::AtomicU32::new(0),
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
