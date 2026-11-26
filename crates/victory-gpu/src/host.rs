@@ -717,18 +717,6 @@ pub(crate) mod tests {
 
     use super::*;
 
-    #[test]
-    fn lists_without_state_changes_do_not_create_a_prelude() {
-        let Some(host) = host() else { return };
-        let list = host.new_list().expect("ordinary host list");
-        assert!(list.prelude.get().is_none(), "new lists start without a prelude");
-        assert!(list.prelude().is_none(), "no state changes need no prelude");
-        assert!(list.prelude.get().is_none(), "a no-op prelude stays uninitialized");
-    }
-
-    /// Shaders that use title memory mark their reads in their own bitmap:
-    /// read marks of both bitmaps are taken, each slot once until it is
-    /// forgotten, and a forgotten slot's next read is taken again.
     /// Lists without transitions keep their prelude pool empty.
     #[test]
     fn lists_without_state_changes_do_not_create_a_prelude() {
@@ -739,6 +727,10 @@ pub(crate) mod tests {
         let preludes = list.preludes.lock().unwrap_or_else(|e| e.into_inner());
         assert!(preludes.free.is_empty() && preludes.flight.is_empty());
     }
+
+    /// Shaders that use title memory mark their reads in their own bitmap:
+    /// read marks of both bitmaps are taken, each slot once until it is
+    /// forgotten, and a forgotten slot's next read is taken again.
 
     /// A list named twice by one submission gets a separate prelude pair for
     /// each use: resetting the first pair before it runs would lose its moves.
@@ -1190,9 +1182,8 @@ pub(crate) struct HostList {
     /// The draw or dispatch being recorded runs a program using title
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
-    /// The list that runs those transitions just before this one, made only
-    /// when this list first needs a state prelude.
-    /// Per-use transition lists, created only when this HostList needs a prelude.
+    /// Per-use transition lists, allocated only when this HostList needs a
+    /// prelude and retained until the submission's fence wait completes.
     preludes: Mutex<Preludes>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
@@ -2400,9 +2391,14 @@ impl HostList {
                 Some(pair) => pair,
                 // A previous use in this same submission is still in flight.
                 // Allocate another pair, but only because this prelude has work.
-                None => match host().and_then(|h| h.new_prelude().ok()) {
-                    Some(pair) => pair,
-                    None => fail(format_args!("a host state prelude had no list")),
+                None => {
+                    let host = host().unwrap_or_else(|| fail("the list's host is unavailable"));
+                    match host.new_prelude() {
+                        Ok(pair) => pair,
+                        Err(e) => fail(format_args!(
+                            "a host state prelude was not made ({e}); host memory may be exhausted"
+                        )),
+                    }
                 },
             }
         };
