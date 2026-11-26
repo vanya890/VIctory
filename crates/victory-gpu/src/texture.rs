@@ -26,6 +26,9 @@ use crate::host::{HostList, host};
 use crate::object::This;
 use windows::core::Interface;
 
+#[cfg(test)]
+mod staging_tests;
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -120,8 +123,7 @@ const KEPT_BYTES: u64 = 64 << 20;
 pub(crate) fn recycle() {
     {
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
-        (c.current, c.used) = (0, 0);
-        c.all.truncate(CHUNKS_KEPT);
+        c.recycle();
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
@@ -165,22 +167,91 @@ fn staging_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
 /// textures take a part of one instead of a buffer of their own (making
 /// upload buffers was 10 % of the submitting thread in a new shot, run
 /// evict5). Rewound at each submission ([`recycle`]): the last one has run.
-struct Chunks {
-    /// (buffer, mapping), [`CHUNK`] bytes each.
-    all: Vec<(ID3D12Resource, usize)>,
+struct Chunks<T> {
+    all: Vec<Chunk<T>>,
     /// The chunk being carved and the bytes taken from it.
     current: usize,
     used: u64,
+    /// Preferred maximum size for new chunks in this submission.
+    growth: u64,
+}
+
+struct Chunk<T> {
+    buffer: T,
+    data: usize,
+    size: u64,
+}
+
+impl<T: Clone> Chunks<T> {
+    const fn new() -> Self {
+        Self {
+            all: Vec::new(),
+            current: 0,
+            used: 0,
+            growth: CHUNK,
+        }
+    }
+
+    fn recycle(&mut self) {
+        (self.current, self.used, self.growth) = (0, 0, CHUNK);
+        // Once large allocations work again, keep their capacity for the
+        // next submission instead of pinning the first small chunks forever.
+        if self.all.len() > CHUNKS_KEPT && self.all[..CHUNKS_KEPT].iter().any(|chunk| chunk.size < CHUNK) {
+            self.all.select_nth_unstable_by_key(CHUNKS_KEPT, |chunk| std::cmp::Reverse(chunk.size));
+        }
+        self.all.truncate(CHUNKS_KEPT);
+    }
+
+    fn take(
+        &mut self,
+        size: u64,
+        mut allocate: impl FnMut(u64) -> Option<(T, usize)>,
+    ) -> Option<(T, u64, usize)> {
+        debug_assert!(size <= CHUNK);
+        while let Some(chunk) = self.all.get(self.current) {
+            let at = self.used.next_multiple_of(512);
+            if at + size <= chunk.size {
+                self.used = at + size;
+                return Some((chunk.buffer.clone(), at, chunk.data + at as usize));
+            }
+            (self.current, self.used) = (self.current + 1, 0);
+        }
+
+        let minimum = size.max(MIN_CHUNK).next_multiple_of(MIN_CHUNK);
+        let mut bytes = self.growth.max(minimum);
+        loop {
+            if let Some((buffer, data)) = allocate(bytes) {
+                let piece = (buffer.clone(), 0, data);
+                self.all.push(Chunk {
+                    buffer,
+                    data,
+                    size: bytes,
+                });
+                self.used = size;
+                return Some(piece);
+            }
+            // Keep servicing requests with available space. New chunks
+            // start smaller after a refusal, unless the request needs more.
+            self.growth = self
+                .growth
+                .min((bytes.next_power_of_two() / 2).max(MIN_CHUNK));
+            if bytes == minimum {
+                return None;
+            }
+            bytes = self.growth.max(minimum);
+        }
+    }
 }
 
 // SAFETY: the mappings are persistent mappings of the upload buffers.
-unsafe impl Send for Chunks {}
-
-static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks { all: Vec::new(), current: 0, used: 0 });
+unsafe impl Send for Chunks<ID3D12Resource> {}
 
 const CHUNK: u64 = 32 << 20;
+const MIN_CHUNK: u64 = 64 << 10;
 /// Chunks kept between submissions (more are made while one needs them).
 const CHUNKS_KEPT: usize = 16;
+
+static CHUNKS: Mutex<Chunks<ID3D12Resource>> = Mutex::new(Chunks::new());
 
 /// `size` bytes of staging space: a buffer, the offset of the space in it
 /// (a multiple of 512, as texture copies need) and its mapping there.
@@ -190,21 +261,12 @@ fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
         return staging_buffer(size).map(|(b, data)| (b, 0, data));
     }
     let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
-    loop {
-        if let Some((buffer, data)) = c.all.get(c.current) {
-            let at = c.used.next_multiple_of(512);
-            if at + size <= CHUNK {
-                let made = (buffer.clone(), at, (*data + at as usize) as *mut u8);
-                c.used = at + size;
-                return Some(made);
-            }
-            (c.current, c.used) = (c.current + 1, 0);
-            continue;
-        }
-        let (buffer, data) = host()?.upload_buffer(CHUNK)?;
+    let (buffer, at, data) = c.take(size, |bytes| {
+        let (buffer, data) = host()?.upload_buffer(bytes)?;
         crate::host::name(&buffer, || "texture staging chunk".into());
-        c.all.push((buffer, data as usize));
-    }
+        Some((buffer, data as usize))
+    })?;
+    Some((buffer, at, data as *mut u8))
 }
 
 // SAFETY: the title memory is only read, under `last`'s lock.
