@@ -223,27 +223,45 @@ pub fn title() -> Title {
 /// and Windows 11 drops that request while the window is hidden unless the
 /// process opts out. Process-wide, for the whole run.
 #[cfg(windows)]
-pub fn use_console_timers() {
-    use windows_sys::Win32::Media::timeBeginPeriod;
+fn power_throttling_state(
+    efficiency_mode: &str,
+) -> windows_sys::Win32::System::Threading::PROCESS_POWER_THROTTLING_STATE {
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
-        ProcessPowerThrottling, SetProcessInformation,
     };
-    let keep = PROCESS_POWER_THROTTLING_STATE {
+    let control =
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
-        StateMask: 0,
+        ControlMask: control,
+        StateMask: if efficiency_mode == "1" { control } else { 0 },
+    }
+}
+
+#[cfg(windows)]
+pub fn use_console_timers() {
+    use windows_sys::Win32::Media::{TIMERR_NOERROR, timeBeginPeriod};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation,
     };
-    // SAFETY: plain process settings; `keep` outlives the call.
+    let mode = std::env::var("VICTORY_EFFICIENCY_MODE").unwrap_or_default();
+    let state = power_throttling_state(&mode);
+    // SAFETY: plain process settings; `state` outlives the call.
     unsafe {
-        SetProcessInformation(
+        if SetProcessInformation(
             GetCurrentProcess(),
             ProcessPowerThrottling,
-            (&raw const keep).cast(),
-            size_of_val(&keep) as u32,
-        );
-        timeBeginPeriod(1);
+            (&raw const state).cast(),
+            size_of_val(&state) as u32,
+        ) == 0
+        {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(%error, "process power throttling unchanged");
+        }
+        if timeBeginPeriod(1) != TIMERR_NOERROR {
+            tracing::warn!("timeBeginPeriod(1) failed");
+        }
     }
 }
 
@@ -285,5 +303,27 @@ mod tests {
         assert_eq!(t.id, 0x639A_A8DD);
         assert_eq!(t.store_id, "9&C");
         assert_eq!(t.storage_bytes, 1024 << 20);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn efficiency_mode_controls_power_throttling_state() {
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        };
+        let both = PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+
+        let default = power_throttling_state("");
+        assert_eq!(default.Version, PROCESS_POWER_THROTTLING_CURRENT_VERSION);
+        assert_eq!(default.ControlMask, both);
+        assert_eq!(default.StateMask, 0);
+
+        let enabled = power_throttling_state("1");
+        assert_eq!(enabled.ControlMask, both);
+        assert_eq!(enabled.StateMask, both);
+        assert_eq!(power_throttling_state("true").StateMask, 0);
+        assert_eq!(power_throttling_state("0").StateMask, 0);
     }
 }

@@ -210,6 +210,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_NO_TDR=1` | disable the GPU timeout for VIctory's direct queue only; default off. Risky diagnostic workaround: a real GPU hang may freeze the display/system for much longer and require a manual restart |
+| `VICTORY_EFFICIENCY_MODE=1` | opt back into Windows process-wide efficiency throttling (EcoQoS execution-speed throttling and ignored timer-resolution requests); default is explicitly off for console timer pacing. This may reduce CPU performance and frame pacing; exact value `1` is required. |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | skip host pipeline creation and omit draws and dispatches, including indirect ones, when the pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
 | `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
