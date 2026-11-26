@@ -1469,6 +1469,293 @@ fn typed_store(format: u32) -> bool {
     ok
 }
 
+/// Number of format planes the host reports for `format` (at least 1).
+fn plane_count(format: DXGI_FORMAT) -> u32 {
+    static KNOWN: Mutex<Vec<(i32, u32)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, count)) = known.iter().find(|(f, _)| *f == format.0) {
+        return count;
+    }
+    let mut info = D3D12_FEATURE_DATA_FORMAT_INFO {
+        Format: format,
+        PlaneCount: 0,
+    };
+    let count = host().map_or(1, |h| {
+        // SAFETY: a plain query into a struct of its size.
+        let ok = unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_INFO,
+                (&raw mut info).cast(),
+                size_of_val(&info) as u32,
+            )
+        };
+        if ok.is_ok() {
+            u32::from(info.PlaneCount).max(1)
+        } else {
+            1
+        }
+    });
+    known.push((format.0, count));
+    count
+}
+
+/// Whether `count` items from `first` (`u32::MAX`: all remaining items) fit
+/// inside `0..total`.
+fn range_in_bounds(first: u32, count: u32, total: u32) -> bool {
+    first < total
+        && (count == u32::MAX
+            || (count > 0 && u64::from(first) + u64::from(count) <= u64::from(total)))
+}
+
+/// Return the concrete number of array slices to put in a D3D12 descriptor.
+/// The console's UINT_MAX means "all remaining"; non-null D3D12 ArraySize
+/// fields require an explicit count.
+fn array_count(first: u32, count: u32, total: u32) -> Option<u32> {
+    if first >= total || count == 0 {
+        return None;
+    }
+    let count = if count == u32::MAX { total - first } else { count };
+    first.checked_add(count).filter(|&end| end <= total).map(|_| count)
+}
+
+/// Return the concrete number of cubes to put in a D3D12 cube-array SRV.
+fn cube_count(first_face: u32, count: u32, total_faces: u32) -> Option<u32> {
+    if first_face >= total_faces {
+        return None;
+    }
+    let count = if count == u32::MAX {
+        (total_faces - first_face) / 6
+    } else {
+        count
+    };
+    (count > 0
+        && u64::from(first_face) + u64::from(count) * 6 <= u64::from(total_faces))
+        .then_some(count)
+}
+
+/// Replace console remaining-range sentinels with concrete host SRV counts.
+/// Called only after the resource/view range has passed validation.
+fn normalize_srv_array_counts(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, total: u32) -> bool {
+    // SAFETY: each arm accesses and writes only the union member selected by ViewDimension.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+                let mut v = desc.Anonymous.Texture1DArray;
+                let Some(count) = array_count(v.FirstArraySlice, v.ArraySize, total) else { return false };
+                v.ArraySize = count;
+                desc.Anonymous.Texture1DArray = v;
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let mut v = desc.Anonymous.Texture2DArray;
+                let Some(count) = array_count(v.FirstArraySlice, v.ArraySize, total) else { return false };
+                v.ArraySize = count;
+                desc.Anonymous.Texture2DArray = v;
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => {
+                let mut v = desc.Anonymous.Texture2DMSArray;
+                let Some(count) = array_count(v.FirstArraySlice, v.ArraySize, total) else { return false };
+                v.ArraySize = count;
+                desc.Anonymous.Texture2DMSArray = v;
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let mut v = desc.Anonymous.TextureCubeArray;
+                let Some(count) = cube_count(v.First2DArrayFace, v.NumCubes, total) else { return false };
+                v.NumCubes = count;
+                desc.Anonymous.TextureCubeArray = v;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Replace console remaining-range sentinels with concrete host UAV counts.
+fn normalize_uav_array_counts(desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC, total: u32) -> bool {
+    // SAFETY: each arm accesses and writes only the union member selected by ViewDimension.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+                let mut v = desc.Anonymous.Texture1DArray;
+                let Some(count) = array_count(v.FirstArraySlice, v.ArraySize, total) else { return false };
+                v.ArraySize = count;
+                desc.Anonymous.Texture1DArray = v;
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                let mut v = desc.Anonymous.Texture2DArray;
+                let Some(count) = array_count(v.FirstArraySlice, v.ArraySize, total) else { return false };
+                v.ArraySize = count;
+                desc.Anonymous.Texture2DArray = v;
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY => {
+                let mut v = desc.Anonymous.Texture2DMSArray;
+                let Some(count) = array_count(v.FirstArraySlice, v.ArraySize, total) else { return false };
+                v.ArraySize = count;
+                desc.Anonymous.Texture2DMSArray = v;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Whether `plane` is valid for a view in `view_format` of a texture in
+/// `resource_format`.
+fn valid_plane(resource_format: DXGI_FORMAT, view_format: DXGI_FORMAT, plane: u32) -> bool {
+    if plane >= plane_count(resource_format) {
+        return false;
+    }
+    match view_format {
+        DXGI_FORMAT_X24_TYPELESS_G8_UINT | DXGI_FORMAT_X32_TYPELESS_G8X24_UINT => plane == 1,
+        DXGI_FORMAT_R24_UNORM_X8_TYPELESS | DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS => plane == 0,
+        _ => true,
+    }
+}
+
+/// Whether `mapping` is a valid `D3D12_SHADER_4_COMPONENT_MAPPING`: bit 12
+/// (`D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES`)
+/// set, upper bits clear, and each 3-bit selector in `0..=5`.
+fn valid_component_mapping(mapping: u32) -> bool {
+    mapping & !0xFFF == 0x1000 && (0..4).all(|c| ((mapping >> (3 * c)) & 7) <= 5)
+}
+
+/// Whether `desc`'s dimension, mip/slice/plane ranges and component mapping
+/// fit `texture` on the host: invalid descriptions remove the retail D3D12
+/// device (`DXGI_ERROR_INVALID_CALL`) inside `CreateShaderResourceView`.
+fn texture_srv_fits(texture: &ID3D12Resource, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) -> bool {
+    if !valid_component_mapping(desc.Shader4ComponentMapping) {
+        once!(
+            mapping = format_args!("{:#x}", desc.Shader4ComponentMapping),
+            "texture shader view with invalid component mapping"
+        );
+        return false;
+    }
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let mips = u32::from(d.MipLevels);
+    let array = u32::from(d.DepthOrArraySize);
+    let msaa = d.SampleDesc.Count > 1;
+    // SAFETY: each arm reads the union field matching `desc.ViewDimension`.
+    let ok = unsafe {
+        match (d.Dimension, desc.ViewDimension) {
+            (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_SRV_DIMENSION_TEXTURE1D) => {
+                let v = desc.Anonymous.Texture1D;
+                range_in_bounds(v.MostDetailedMip, v.MipLevels, mips)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_SRV_DIMENSION_TEXTURE1DARRAY) => {
+                let v = desc.Anonymous.Texture1DArray;
+                range_in_bounds(v.MostDetailedMip, v.MipLevels, mips)
+                    && range_in_bounds(v.FirstArraySlice, v.ArraySize, array)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURE2D) if !msaa => {
+                let v = desc.Anonymous.Texture2D;
+                range_in_bounds(v.MostDetailedMip, v.MipLevels, mips)
+                    && valid_plane(d.Format, desc.Format, v.PlaneSlice)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURE2DARRAY) if !msaa => {
+                let v = desc.Anonymous.Texture2DArray;
+                range_in_bounds(v.MostDetailedMip, v.MipLevels, mips)
+                    && range_in_bounds(v.FirstArraySlice, v.ArraySize, array)
+                    && valid_plane(d.Format, desc.Format, v.PlaneSlice)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURE2DMS) if msaa => true,
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY) if msaa => {
+                let v = desc.Anonymous.Texture2DMSArray;
+                range_in_bounds(v.FirstArraySlice, v.ArraySize, array)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURECUBE) if !msaa => {
+                let v = desc.Anonymous.TextureCube;
+                array >= 6 && range_in_bounds(v.MostDetailedMip, v.MipLevels, mips)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURECUBEARRAY) if !msaa => {
+                let v = desc.Anonymous.TextureCubeArray;
+                let faces_ok = v.First2DArrayFace < array
+                    && if v.NumCubes == u32::MAX {
+                        u64::from(v.First2DArrayFace) + 6 <= u64::from(array)
+                    } else {
+                        v.NumCubes > 0
+                            && u64::from(v.First2DArrayFace) + u64::from(v.NumCubes) * 6
+                                <= u64::from(array)
+                    };
+                faces_ok && range_in_bounds(v.MostDetailedMip, v.MipLevels, mips)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_SRV_DIMENSION_TEXTURE3D) => {
+                let v = desc.Anonymous.Texture3D;
+                range_in_bounds(v.MostDetailedMip, v.MipLevels, mips)
+            }
+            _ => false,
+        }
+    };
+    let ok = ok && normalize_srv_array_counts(desc, array);
+    if !ok {
+        once!(
+            resource_dim = d.Dimension.0,
+            view_dim = desc.ViewDimension.0,
+            mips,
+            array,
+            samples = d.SampleDesc.Count,
+            "texture shader view does not fit its host texture"
+        );
+    }
+    ok
+}
+
+fn texture_uav_fits(texture: &ID3D12Resource, desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC) -> bool {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let mips = u32::from(d.MipLevels);
+    let array = u32::from(d.DepthOrArraySize);
+    let msaa = d.SampleDesc.Count > 1;
+    // SAFETY: each arm reads the union field matching `desc.ViewDimension`.
+    let ok = unsafe {
+        match (d.Dimension, desc.ViewDimension) {
+            (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_UAV_DIMENSION_TEXTURE1D) => {
+                desc.Anonymous.Texture1D.MipSlice < mips
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => {
+                let v = desc.Anonymous.Texture1DArray;
+                v.MipSlice < mips && range_in_bounds(v.FirstArraySlice, v.ArraySize, array)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_UAV_DIMENSION_TEXTURE2D) if !msaa => {
+                let v = desc.Anonymous.Texture2D;
+                v.MipSlice < mips && valid_plane(d.Format, desc.Format, v.PlaneSlice)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_UAV_DIMENSION_TEXTURE2DARRAY) if !msaa => {
+                let v = desc.Anonymous.Texture2DArray;
+                v.MipSlice < mips
+                    && range_in_bounds(v.FirstArraySlice, v.ArraySize, array)
+                    && valid_plane(d.Format, desc.Format, v.PlaneSlice)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_UAV_DIMENSION_TEXTURE2DMS) if msaa => true,
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY) if msaa => {
+                let v = desc.Anonymous.Texture2DMSArray;
+                range_in_bounds(v.FirstArraySlice, v.ArraySize, array)
+            }
+            (D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_UAV_DIMENSION_TEXTURE3D) => {
+                let v = desc.Anonymous.Texture3D;
+                if v.MipSlice >= mips {
+                    false
+                } else {
+                    let depth = array.checked_shr(v.MipSlice).unwrap_or(0).max(1);
+                    range_in_bounds(v.FirstWSlice, v.WSize, depth)
+                }
+            }
+            _ => false,
+        }
+    };
+    let ok = ok && normalize_uav_array_counts(desc, array);
+    if !ok {
+        once!(
+            resource_dim = d.Dimension.0,
+            view_dim = desc.ViewDimension.0,
+            mips,
+            array,
+            samples = d.SampleDesc.Count,
+            "texture unordered access view does not fit its host texture"
+        );
+    }
+    ok
+}
+
 /// Makes the host descriptor for `view` at `at` (in any host view heap):
 /// the host resource it views, if it can.
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
@@ -1521,6 +1808,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
+                if desc.as_mut().is_some_and(|d| !texture_srv_fits(texture, d)) {
+                    return None;
+                }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -1567,6 +1857,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 desc.Format = DXGI_FORMAT(format as i32);
             }
             if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
+                return None;
+            }
+            if desc.as_mut().is_some_and(|d| !texture_uav_fits(texture, d)) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
@@ -2597,6 +2890,533 @@ mod tests {
     /// `HostHeap::view_addresses`, and `descriptor::pinned_view` against concurrent
     /// `Resource::Release()` across textures, buffers, and dual-resource UAVs must
     /// neither dereference freed resources nor deadlock on `VIEWS`.
+    #[test]
+    fn array_view_sentinels_are_normalized_in_host_descriptors() {
+        let mut srv_words = [0u32; 10];
+        srv_words[1] = 5; // TEXTURE2DARRAY
+        srv_words[5] = 1; // MipLevels
+        srv_words[6] = 2; // FirstArraySlice
+        srv_words[7] = u32::MAX; // console "all remaining" sentinel
+        let mut srv = srv_desc(&srv_words);
+        assert!(normalize_srv_array_counts(&mut srv, 6));
+        // SAFETY: the test selected TEXTURE2DARRAY above.
+        assert_eq!(unsafe { srv.Anonymous.Texture2DArray.ArraySize }, 4);
+
+        let mut ms_srv_words = [0u32; 10];
+        ms_srv_words[1] = 7; // TEXTURE2DMSARRAY
+        ms_srv_words[4] = 1; // FirstArraySlice
+        ms_srv_words[5] = u32::MAX; // ArraySize
+        let mut ms_srv = srv_desc(&ms_srv_words);
+        assert!(normalize_srv_array_counts(&mut ms_srv, 6));
+        // SAFETY: the test selected TEXTURE2DMSARRAY above.
+        assert_eq!(unsafe { ms_srv.Anonymous.Texture2DMSArray.ArraySize }, 5);
+
+        let mut cube_words = [0u32; 10];
+        cube_words[1] = 10; // TEXTURECUBEARRAY
+        cube_words[5] = 1; // MipLevels
+        cube_words[6] = 6; // First2DArrayFace
+        cube_words[7] = u32::MAX; // NumCubes
+        let mut cube_srv = srv_desc(&cube_words);
+        assert!(normalize_srv_array_counts(&mut cube_srv, 18));
+        // SAFETY: the test selected TEXTURECUBEARRAY above.
+        assert_eq!(unsafe { cube_srv.Anonymous.TextureCubeArray.NumCubes }, 2);
+
+        let mut uav_words = [0u32; 10];
+        uav_words[1] = 5; // TEXTURE2DARRAY
+        uav_words[2] = 1; // MipSlice
+        uav_words[3] = 2; // FirstArraySlice
+        uav_words[4] = u32::MAX; // ArraySize
+        let mut uav = uav_desc(&uav_words);
+        assert!(normalize_uav_array_counts(&mut uav, 6));
+        // SAFETY: the test selected TEXTURE2DARRAY above.
+        assert_eq!(unsafe { uav.Anonymous.Texture2DArray.ArraySize }, 4);
+    }
+
+    #[test]
+    fn texture_views_with_invalid_dimensions_ranges_or_mapping_fall_back_to_null() {
+        let Some(host) = host() else {
+            assert!(
+                std::env::var_os("VICTORY_D3D12_WARP").is_none(),
+                "VICTORY_D3D12_WARP=1 was requested, but no D3D12 WARP device could be created"
+            );
+            eprintln!("SKIP: no host D3D12 device; texture-view integration path not exercised");
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 64) else {
+            assert!(
+                std::env::var_os("VICTORY_D3D12_WARP").is_none(),
+                "VICTORY_D3D12_WARP=1 was requested, but the D3D12 descriptor heap could not be created"
+            );
+            eprintln!("SKIP: could not create the host descriptor heap");
+            return;
+        };
+        eprintln!("EXERCISE: host-backed texture SRV/UAV validation");
+        let make_res = |dim: u32,
+                        w: u64,
+                        h: u32,
+                        depth_or_array: u16,
+                        mips: u16,
+                        fmt: u32,
+                        samples: u32,
+                        flags: u32|
+         -> crate::object::This {
+            let mut desc = [0u32; 14];
+            desc[0] = dim;
+            desc[4] = w as u32;
+            desc[5] = (w >> 32) as u32;
+            desc[6] = h;
+            desc[7] = u32::from(depth_or_array) | (u32::from(mips) << 16);
+            desc[8] = fmt;
+            desc[9] = samples;
+            desc[12] = flags;
+            let heap_props: [u32; 5] = [1, 0, 0, 0, 0];
+            let iid = crate::object::guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let mut res = std::ptr::null();
+            let hr = crate::resource::create_committed(
+                std::ptr::null(),
+                heap_props.as_ptr().cast(),
+                0,
+                desc.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &iid,
+                &mut res,
+            );
+            assert_eq!(
+                hr, 0,
+                "CreateCommittedResource dim={dim} fmt={fmt} samples={samples}"
+            );
+            assert!(
+                crate::resource::host_resource(res).is_some(),
+                "host texture created for dim={dim} fmt={fmt} samples={samples}"
+            );
+            res
+        };
+        // 1D (2 slices, 2 mips), 2D (1 slice, 2 mips, UAV), 2D (5 slices), 2D (6 slices, 2 mips),
+        // 2D MSAA 4x (2 slices, RT), 2D R24G8_TYPELESS (DS), 3D (depth 4, 2 mips, UAV).
+        let t1d = make_res(2, 16, 1, 2, 2, 28, 1, 4);
+        let t2d = make_res(3, 16, 16, 1, 2, 28, 1, 4);
+        let t2d_5 = make_res(3, 16, 16, 5, 1, 28, 1, 0);
+        let t2d_6 = make_res(3, 16, 16, 6, 2, 28, 1, 4);
+        let t2d_ms4 = make_res(3, 16, 16, 2, 1, 28, 4, 1);
+        let t2d_ds = make_res(3, 16, 16, 1, 1, 44, 1, 2);
+        let t3d = make_res(4, 16, 16, 4, 2, 28, 1, 4);
+
+        let srv_words = |fmt: u32,
+                         dim: u32,
+                         mapping: u32,
+                         w4: u32,
+                         w5: u32,
+                         w6: u32,
+                         w7: u32,
+                         w8: u32,
+                         w9: u32|
+         -> [u32; 10] { [fmt, dim, mapping, 0, w4, w5, w6, w7, w8, w9] };
+        let uav_words = |fmt: u32, dim: u32, w2: u32, w3: u32, w4: u32, w5: u32| -> [u32; 10] {
+            [fmt, dim, w2, w3, w4, w5, 0, 0, 0, 0]
+        };
+        let def = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
+        // D3D12_SHADER_RESOURCE_VIEW_DESC layout in u32 words (union is 8-byte aligned at word 4):
+        // [0]=Format, [1]=ViewDimension, [2]=Shader4ComponentMapping, [3]=padding,
+        // [4]=MostDetailedMip (or FirstArraySlice for 2DMSArray),
+        // [5]=MipLevels (or ArraySize for 2DMSArray),
+        // [6]=PlaneSlice (2D) / FirstArraySlice (1D&2DArray) / First2DArrayFace (CubeArray) / ResourceMinLODClamp (1D&3D&Cube),
+        // [7]=ResourceMinLODClamp (2D) / ArraySize (1D&2DArray) / NumCubes (CubeArray),
+        // [8]=PlaneSlice (2DArray) / ResourceMinLODClamp (1DArray&CubeArray).
+        let srv_cases: &[(&str, crate::object::This, Option<[u32; 10]>, bool)] = &[
+            // Invalid SRVs (must fall back to null without removing the retail device)
+            (
+                "srv_2d_oob_mip",
+                t2d,
+                Some(srv_words(28, 4, def, 2, 1, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_2d_mip_overflow",
+                t2d,
+                Some(srv_words(28, 4, def, 1, 2, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_2d_mip_zero",
+                t2d,
+                Some(srv_words(28, 4, def, 0, 0, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_2d_oob_plane",
+                t2d,
+                Some(srv_words(28, 4, def, 0, 1, 1, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_2d_mapping_zero",
+                t2d,
+                Some(srv_words(28, 4, 0, 0, 1, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_2d_mapping_bad_comp",
+                t2d,
+                Some(srv_words(28, 4, 0x1006, 0, 1, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_2d_mapping_high_bit",
+                t2d,
+                Some(srv_words(28, 4, 0x3688, 0, 1, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_3d_on_2d",
+                t2d,
+                Some(srv_words(28, 8, def, 0, 1, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_buf_on_2d",
+                t2d,
+                Some(srv_words(28, 1, def, 0, 0, 1, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_unk_on_2d",
+                t2d,
+                Some(srv_words(28, 0, def, 0, 1, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_2darr_oob_slice",
+                t2d,
+                Some(srv_words(28, 5, def, 0, 1, 1, 1, 0, 0)),
+                false,
+            ),
+            (
+                "srv_2darr_zero_slices",
+                t2d,
+                Some(srv_words(28, 5, def, 0, 1, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_cube_too_few_slices",
+                t2d_5,
+                Some(srv_words(28, 9, def, 0, 1, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_cubearr_u32max_short",
+                t2d_6,
+                Some(srv_words(28, 10, def, 0, 1, 1, u32::MAX, 0, 0)),
+                false,
+            ),
+            (
+                "srv_cubearr_oob_cubes",
+                t2d_6,
+                Some(srv_words(28, 10, def, 0, 1, 0, 2, 0, 0)),
+                false,
+            ),
+            (
+                "srv_2dms_on_single_sample",
+                t2d,
+                Some(srv_words(28, 6, def, 0, 0, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_2dmsarr_on_single_sample",
+                t2d,
+                Some(srv_words(28, 7, def, 0, 1, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_2d_on_ms4",
+                t2d_ms4,
+                Some(srv_words(28, 4, def, 0, 1, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_ds_stencil_wrong_plane0",
+                t2d_ds,
+                Some(srv_words(47, 4, def, 0, 1, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_ds_depth_wrong_plane1",
+                t2d_ds,
+                Some(srv_words(46, 4, def, 0, 1, 1, 0, 0, 0)),
+                false,
+            ),
+            (
+                "srv_ds_plane2_oob",
+                t2d_ds,
+                Some(srv_words(47, 4, def, 0, 1, 2, 0, 0, 0)),
+                false,
+            ),
+            // Valid boundary SRVs (must create real host views)
+            ("srv_2d_default", t2d, None, true),
+            (
+                "srv_2d_mip_u32max",
+                t2d,
+                Some(srv_words(28, 4, def, 1, u32::MAX, 0, 0, 0, 0)),
+                true,
+            ),
+            (
+                "srv_2d_custom_mapping",
+                t2d,
+                Some(srv_words(28, 4, 0x1000, 0, 1, 0, 0, 0, 0)),
+                true,
+            ),
+            (
+                "srv_2darr_u32max",
+                t2d_6,
+                Some(srv_words(28, 5, def, 0, 2, 1, u32::MAX, 0, 0)),
+                true,
+            ),
+            (
+                "srv_cube_ok",
+                t2d_6,
+                Some(srv_words(28, 9, def, 0, 2, 0, 0, 0, 0)),
+                true,
+            ),
+            (
+                "srv_cubearr_u32max_ok",
+                t2d_6,
+                Some(srv_words(28, 10, def, 0, 1, 0, u32::MAX, 0, 0)),
+                true,
+            ),
+            (
+                "srv_2dms_on_ms4",
+                t2d_ms4,
+                Some(srv_words(28, 6, def, 0, 0, 0, 0, 0, 0)),
+                true,
+            ),
+            (
+                "srv_2dmsarr_u32max",
+                t2d_ms4,
+                Some(srv_words(28, 7, def, 0, u32::MAX, 0, 0, 0, 0)),
+                true,
+            ),
+            (
+                "srv_ds_depth_plane0",
+                t2d_ds,
+                Some(srv_words(46, 4, def, 0, 1, 0, 0, 0, 0)),
+                true,
+            ),
+            (
+                "srv_ds_stencil_plane1",
+                t2d_ds,
+                Some(srv_words(47, 4, def, 0, 1, 1, 0, 0, 0)),
+                true,
+            ),
+            (
+                "srv_1d_ok",
+                t1d,
+                Some(srv_words(28, 2, def, 0, 2, 0, 0, 0, 0)),
+                true,
+            ),
+            (
+                "srv_1darr_u32max",
+                t1d,
+                Some(srv_words(28, 3, def, 0, 1, 1, u32::MAX, 0, 0)),
+                true,
+            ),
+            (
+                "srv_3d_ok",
+                t3d,
+                Some(srv_words(28, 8, def, 1, u32::MAX, 0, 0, 0, 0)),
+                true,
+            ),
+        ];
+
+        // D3D12_UNORDERED_ACCESS_VIEW_DESC layout in u32 words:
+        // [0]=Format, [1]=ViewDimension,
+        // [2]=MipSlice,
+        // [3]=PlaneSlice (2D) / FirstArraySlice (1D&2DArray) / FirstWSlice (3D),
+        // [4]=ArraySize (1D&2DArray) / WSize (3D),
+        // [5]=PlaneSlice (2DArray).
+        let uav_cases: &[(&str, crate::object::This, Option<[u32; 10]>, bool)] = &[
+            // Invalid UAVs
+            (
+                "uav_2d_oob_mip",
+                t2d,
+                Some(uav_words(28, 4, 2, 0, 0, 0)),
+                false,
+            ),
+            (
+                "uav_2d_oob_plane",
+                t2d,
+                Some(uav_words(28, 4, 0, 1, 0, 0)),
+                false,
+            ),
+            (
+                "uav_3d_on_2d",
+                t2d,
+                Some(uav_words(28, 8, 0, 0, 1, 0)),
+                false,
+            ),
+            (
+                "uav_2dms_on_single_sample",
+                t2d,
+                Some(uav_words(28, 6, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "uav_2dmsarr_on_single_sample",
+                t2d,
+                Some(uav_words(28, 7, 0, 0, 1, 0)),
+                false,
+            ),
+            (
+                "uav_2darr_oob_slice",
+                t2d,
+                Some(uav_words(28, 5, 0, 0, 2, 0)),
+                false,
+            ),
+            (
+                "uav_2darr_zero_slices",
+                t2d,
+                Some(uav_words(28, 5, 0, 0, 0, 0)),
+                false,
+            ),
+            (
+                "uav_3d_mip1_oob_w",
+                t3d,
+                Some(uav_words(28, 8, 1, 0, 3, 0)),
+                false,
+            ),
+            (
+                "uav_3d_mip1_oob_first_w",
+                t3d,
+                Some(uav_words(28, 8, 1, 2, u32::MAX, 0)),
+                false,
+            ),
+            // Valid boundary UAVs
+            ("uav_2d_default", t2d, None, true),
+            ("uav_1d_ok", t1d, Some(uav_words(28, 2, 1, 0, 0, 0)), true),
+            (
+                "uav_1darr_u32max",
+                t1d,
+                Some(uav_words(28, 3, 0, 1, u32::MAX, 0)),
+                true,
+            ),
+            (
+                "uav_2darr_u32max",
+                t2d_6,
+                Some(uav_words(28, 5, 1, 2, u32::MAX, 0)),
+                true,
+            ),
+            (
+                "uav_3d_mip1_exact_w",
+                t3d,
+                Some(uav_words(28, 8, 1, 0, 2, 0)),
+                true,
+            ),
+            (
+                "uav_3d_mip1_u32max_w",
+                t3d,
+                Some(uav_words(28, 8, 1, 1, u32::MAX, 0)),
+                true,
+            ),
+        ];
+
+        let check_view_errors = |name: &str, before: u64| {
+            // SAFETY: plain device query.
+            let reason = unsafe { host.device.GetDeviceRemovedReason() };
+            assert!(reason.is_ok(), "{name} removed the host device: {reason:?}");
+            let Ok(queue) = windows::core::Interface::cast::<ID3D12InfoQueue>(&host.device) else {
+                return;
+            };
+            // SAFETY: each stored message is read into a buffer of its reported size.
+            unsafe {
+                let total = queue.GetNumStoredMessages();
+                let start = before.min(total);
+                for i in start..total {
+                    let mut size = 0;
+                    if queue.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u64; size.div_ceil(8)];
+                    let msg = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    if queue.GetMessage(i, Some(msg), &mut size).is_ok()
+                        && (*msg).Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0
+                    {
+                        let text = String::from_utf8_lossy(std::slice::from_raw_parts(
+                            (*msg).pDescription,
+                            (*msg).DescriptionByteLength,
+                        ));
+                        let text = text.trim_end_matches('\0');
+                        assert!(
+                            !text.contains("CreateShaderResourceView")
+                                && !text.contains("CreateUnorderedAccessView"),
+                            "{name} emitted D3D12 debug error: {text}"
+                        );
+                    }
+                }
+            }
+        };
+        let msg_count = || {
+            windows::core::Interface::cast::<ID3D12InfoQueue>(&host.device).map_or(0, |q| {
+                // SAFETY: plain info-queue count query.
+                unsafe { q.GetNumStoredMessages() }
+            })
+        };
+
+        let mut slot = 0u32;
+        for &(name, res, desc, expect_real) in srv_cases {
+            let before = msg_count();
+            let view = View::Shader(res as usize, desc);
+            heap.make_at(heap.count + slot, &view);
+            check_view_errors(name, before);
+            assert_eq!(heap.kept(heap.count + slot), expect_real, "{name}");
+            slot += 1;
+        }
+        for &(name, res, desc, expect_real) in uav_cases {
+            let before = msg_count();
+            let view = View::Unordered(res as usize, 0, desc);
+            heap.make_at(heap.count + slot, &view);
+            check_view_errors(name, before);
+            assert_eq!(heap.kept(heap.count + slot), expect_real, "{name}");
+            slot += 1;
+        }
+        // Placed texture views route through `make` as well: an invalid mip or
+        // dimension on a placed texture must fall back to null without removing
+        // the device.
+        let va = placed_memory();
+        let placed_res = placed_tex_desc(4, 4, 28, 4);
+        let mut bad_placed_srv = placed_tex_srv_desc(va, 28);
+        bad_placed_srv[4] = 3; // MostDetailedMip = 3 on a 1-mip texture
+        let mut bad_placed_uav = placed_tex_uav_desc(va, 28);
+        bad_placed_uav[2] = 3; // MipSlice = 3 on a 1-mip texture
+        for (name, view) in [
+            (
+                "placed_srv_oob_mip",
+                View::Placed(false, placed_res, bad_placed_srv),
+            ),
+            (
+                "placed_uav_oob_mip",
+                View::Placed(true, placed_res, bad_placed_uav),
+            ),
+        ] {
+            let before = msg_count();
+            heap.make_at(heap.count + slot, &view);
+            check_view_errors(name, before);
+            assert!(!heap.kept(heap.count + slot), "{name}");
+            slot += 1;
+        }
+
+        let release = |o: crate::object::This| {
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(o, 0x10)(o)
+        };
+        for r in [t1d, t2d, t2d_5, t2d_6, t2d_ms4, t2d_ds, t3d] {
+            assert_eq!(release(r), 0);
+        }
+    }
+
     #[test]
     fn concurrent_mirror_and_sync_survive_resource_release() {
         use std::sync::{Arc, Barrier};
