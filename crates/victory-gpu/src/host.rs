@@ -2562,6 +2562,11 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+/// [`read_into`] a buffer not yet written: on true every byte of `dst` is.
+pub(crate) fn read_into_uninit(src: *const u8, dst: &mut [std::mem::MaybeUninit<u8>]) -> bool {
+    read(src, dst.as_mut_ptr().cast(), dst.len())
+}
+
 /// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
 /// page is not readable or a destination page not writable (the bytes
 /// before that page may have been copied).

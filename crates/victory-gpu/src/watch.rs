@@ -980,6 +980,19 @@ pub(crate) mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// The kernel read `Changed::save` fills an unzeroed buffer with fails
+    /// rather than faulting on memory it cannot read, so no unwritten
+    /// bytes are kept; a read that succeeds writes them all.
+    #[test]
+    fn a_read_into_an_unwritten_buffer_fails_on_an_unreadable_source() {
+        let mut dst = Box::<[u8]>::new_uninit_slice(64);
+        assert!(!crate::host::read_into_uninit(std::ptr::null(), &mut dst));
+        let src = [7u8; 64];
+        assert!(crate::host::read_into_uninit(src.as_ptr(), &mut dst));
+        // SAFETY: the read succeeded, so it wrote every byte.
+        assert_eq!(&*unsafe { dst.assume_init() }, &src[..]);
+    }
+
     /// Everything is changed at first; after taking, only what is written
     /// (by faults, or reported) is, and every tracker of a page sees it.
     #[test]
