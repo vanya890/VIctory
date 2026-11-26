@@ -4894,7 +4894,7 @@ mod present_plane_tests {
                         Height: 32,
                         DepthOrArraySize: 1,
                         MipLevels: 1,
-                        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        Format: DXGI_FORMAT_R16G16B16A16_UNORM,
                         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                         Flags: D3D12_RESOURCE_FLAG_NONE,
                         ..Default::default()
