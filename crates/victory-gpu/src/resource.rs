@@ -292,13 +292,14 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    if format == own {
-        return None;
-    }
     let recorded = resource(this)
         .rtv_format
         .load(std::sync::atomic::Ordering::Relaxed);
-    Some(if recorded != 0 { recorded } else { own })
+    if recorded != 0 {
+        Some(recorded)
+    } else {
+        (format != own).then_some(own)
+    }
 }
 
 /// Records the actual typed RTV format at OMSetRenderTargets time. The
