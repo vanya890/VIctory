@@ -1070,6 +1070,38 @@ pub(crate) mod tests {
         node.pCommandListDebugNameA = longer.as_ptr().cast();
         assert!(!list.is_node(&node), "a number that only starts with ours is no match");
     }
+    #[test]
+    fn keep_deduplicates_repeated_objects_until_reset() {
+        let host = super::host();
+        if crate::switch::on("VICTORY_D3D12_WARP") {
+            assert!(
+                host.is_some(),
+                "WARP validation requested but no D3D12 host was created"
+            );
+        }
+        let Some(host) = host else { return };
+        let list = host.new_list().unwrap();
+        let (a, _) = host.upload_buffer(256).unwrap();
+        let (b, _) = host.upload_buffer(256).unwrap();
+        for _ in 0..1000 {
+            list.keep(&a);
+        }
+        assert_eq!(list.deferred().kept.len(), 1);
+        assert_eq!(list.deferred().kept_ptrs.len(), 1);
+        list.keep(&b);
+        assert_eq!(list.deferred().kept.len(), 2);
+        assert_eq!(list.deferred().kept_ptrs.len(), 2);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert!(list.deferred().kept.is_empty());
+        assert!(list.deferred().kept_ptrs.is_empty());
+        list.keep(&a);
+        assert_eq!(list.deferred().kept.len(), 1);
+        assert_eq!(list.deferred().kept_ptrs.len(), 1);
+        list.close();
+    }
+
 }
 
 /// A host command list and its allocator, always used together.
@@ -5692,33 +5724,4 @@ mod removal_cause_tests {
             Some("ID3D12Device::RemoveDevice: possibly at fault")
         );
     }
-    #[test]
-    fn keep_deduplicates_repeated_objects_until_reset() {
-        let host = host();
-        if crate::switch::on("VICTORY_D3D12_WARP") {
-            assert!(host.is_some(), "WARP validation requested but no D3D12 host was created");
-        }
-        let Some(host) = host else { return };
-        let list = host.new_list().unwrap();
-        let (a, _) = host.upload_buffer(256).unwrap();
-        let (b, _) = host.upload_buffer(256).unwrap();
-        for _ in 0..1000 {
-            list.keep(&a);
-        }
-        assert_eq!(list.deferred().kept.len(), 1);
-        assert_eq!(list.deferred().kept_ptrs.len(), 1);
-        list.keep(&b);
-        assert_eq!(list.deferred().kept.len(), 2);
-        assert_eq!(list.deferred().kept_ptrs.len(), 2);
-        list.close();
-        host.execute(&[&list]);
-        list.reset();
-        assert!(list.deferred().kept.is_empty());
-        assert!(list.deferred().kept_ptrs.is_empty());
-        list.keep(&a);
-        assert_eq!(list.deferred().kept.len(), 1);
-        assert_eq!(list.deferred().kept_ptrs.len(), 1);
-        list.close();
-    }
-
 }
