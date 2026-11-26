@@ -813,7 +813,7 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
-    /// Changes whenever the list's tracked texture-state map changes.
+    /// Changes whenever tracked texture state or depth-twin routing can affect target ensures.
     states_generation: std::sync::atomic::AtomicU64,
     /// Depth textures with a writable twin the list uses (`crate::twin`),
     /// by host copy: the side its first use needs and the side it leaves
