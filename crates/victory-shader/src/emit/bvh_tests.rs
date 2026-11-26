@@ -852,6 +852,7 @@ fn intersections_on_nodes_in_title_memory_equal_the_reference() {
 /// must select a separate mapped page in the root-derived title-memory path.
 #[test]
 fn root_derived_bvh_addresses_preserve_low_word_carries_and_node_hi() {
-    run_cases_at(false, 4, true, TITLE - 0x1_0000_0000, 0x2000_0000, 0);
-    run_cases_at(true, 4, true, TITLE, 0, 1);
+    // `memory = false` selects the Source::Built root-descriptor path.
+    run_cases_at(false, 4, false, TITLE - 0x1_0000_0000, 0x2000_0000, 0);
+    run_cases_at(true, 4, false, TITLE, 0, 1);
 }
