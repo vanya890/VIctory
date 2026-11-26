@@ -450,6 +450,10 @@ impl State {
                 resource: record.resource as usize,
                 desc: record.desc(),
             };
+            crate::resource::record_rtv_view_format(
+                record.resource,
+                target.desc.as_ref().map(|desc| desc.Format.0 as u32),
+            );
             snapshot.push(target);
             resolved.push((target, texture));
         }
