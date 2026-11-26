@@ -212,7 +212,12 @@ impl<S, F> Held<S, F> {
                             signal(fence, value);
                             reads.borrow_mut().clear();
                         },
-                        Some(Item::FenceWait(fence, _)) => drop(fence),
+                        Some(Item::FenceWait(fence, _)) => {
+                            drop(fence);
+                            // A completed fence is a synchronization boundary: work
+                            // signaled outside this pump may have changed a cached wait word.
+                            reads.borrow_mut().clear();
+                        }
                         None => {}
                     }
                 }
@@ -405,6 +410,52 @@ mod tests {
         );
     }
 
+    /// A completed external fence may publish memory writes while this pump
+    /// still holds a cached pre-fence value for the same wait word.
+    #[test]
+    fn a_satisfied_fence_wait_invalidates_the_wait_word_cache() {
+        use std::cell::Cell;
+
+        let memory = RefCell::new(HashMap::from([(0x100, 0)]));
+        let reads = Cell::new(0);
+        let read = |address: u64, _bytes: u8| {
+            reads.set(reads.get() + 1);
+            Some(*memory.borrow().get(&address).unwrap_or(&0))
+        };
+        let fence = |value: &usize| {
+            if *value == 5 {
+                // Model work completed before the fence was signaled.
+                memory.borrow_mut().insert(0x100, 1);
+                5
+            } else {
+                0
+            }
+        };
+        let mut ran = Vec::new();
+        let mut run = |queue: usize, segments: Vec<&'static str>| {
+            ran.push((queue, segments));
+        };
+        let mut signal = |_: usize, _: u64| {};
+        let mut held = Held::default();
+        // Queue 1 seeds the cache with X=0 and blocks.
+        held.push(1, Item::Segment("queue-a", vec![ge(0x100, 1)]));
+        // Queue 2 observes the completed fence, which makes X=1 visible.
+        held.push(2, Item::FenceWait(5, 5));
+        held.push(2, Item::Segment("after-fence", vec![ge(0x100, 1)]));
+
+        let pumped = held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        });
+        drop(run);
+
+        assert_eq!(ran, vec![(2, vec!["after-fence"]), (1, vec!["queue-a"])]);
+        assert_eq!(reads.get(), 3, "the post-fence read must not reuse X=0");
+        assert!(!pumped.blocked);
+        assert!(held.is_empty());
+    }
     #[test]
     fn a_queue_unblocked_by_later_work_does_not_remain_blocked() {
         let fake = RefCell::new(Fake::default());
