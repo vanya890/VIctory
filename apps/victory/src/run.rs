@@ -82,7 +82,7 @@ pub fn run(
     // Mapped: the patched bytes (the exe's size, 114 MB) are not needed.
     drop(prepared);
     victory_hle::runtime::set_main_image(image.base());
-    victory_hle::runtime::set_image_path(image.base(), exe);
+    victory_hle::runtime::set_image_path(image.base(), &exe);
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
