@@ -4810,7 +4810,7 @@ mod present_plane_tests {
             D3D12_RESOURCE_FLAG_NONE,
             D3D12_RESOURCE_STATE_COPY_DEST,
         );
-        let row_pitch = 32 * 4;
+        let row_pitch = 256;
         let (upload, data) = host
             .upload_buffer((row_pitch * 32) as u64)
             .expect("upload buffer for typed shader resource");
