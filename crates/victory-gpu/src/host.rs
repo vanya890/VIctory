@@ -207,8 +207,17 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
+        // Strictly opt-in: long title workloads can exceed the normal GPU
+        // watchdog window. This disables timeout only for VIctory's direct
+        // queue; a real GPU hang can leave the display unresponsive much longer.
+        let no_tdr = crate::switch::on("VICTORY_NO_TDR");
         let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+            Flags: if no_tdr {
+                D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT
+            } else {
+                D3D12_COMMAND_QUEUE_FLAG_NONE
+            },
             ..Default::default()
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
