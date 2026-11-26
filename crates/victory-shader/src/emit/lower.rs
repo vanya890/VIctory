@@ -4126,21 +4126,58 @@ impl<'a> Lower<'a> {
         let kind = self.used_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
-        let offset = &((*offset as u32).wrapping_add(base) as i32);
-        let mut addr = self.s.m.i32(*offset as u32);
+        // RDNA2 truncates the immediate and SGPR byte offset independently.
+        let imm_offset = (*offset as u32) & !3;
+        let total_offset = imm_offset.wrapping_add(base);
+        let mut addr = self.s.m.i32(total_offset);
         if let Some(x) = extra {
             addr = self.s.m.bin(c, Bin::Add, addr, x);
         }
-        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
-            let so = self.operand(inst, soffset)?;
-            addr = self.s.m.bin(c, Bin::Add, addr, so);
-        }
-        if matches!(src, Source::Built { address, .. } if address.param == CODE) {
-            // A descriptor built around a table in the code.
+        let so = if matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+            None
+        } else {
+            let value = self.operand(inst, soffset)?;
+            let mask = self.s.m.i32(!3u32);
+            let value = self.s.m.bin(c, Bin::And, value, mask);
+            addr = self.s.m.bin(c, Bin::Add, addr, value);
+            Some(value)
+        };
+        // A dynamic PC-relative CODE term contributes to the same bounds.
+        let dynamic = match (extra, so) {
+            (Some(x), Some(y)) => {
+                let sum = self.s.m.bin(c, Bin::Add, x, y);
+                Some((sum, Some(self.s.m.cmp(c, pred::IULT, sum, x))))
+            }
+            (Some(x), None) => Some((x, None)),
+            (None, Some(y)) => Some((y, None)),
+            (None, None) => None,
+        };
+        if let Source::Built { address, bits, words } = src
+            && address.param == CODE
+        {
+            // Keep NUM_RECORDS per dword, including dynamic offsets.
+            let limit = u64::from(words[0]) * u64::from((bits >> 16) & 0x3FFF).max(1);
+            let end = u64::from(imm_offset) + 4;
+            let zero = self.s.m.i32(0);
             for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let x = self.code_dword(a)?;
+                let fixed = end + 4 * u64::from(k);
+                let x = if fixed > limit {
+                    zero
+                } else {
+                    let off = self.s.m.i32(4 * k);
+                    let a = self.s.m.bin(c, Bin::Add, addr, off);
+                    let x = self.code_dword(a)?;
+                    if let Some((dynamic, overflow)) = dynamic {
+                        let rest = self.s.m.i32((limit - fixed).min(u64::from(u32::MAX)) as u32);
+                        let mut out = self.s.m.cmp(c, pred::IUGT, dynamic, rest);
+                        if let Some(overflow) = overflow {
+                            out = self.s.m.bin(c, Bin::Or, out, overflow);
+                        }
+                        self.s.m.select(c, out, zero, x)
+                    } else {
+                        x
+                    }
+                };
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
