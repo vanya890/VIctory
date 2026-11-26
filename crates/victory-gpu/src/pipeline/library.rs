@@ -301,8 +301,47 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveKind {
+    None,
+    EarlyOnly,
+    Full,
+}
+
+fn save_kind(added: u64, prebuilt_changed: bool, used_changed: bool) -> SaveKind {
+    if added > 0 || prebuilt_changed {
+        SaveKind::Full
+    } else if used_changed {
+        SaveKind::EarlyOnly
+    } else {
+        SaveKind::None
+    }
+}
+
+fn write_early_list(dir: &std::path::Path, used: &[String]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes())
+}
+
+fn write_full_save(
+    dir: &std::path::Path,
+    blob: &[u8],
+    prebuilt: Option<&str>,
+    used: &[String],
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    write_atomically(&dir.join(LIBRARY_FILE), blob)?;
+    // Write the matching prebuilt manifest right after `host-pipelines.bin`
+    // so a transient failure on `early-pipelines.txt` never leaves the binary
+    // paired with a stale manifest tag after an `EarlyOnly` retry.
+    if let Some(list) = prebuilt {
+        write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes())?;
+    }
+    write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes())
+}
+
+/// Writes the library and/or the early list if pipelines were added or first
+/// used since the last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
@@ -314,43 +353,57 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    let (blob, prebuilt) = {
+    let (need_early, library_data) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
-            return;
-        }
-        // SAFETY: a plain size query on a live library.
-        let size = unsafe { l.library.GetSerializedSize() };
-        let Some(mut bytes) = zeroed(size) else {
-            // Left for a later save: the pipelines stay counted as added.
-            tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
-            return;
-        };
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe { l.library.Serialize(&mut bytes) }.map(|()| bytes);
-        match bytes {
-            Ok(bytes) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
-                // Kept beside the bytes it holds for (also when a run adds
-                // pipelines).
-                let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                return;
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        match save_kind(l.added, l.prebuilt_changed, used_changed) {
+            SaveKind::None => return,
+            SaveKind::EarlyOnly => (true, None),
+            SaveKind::Full => {
+                // SAFETY: a plain size query on a live library.
+                let size = unsafe { l.library.GetSerializedSize() };
+                if let Some(mut bytes) = zeroed(size) {
+                    // SAFETY: a buffer of the size the library asks for.
+                    match unsafe { l.library.Serialize(&mut bytes) } {
+                        Ok(()) => {
+                            l.added = 0;
+                            l.prebuilt_changed = false;
+                            // Kept beside the bytes it holds for (also when a run adds
+                            // pipelines).
+                            let prebuilt =
+                                (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
+                            (used_changed, Some((bytes, prebuilt)))
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "host pipeline library not serialised");
+                            (used_changed, None)
+                        }
+                    }
+                } else {
+                    // Left for a later save: the pipelines stay counted as added.
+                    tracing::warn!(
+                        bytes = size,
+                        "no memory to serialise the host pipeline library; saved later"
+                    );
+                    (used_changed, None)
+                }
             }
         }
     };
     let used = used().as_ref().map(Used::list).unwrap_or_default();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
-        .and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
-            None => Ok(()),
-        });
+    let Some((blob, prebuilt)) = library_data else {
+        if need_early {
+            match write_early_list(dir, &used) {
+                Ok(()) => tracing::info!(early = used.len(), "early pipeline list saved"),
+                Err(e) => {
+                    USED_CHANGED.store(true, Ordering::Relaxed);
+                    tracing::warn!(error = %e, "early pipeline list not saved");
+                }
+            }
+        }
+        return;
+    };
+    let written = write_full_save(dir, &blob, prebuilt.as_deref(), &used);
     let (created, distinct) = created();
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
@@ -366,7 +419,12 @@ pub(crate) fn save(now: bool) {
             shaders_translated,
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            if need_early {
+                USED_CHANGED.store(true, Ordering::Relaxed);
+            }
+            tracing::warn!(error = %e, "host pipeline library not saved");
+        }
     }
 }
 
@@ -838,5 +896,54 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+
+    #[test]
+    fn save_kind_skips_library_serialisation_when_only_early_list_changed() {
+        assert_eq!(save_kind(0, false, false), SaveKind::None);
+        assert_eq!(save_kind(0, false, true), SaveKind::EarlyOnly);
+        assert_eq!(save_kind(1, false, false), SaveKind::Full);
+        assert_eq!(save_kind(1, false, true), SaveKind::Full);
+        assert_eq!(save_kind(0, true, false), SaveKind::Full);
+        assert_eq!(save_kind(0, true, true), SaveKind::Full);
+    }
+
+    #[test]
+    fn write_early_list_updates_only_early_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let used = vec!["pipe-a".to_owned(), "pipe-b".to_owned()];
+        write_early_list(dir.path(), &used).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(EARLY_FILE)).unwrap(),
+            "pipe-a\npipe-b"
+        );
+        assert!(!dir.path().join(LIBRARY_FILE).exists());
+        assert!(!dir.path().join(PREBUILT_FILE).exists());
+    }
+
+    #[test]
+    fn write_full_save_updates_prebuilt_manifest_before_early_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let used = vec!["pipe-a".to_owned()];
+        // Block replacing `early-pipelines.txt` so the full save fails on the
+        // early-list write after writing the new binary.
+        std::fs::create_dir(dir.path().join(EARLY_FILE)).unwrap();
+        let err = write_full_save(dir.path(), b"new-blob", Some("tag-new\npipe-a\n"), &used);
+        assert!(err.is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap(),
+            b"new-blob"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(PREBUILT_FILE)).unwrap(),
+            "tag-new\npipe-a\n"
+        );
+        // Once the early-list blocker clears, an early-only retry finishes cleanly.
+        std::fs::remove_dir(dir.path().join(EARLY_FILE)).unwrap();
+        write_early_list(dir.path(), &used).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(EARLY_FILE)).unwrap(),
+            "pipe-a"
+        );
     }
 }
