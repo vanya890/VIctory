@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY, E_POINTER};
+use windows::Win32::Foundation::{E_OUTOFMEMORY, E_POINTER};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
 
@@ -327,7 +327,7 @@ mod tests {
             assert!(heaps
                 .allocate(ALIGN, ALIGN, || start, || {
                     calls.set(calls.get() + 1);
-                    Err(windows::core::Error::from_hresult(E_INVALIDARG))
+                    Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG))
                 })
                 .is_none());
         }
@@ -341,8 +341,7 @@ mod tests {
             return; // no host GPU here
         };
         let start = Instant::now();
-        let mut heaps = Heaps::default();
-        heaps.retry_growth_at = Some(start);
+        let mut heaps = Heaps { retry_growth_at: Some(start), ..Heaps::default() };
         assert!(heaps
             .allocate(ALIGN, ALIGN, || start + GROWTH_BACKOFF, || create_heap(&host.device))
             .is_some());
