@@ -4649,4 +4649,142 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(crate::object::slot::<Release>(obj, 0x10)(obj), 0);
         }
     }
+ 
+    /// Cached flags must preserve the state legality and upload policy of
+    /// the original D3D12 resource description.
+    #[test]
+    fn a_host_texture_keeps_its_resource_flags() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let kinds = [
+            (D3D12_RESOURCE_FLAG_NONE, DXGI_FORMAT_R8G8B8A8_UNORM),
+            (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, DXGI_FORMAT_R8G8B8A8_UNORM),
+            (D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, DXGI_FORMAT_R8G8B8A8_UNORM),
+            (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, DXGI_FORMAT_D32_FLOAT),
+            (
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+                    | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+                DXGI_FORMAT_D32_FLOAT,
+            ),
+        ];
+        let states: Vec<u32> = (0..24)
+            .map(|b| 1u32 << b)
+            .chain([0, 0xc0, 0x10 | 0x40, 0x8 | 0xc0])
+            .collect();
+        for (flags, format) in kinds {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: flags,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a valid description and output.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+            }
+            let texture = texture.unwrap();
+            let copy = crate::resource::HostTexture::new(texture.clone(), 0, Vec::new());
+            assert_eq!(copy.flags, flags.0 as u32);
+            assert_eq!(
+                copy.title_written(),
+                crate::texture::title_written(&texture),
+                "flags {:#x}",
+                flags.0
+            );
+            for &state in &states {
+                assert_eq!(
+                    copy.legal(state),
+                    crate::host::legal_state(&texture, state),
+                    "flags {:#x}, state {state:#x}",
+                    flags.0
+                );
+            }
+        }
+    }
+
+    /// A draw read must use the same pinned host copy for upload and state.
+    #[test]
+    fn a_texture_read_reuses_its_pinned_host_copy() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        const COPY_SOURCE: u32 = 0x800;
+        let address = title_memory(2 << 16);
+        let textures: Vec<This> = (0..2)
+            .map(|k| {
+                texture_at_address(
+                    address + (k << 16),
+                    &texture_words(64, 64, 28, 0x100, 0),
+                )
+            })
+            .collect();
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        let copies: Vec<_> = textures
+            .iter()
+            .map(|&t| crate::resource::host_copy(t).unwrap())
+            .collect();
+        let raw = |k: usize| copies[k].texture.as_raw() as usize;
+        copies[1].host_written.store(true, Ordering::Relaxed);
+        let list = host.new_list().unwrap();
+        let _ = crate::host::tests::issued();
+        let read = |k: usize| {
+            readable(
+                &list,
+                &used(ResourceType::Srv),
+                &View::Shader(textures[k] as usize, Some(desc)),
+                true,
+            )
+        };
+        read(0);
+        crate::list::ensure_state(&list, textures[0], COPY_SOURCE);
+        read(0);
+        read(0);
+        assert_eq!(
+            crate::host::tests::issued(),
+            [
+                (raw(0), SHADER_RESOURCE, COPY_SOURCE),
+                (raw(0), COPY_SOURCE, SHADER_RESOURCE)
+            ],
+            "the first use is the prelude's; then each change once"
+        );
+        assert!(
+            !list.first_use(raw(0)),
+            "the title-written texture's upload is recorded in the list"
+        );
+        read(1);
+        assert!(
+            list.first_use(raw(1)),
+            "a texture the host wrote is not uploaded"
+        );
+        list.close();
+        type Release = extern "system" fn(This) -> u32;
+        for t in textures {
+            let _ = crate::object::slot::<Release>(t, 0x10)(t);
+        }
+    }
 }
