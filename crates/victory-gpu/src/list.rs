@@ -1698,6 +1698,7 @@ mod state {
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
         // SAFETY: the title passes four floats or null.
         with_state(this, |list, s| {
+            // SAFETY: the title callback contract supplies four readable floats or null.
             s.blend_factor(list, unsafe { factor.as_ref() })
         });
     }
@@ -2373,6 +2374,7 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(
+            // SAFETY: list is the live list created by this test and not released yet.
             unsafe { &(*list.cast::<List>()).uploads }
                 .lock()
                 .unwrap()
@@ -2833,6 +2835,7 @@ mod tests {
         };
         // SAFETY: live device and initialized format-info struct.
         assert!(
+            // SAFETY: host owns a live D3D12 device; info is initialized and correctly sized.
             unsafe {
                 host.device.CheckFeatureSupport(
                     D3D12_FEATURE_FORMAT_INFO,
