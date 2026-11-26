@@ -272,7 +272,7 @@ fn gathers_at_a_level_match_the_hardware() {
                 "{label}: lane {lane}, offset"
             );
             // WARP's own gather truncates where the hardware rounds.
-            if lane < 16 && !warp {
+            if lane < 16 && !host.is_warp() {
                 assert_eq!(got(2), got(0), "{label}: lane {lane} against its gather");
             }
         }
