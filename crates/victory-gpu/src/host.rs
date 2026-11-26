@@ -3540,14 +3540,14 @@ impl Host {
                 ));
                 list.ResourceBarrier(&before);
                 let dst = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(&back),
+                    pResource: back.as_raw(),
                     Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                         SubresourceIndex: 0,
                     },
                 };
                 let src = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(texture),
+                    pResource: texture.as_raw(),
                     Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                         SubresourceIndex: 0,
