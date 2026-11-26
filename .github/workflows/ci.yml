@@ -35,5 +35,7 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      - name: Diagnose present conversion test
+        run: cargo test -p victory-gpu --lib --all-features present_conversion_requires_typed_view_and_shader_resource_access --locked -- --nocapture --test-threads=1
       - name: Tests, all features
         run: cargo test --workspace --all-features --locked
