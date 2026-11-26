@@ -921,13 +921,9 @@ mod tests {
 
     #[test]
     fn wave64_lds_only_group_fitting_host_wave32_does_not_require_wave64() {
-        let words = [
-            0x7D84_0480,
-            0xBE84_3C6A,
-            0xBF86_0001,
-            0xBF8A_0000,
-            S_ENDPGM,
-        ];
+        // An unconditional group barrier is sufficient here: no lane-index
+        // or mask-as-data operation requires the console's 64-lane mapping.
+        let words = [0xBF8A_0000, S_ENDPGM];
         let lowered = lower_wave_mode(
             &words,
             WaveMode::with_range(32, 32, false, GroupSync::Auto),
@@ -936,18 +932,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lowered.wave_size, None);
-        assert_eq!(lowered.barrier_modes, [8]);
+        assert_eq!(lowered.barrier_modes, [1 | 8]);
     }
 
     #[test]
     fn wave64_lds_only_group_spanning_host_wave32_requires_wave64() {
-        let words = [
-            0x7D84_0480,
-            0xBE84_3C6A,
-            0xBF86_0001,
-            0xBF8A_0000,
-            S_ENDPGM,
-        ];
+        let words = [0xBF8A_0000, S_ENDPGM];
         assert!(matches!(
             lower_wave_mode(
                 &words,
