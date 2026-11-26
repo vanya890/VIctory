@@ -670,12 +670,6 @@ impl Layout {
             runs.list().iter().map(|r| r.0).min()?,
             runs.list().iter().map(|r| r.0 + r.2).max()?,
         );
-        // Runs::copy addresses the row from its base; if this layout's
-        // first run does not start there, fall back to whole-subresource
-        // refresh rather than reading an incomplete scratch span.
-        if lo != 0 {
-            return None;
-        }
         let start = |z: u32, y: u32| {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
@@ -702,7 +696,10 @@ impl Layout {
         for z in 0..m.depth {
             for y in y0..y1 {
                 let at = start(z, y);
-                (a, b) = (a.min(at + lo), b.max(at + hi));
+                // Runs::copy addresses each row from its base. Include the
+                // prefix before the first run in scratch, even if the changed
+                // range overlaps only a later run.
+                (a, b) = (a.min(at), b.max(at + hi));
             }
         }
         Some((y0..y1, a..b))
