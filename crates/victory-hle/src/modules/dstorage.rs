@@ -1070,10 +1070,25 @@ fn into_destination(
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
+    into_destination_with(request, len, |at, len| {
+        victory_gpu::kernel_will_write(at, len)
+    }, fill)
+}
+
+/// The raw-destination write lease must enclose the entire fill operation:
+/// DirectStorage's ERROR_INVALID_USER_BUFFER fallback reads into host staging
+/// memory and copies each chunk before the request can complete.
+fn into_destination_with<G>(
+    request: &Request,
+    len: usize,
+    acquire_write: impl FnOnce(usize, usize) -> G,
+    fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
+) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        let _writing = victory_gpu::kernel_will_write(request.destination as usize, len);
+        // GPU side's guard on title buffers; open them first and keep the
+        // lease alive until every direct or staged copy has completed.
+        let _writing = acquire_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -1186,6 +1201,70 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn raw_staged_read_keeps_destination_lease_until_all_chunks_are_copied() {
+        use std::sync::atomic::AtomicBool;
+
+        struct Lease<'a>(&'a AtomicBool);
+        impl Drop for Lease<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+
+        let expected = b"partial then staged chunks";
+        let mut destination = vec![0; expected.len()];
+        let request = Request {
+            options: 0,
+            destination: destination.as_mut_ptr().cast(),
+            page_offset: 0,
+            destination_size: expected.len() as u32,
+            source: std::ptr::null(),
+            offset: 41,
+            source_size: expected.len() as u32,
+            intermediate_size: 0,
+            tag: 0,
+            name: c"lease-test".as_ptr(),
+        };
+        let lease_active = AtomicBool::new(false);
+        let mut reads = 0;
+
+        into_destination_with(
+            &request,
+            expected.len(),
+            |at, len| {
+                assert_eq!(at, destination.as_ptr() as usize);
+                assert_eq!(len, expected.len());
+                assert!(!lease_active.swap(true, Ordering::SeqCst));
+                Lease(&lease_active)
+            },
+            |out| {
+                read_file_into(out, 41, true, |staging, at| {
+                    assert!(lease_active.load(Ordering::SeqCst), "lease dropped during staged read");
+                    reads += 1;
+                    match reads {
+                        1 => Err(std::io::Error::from_raw_os_error(
+                            ERROR_INVALID_USER_BUFFER as i32,
+                        )),
+                        _ => {
+                            let start = (at - 41) as usize;
+                            let n = staging.len().min(5);
+                            staging[..n].copy_from_slice(&expected[start..start + n]);
+                            Ok(n)
+                        }
+                    }
+                })?;
+                assert!(lease_active.load(Ordering::SeqCst), "lease must cover every staged copy");
+                assert_eq!(out, expected);
+                Ok(out.len())
+            },
+        )
+        .unwrap();
+
+        assert!(!lease_active.load(Ordering::SeqCst), "lease drops after fill completes");
+        assert!(reads > 2, "exercise multiple staged chunks");
+    }
 
     #[test]
     fn raw_read_keeps_direct_reads_on_the_original_buffer() {
