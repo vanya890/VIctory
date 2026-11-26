@@ -191,9 +191,12 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 
 The on/off switches below (`...=1`) are off when unset or set to `0`.
 
+On Windows, VIctory opts the whole process out of execution-speed (EcoQoS) and timer-resolution throttling by default. Set `VICTORY_EFFICIENCY_MODE=1` to opt back into both; this may reduce power use but can also reduce CPU performance and affect frame pacing. The default opt-out can increase power use, heat and fan noise on portable systems.
+
 | Variable | Effect |
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
+| `VICTORY_EFFICIENCY_MODE=1` | opts back into process-wide Windows execution-speed/EcoQoS and timer-resolution throttling (off by default) |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
