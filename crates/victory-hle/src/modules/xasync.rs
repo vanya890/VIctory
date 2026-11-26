@@ -822,9 +822,15 @@ extern "system" fn complete(context: *mut c_void, _canceled: bool) {
 }
 
 #[cfg(test)]
-static FINALIZE_STATUS_HOOK: LazyLock<
-    Mutex<Option<(usize, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
-> = LazyLock::new(|| Mutex::new(None));
+struct FinalizeStatusHook {
+    block: usize,
+    entered: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+static FINALIZE_STATUS_HOOK: LazyLock<Mutex<Option<FinalizeStatusHook>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 fn finalize(call: &Arc<Call>, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
     // Read before publishing: once the status is set, the title may free
@@ -852,8 +858,8 @@ fn finalize(call: &Arc<Call>, block: *mut AsyncBlock, result: HRESULT, required_
         {
             let hook = lock(&FINALIZE_STATUS_HOOK)
                 .as_ref()
-                .filter(|(address, _, _)| *address == block as usize)
-                .map(|(_, entered, release)| (entered.clone(), release.clone()));
+                .filter(|hook| hook.block == block as usize)
+                .map(|hook| (hook.entered.clone(), hook.release.clone()));
             if let Some((entered, release)) = hook {
                 entered.wait();
                 release.wait();
@@ -2508,7 +2514,11 @@ mod tests {
         let address = (&raw mut block) as usize;
         let entered = Arc::new(std::sync::Barrier::new(2));
         let release = Arc::new(std::sync::Barrier::new(2));
-        *lock(&FINALIZE_STATUS_HOOK) = Some((address, entered.clone(), release.clone()));
+        *lock(&FINALIZE_STATUS_HOOK) = Some(FinalizeStatusHook {
+            block: address,
+            entered: entered.clone(),
+            release: release.clone(),
+        });
 
         let first_begin = std::thread::spawn(move || {
             XAsyncBegin(
