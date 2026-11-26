@@ -830,6 +830,10 @@ struct Resource {
     /// The most recently bound typed RTV view, used when presenting typeless resources.
     #[cfg(windows)]
     rtv_format: std::sync::atomic::AtomicU32,
+    /// Generation of the memory bucket when alias lookup last found no GPU writer.
+    /// A matching generation makes another TEXTURES_AT map lookup unnecessary.
+    #[cfg(windows)]
+    no_writer_seen: std::sync::atomic::AtomicU64,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1842,6 +1846,8 @@ fn hand_out_resource(
         made_with: (state, (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() })),
         #[cfg(windows)]
         rtv_format: std::sync::atomic::AtomicU32::new(0),
+        #[cfg(windows)]
+        no_writer_seen: std::sync::atomic::AtomicU64::new(0),
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -1849,10 +1855,10 @@ fn hand_out_resource(
         crate::shadow::register(at, resource.data() as u64, desc.width);
     } else if host_desc(&desc).is_some() {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        TEXTURES_AT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(resource.data() as u64, at);
+        let memory = resource.data() as u64;
+        let mut textures = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+        textures.insert(memory, at);
+        textures_at_changed(memory);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -1879,16 +1885,20 @@ impl LiveTextures {
             .insert(resource);
     }
 
-    fn remove(&mut self, memory: u64, resource: usize) {
-        if let Some(live) = self.live.as_mut() {
-            live.remove(&resource);
-        }
+    fn remove(&mut self, memory: u64, resource: usize) -> bool {
+        let mut removed = self
+            .live
+            .as_mut()
+            .is_some_and(|live| live.remove(&resource));
         if let Some(list) = self.by_memory.get_mut(&memory) {
+            let previous_len = list.len();
             list.retain(|&r| r != resource);
+            removed |= list.len() != previous_len;
             if list.is_empty() {
                 self.by_memory.remove(&memory);
             }
         }
+        removed
     }
 
     fn contains(&self, resource: usize) -> bool {
@@ -1907,6 +1917,26 @@ impl LiveTextures {
 /// [`alias_source`] finds the one the GPU writes.
 #[cfg(windows)]
 static TEXTURES_AT: std::sync::Mutex<LiveTextures> = std::sync::Mutex::new(LiveTextures::new());
+
+/// Generation counters for negative alias-source lookups. A change to any
+/// texture in the same page-hash bucket invalidates the cached "no writer"
+/// answer. Collisions only cause an extra map lookup, never a false hit.
+#[cfg(windows)]
+static TEXTURES_AT_CHANGES: [std::sync::atomic::AtomicU64; 1024] =
+    [const { std::sync::atomic::AtomicU64::new(1) }; 1024];
+
+#[cfg(windows)]
+fn textures_at_changes(memory: u64) -> &'static std::sync::atomic::AtomicU64 {
+    // Title texture memory is page-aligned; spread page numbers over 1024 buckets.
+    let bucket = (memory >> 12).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - 10);
+    &TEXTURES_AT_CHANGES[bucket as usize]
+}
+
+/// Called while TEXTURES_AT is locked, after inserting or removing a resource.
+#[cfg(windows)]
+fn textures_at_changed(memory: u64) {
+    textures_at_changes(memory).fetch_add(1, std::sync::atomic::Ordering::Release);
+}
 
 /// For a texture made for a placed view (`texture_at`): the host copy of a
 /// title texture the GPU writes (render target, depth or unordered access)
@@ -1928,8 +1958,27 @@ pub(crate) fn alias_source(placed: This) -> Option<std::sync::Arc<HostTexture>> 
         return None;
     }
     let b = resource(placed);
-    let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+    // Keep the existing host-copy/liveness check before taking the fast path.
     let b_copy = made(b)?;
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    let changes = textures_at_changes(b.data() as u64);
+    if b.no_writer_seen.load(Relaxed) == changes.load(Acquire) {
+        return None;
+    }
+
+    let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let others = map.by_memory.get(&(b.data() as u64));
+    let has_writer = others.is_some_and(|resources| {
+        resources.iter().any(|&r| {
+            r as This != placed && resource(r as This).desc.flags & WRITTEN != 0
+        })
+    });
+    if !has_writer {
+        // The map and its generation are consistent while this lock is held.
+        b.no_writer_seen.store(changes.load(Relaxed), Relaxed);
+        return None;
+    }
+
     let bytes = |d: &ResourceDesc| {
         let (size, block) = element(d.format)?;
         let swizzle = texture_layout(d).map_or(d.layout, |t| t.planes[0].layout.desc.swizzle.0);
@@ -1944,8 +1993,7 @@ pub(crate) fn alias_source(placed: This) -> Option<std::sync::Arc<HostTexture>> 
         ))
     };
     let want = bytes(&b.desc)?;
-    map.by_memory
-        .get(&(b.data() as u64))?
+    others?
         .iter()
         .map(|&r| r as This)
         .filter(|&r| r != placed)
@@ -1989,10 +2037,11 @@ impl Drop for Resource {
         // once it acquires `Viewed::inner`.
         crate::descriptor::forget(at);
         if self.desc.dimension != BUFFER {
-            TEXTURES_AT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(self.data() as u64, at);
+            let memory = self.data() as u64;
+            let mut textures = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+            if textures.remove(memory, at) {
+                textures_at_changed(memory);
+            }
         }
         crate::bindless::forget(at);
         if self.desc.dimension == BUFFER {
@@ -2443,6 +2492,73 @@ mod tests {
     #[test]
     fn a_null_view_has_no_alias_source() {
         assert!(alias_source(std::ptr::null()).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_texture_insert_and_remove_advance_alias_generations() {
+        use std::sync::atomic::Ordering::Acquire;
+
+        let memory = 0x1234_5000;
+        let before = textures_at_changes(memory).load(Acquire);
+        let mut textures = LiveTextures::new();
+        textures.insert(memory, 0x1000);
+        textures_at_changed(memory);
+        let inserted = textures_at_changes(memory).load(Acquire);
+        assert!(inserted > before, "insertion invalidates cached negative answers");
+
+        assert!(textures.remove(memory, 0x1000));
+        textures_at_changed(memory);
+        let removed = textures_at_changes(memory).load(Acquire);
+        assert!(removed > inserted, "removal invalidates cached negative answers");
+        assert!(!textures.remove(memory, 0x1000), "removing an absent entry is a no-op");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_read_finds_a_writer_made_at_its_memory_later() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap = heap(1 << 20);
+        let place = |desc: &ResourceDesc| {
+            let mut out = null;
+            assert_eq!(
+                create_placed(null, heap, 0, desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out),
+                S_OK
+            );
+            out
+        };
+
+        // BC1 64x64 and R32G32_UINT 16x16 have the same title-memory layout.
+        let read = place(&texture(64, 64, 71, 1));
+        assert!(made(resource(read)).is_some());
+        assert_eq!(alias_source(read), None, "alone at its memory");
+        assert_eq!(alias_source(read), None, "the negative answer is cached");
+
+        let target = place(&ResourceDesc {
+            flags: UNORDERED,
+            ..texture(16, 16, 17, 1)
+        });
+        let (read_copy, target_copy) = (
+            made(resource(read)).unwrap(),
+            made(resource(target)).unwrap(),
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&read_copy, &target_copy),
+            "the two placed resources have separate host textures"
+        );
+        let alias = alias_source(read).expect("the newly-created writer invalidates the cache");
+        assert!(std::sync::Arc::ptr_eq(&alias, &target_copy));
+        assert_eq!(alias_source(target), None, "the writer has no other writer");
+        drop(alias);
+        drop((read_copy, target_copy));
+
+        assert_eq!(slot::<Release>(target, 0x10)(target), 0);
+        assert_eq!(alias_source(read), None, "releasing the writer invalidates the cache");
+        assert_eq!(slot::<Release>(read, 0x10)(read), 0);
+        assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
     }
 
     #[test]
