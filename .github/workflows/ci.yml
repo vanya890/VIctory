@@ -35,3 +35,9 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      # Force the generic texture descriptor path through the software D3D12 adapter.
+      # The test fails closed if WARP cannot be initialized.
+      - name: D3D12 WARP texture SRV/UAV regression
+        run: cargo test -p victory-gpu --features diagnostics --lib --locked texture_views_with_invalid_dimensions_ranges_or_mapping_fall_back_to_null -- --nocapture
+        env:
+          VICTORY_D3D12_WARP: "1"
