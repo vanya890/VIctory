@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
+use std::thread::ThreadId;
 use std::time::Duration;
 
 use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing};
@@ -490,17 +491,64 @@ const OP_GET_RESULT: u32 = 2;
 const OP_CANCEL: u32 = 3;
 const OP_CLEANUP: u32 = 4;
 
+/// Tracks in-flight provider operations (`OP_BEGIN`, `OP_DO_WORK`,
+/// `OP_CANCEL`) and completion claiming so `OP_CLEANUP` and completion
+/// publication never race with an active provider callback on another thread.
+#[derive(Default)]
+struct Lifecycle {
+    /// Threads currently executing a provider op on this call.
+    active: Vec<ThreadId>,
+    /// Set once `XAsyncCancel` starts dispatching `OP_CANCEL`.
+    canceling: bool,
+    /// First completion claimed for this call (`result`, `required_size`).
+    pending: Option<(HRESULT, usize)>,
+    /// Set once finalization (`OP_CLEANUP` + status publication + callback)
+    /// has been handed to one thread.
+    finalizing: bool,
+}
+
 /// One call in flight, until its result is taken or it fails.
 struct Call {
     provider: Provider,
     context: usize,
     identity: usize,
-    /// Set by the first completion, which then runs without a lock: the
-    /// provider's cleanup may wait for a thread completing the same call.
-    claimed: AtomicBool,
+    /// Coordinates provider ops with completion and cleanup without being held
+    /// across any callback: cleanup may wait for a thread completing the same
+    /// call.
+    lifecycle: Mutex<Lifecycle>,
+    /// OP_CLEANUP runs once, before status publication for failed/empty calls.
+    cleanup_done: AtomicBool,
     /// The status is published.
     done: Mutex<bool>,
     finished: Condvar,
+}
+
+/// Keeps a thread recorded in [`Call::lifecycle`] while a provider op runs,
+/// finalizing any deferred completion once the last active op exits.
+struct OpGuard {
+    call: Arc<Call>,
+    block: *mut AsyncBlock,
+    active: bool,
+}
+
+impl OpGuard {
+    fn finish(mut self, result: HRESULT, required_size: usize) {
+        self.active = false;
+        if let Some((hr, size)) = self.call.leave_op(result, required_size) {
+            finalize(&self.call, self.block, hr, size);
+        }
+    }
+}
+
+impl Drop for OpGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            if let Some((hr, size)) = self.call.leave_op(E_PENDING, 0) {
+                finalize(&self.call, self.block, hr, size);
+            }
+        }
+    }
 }
 
 impl Call {
@@ -519,6 +567,63 @@ impl Call {
         };
         (self.provider)(op, &data)
     }
+
+    fn enter_begin(self: &Arc<Self>, block: *mut AsyncBlock) -> OpGuard {
+        lock(&self.lifecycle)
+            .active
+            .push(std::thread::current().id());
+        OpGuard {
+            call: self.clone(),
+            block,
+            active: true,
+        }
+    }
+
+    fn enter_work(self: &Arc<Self>, block: *mut AsyncBlock) -> Option<OpGuard> {
+        let mut state = lock(&self.lifecycle);
+        if state.canceling || state.pending.is_some() || state.finalizing {
+            return None;
+        }
+        state.active.push(std::thread::current().id());
+        Some(OpGuard {
+            call: self.clone(),
+            block,
+            active: true,
+        })
+    }
+
+    fn enter_cancel(self: &Arc<Self>, block: *mut AsyncBlock) -> Option<OpGuard> {
+        let mut state = lock(&self.lifecycle);
+        if state.canceling || state.pending.is_some() || state.finalizing {
+            return None;
+        }
+        state.canceling = true;
+        state.active.push(std::thread::current().id());
+        Some(OpGuard {
+            call: self.clone(),
+            block,
+            active: true,
+        })
+    }
+
+    fn leave_op(&self, result: HRESULT, required_size: usize) -> Option<(HRESULT, usize)> {
+        let me = std::thread::current().id();
+        let mut state = lock(&self.lifecycle);
+        if let Some(i) = state.active.iter().rposition(|&t| t == me) {
+            state.active.swap_remove(i);
+        }
+        if result != E_PENDING && state.pending.is_none() {
+            state.pending = Some((result, required_size));
+        }
+        if !state.finalizing
+            && state.active.is_empty()
+            && let Some(pending) = state.pending
+        {
+            state.finalizing = true;
+            return Some(pending);
+        }
+        None
+    }
 }
 
 /// Calls by block address.
@@ -526,14 +631,6 @@ static CALLS: LazyLock<Mutex<HashMap<usize, Arc<Call>>>> = LazyLock::new(Default
 
 fn call(block: *mut AsyncBlock) -> Option<Arc<Call>> {
     lock(&CALLS).get(&(block as usize)).cloned()
-}
-
-/// Whether `call` is still the call in flight on `block`: once it is over,
-/// the title may begin another call on the same block.
-fn is_current(call: &Arc<Call>, block: *mut AsyncBlock) -> bool {
-    lock(&CALLS)
-        .get(&(block as usize))
-        .is_some_and(|current| Arc::ptr_eq(current, call))
 }
 
 /// The block's status and result-size words.
@@ -560,6 +657,32 @@ fn release(block: *mut AsyncBlock) {
     let removed = lock(&CALLS).remove(&(block as usize));
     if let Some(call) = removed {
         call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
+    }
+}
+
+fn remove_call(call: &Arc<Call>, block: *mut AsyncBlock) -> Option<Arc<Call>> {
+    let mut calls = lock(&CALLS);
+    let key = block as usize;
+    calls
+        .get(&key)
+        .is_some_and(|current| Arc::ptr_eq(current, call))
+        .then(|| calls.remove(&key))
+        .flatten()
+}
+
+/// Runs cleanup at most once. Never hold the CALLS, lifecycle or done locks
+/// across this provider callback.
+fn cleanup_call(call: &Call, block: *mut AsyncBlock) {
+    if !call.cleanup_done.swap(true, Ordering::AcqRel) {
+        call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
+    }
+}
+
+/// Removes the call before cleanup for already-published results, or after
+/// cleanup and status publication for failed/empty results.
+fn release_call(call: &Arc<Call>, block: *mut AsyncBlock) {
+    if let Some(removed) = remove_call(call, block) {
+        cleanup_call(&removed, block);
     }
 }
 
@@ -597,16 +720,16 @@ pub fn XAsyncBegin(
         provider,
         context: context as usize,
         identity: identity as usize,
-        claimed: AtomicBool::new(false),
+        lifecycle: Mutex::default(),
+        cleanup_done: AtomicBool::new(false),
         done: Mutex::new(false),
         finished: Condvar::new(),
     });
+    let guard = call.enter_begin(block);
     lock(&CALLS).insert(block as usize, call.clone());
     // A failed begin fails the call, so the completion routine still runs.
     let hr = call.provider(OP_BEGIN, block, 0, std::ptr::null_mut());
-    if hr < 0 {
-        complete_call(&call, block, hr, 0);
-    }
+    guard.finish(if hr < 0 { hr } else { E_PENDING }, 0);
     S_OK
 }
 
@@ -621,15 +744,15 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
     extern "system" fn work(context: *mut c_void, canceled: bool) {
         // SAFETY: boxed in `XAsyncSchedule`; a task runs once.
         let Work { call, block } = *unsafe { Box::from_raw(context.cast::<Work>()) };
-        if !is_current(&call, block) {
+        if canceled {
+            complete_call(&call, block, E_ABORT, 0);
             return;
         }
-        let hr = if canceled {
-            E_ABORT
-        } else {
-            call.provider(OP_DO_WORK, block, 0, std::ptr::null_mut())
+        let Some(guard) = call.enter_work(block) else {
+            return;
         };
-        complete_call(&call, block, hr, 0);
+        let hr = call.provider(OP_DO_WORK, block, 0, std::ptr::null_mut());
+        guard.finish(hr, 0);
     }
     if block.is_null() {
         return E_INVALIDARG;
@@ -664,7 +787,30 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
 /// own completions name the call they belong to, not the block: if the
 /// provider already completed it, the title may have begun another call on
 /// the block, which a second complete by block would end.
-fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
+fn complete_call(call: &Arc<Call>, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
+    if result == E_PENDING {
+        return;
+    }
+    let finish = {
+        let me = std::thread::current().id();
+        let mut state = lock(&call.lifecycle);
+        if state.pending.is_some() {
+            return;
+        }
+        state.pending = Some((result, required_size));
+        if !state.finalizing && state.active.iter().all(|&t| t == me) {
+            state.finalizing = true;
+            true
+        } else {
+            false
+        }
+    };
+    if finish {
+        finalize(call, block, result, required_size);
+    }
+}
+
+fn finalize(call: &Arc<Call>, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
     extern "system" fn complete(block: *mut c_void, _canceled: bool) {
         let block = block.cast::<AsyncBlock>();
         // SAFETY: read before the status was published; see below.
@@ -672,24 +818,25 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
             routine(block);
         }
     }
-    if result == E_PENDING {
-        return;
-    }
-    if call.claimed.swap(true, Ordering::AcqRel) {
-        return;
-    }
     // Read before publishing: once the status is set, the title may free
     // the block.
     // SAFETY: a block in flight is valid.
     let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
     let (status, size) = words(block);
     if result < 0 || required_size == 0 {
-        release(block);
+        // Keep the completion record discoverable while cleanup runs. A
+        // waiter must not miss the call and read the still-pending block.
+        cleanup_call(call, block);
     }
     size.store(required_size, Ordering::Release);
     status.store(result as u32 as usize, Ordering::Release);
     *lock(&call.done) = true;
     call.finished.notify_all();
+    if result < 0 || required_size == 0 {
+        // Status is visible before removal. This function only compares the
+        // pointer value; it never dereferences the title's block.
+        remove_call(call, block);
+    }
     if routine.is_some() {
         let task = Task::new(block.cast(), complete);
         match queue(handle) {
@@ -699,11 +846,28 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     }
 }
 
+#[cfg(test)]
+static STATUS_WAIT_HOOK: LazyLock<Mutex<Option<(usize, std::sync::mpsc::Sender<()>)>>> =
+    LazyLock::new(Default::default);
 pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
     if wait && let Some(call) = call(block) {
+        #[cfg(test)]
+        {
+            let found = {
+                let mut hook = lock(&STATUS_WAIT_HOOK);
+                if hook.as_ref().is_some_and(|(key, _)| *key == block as usize) {
+                    hook.take().map(|(_, sender)| sender)
+                } else {
+                    None
+                }
+            };
+            if let Some(found) = found {
+                let _ = found.send(());
+            }
+        }
         let done = lock(&call.done);
         drop(call.finished.wait_while(done, |d| !*d));
     }
@@ -727,14 +891,11 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 /// Asks the provider to cancel; the call fails with `E_ABORT` unless the
 /// provider completed it first. A completed call is left alone.
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
-    if let Some(call) = call(block) {
-        // A completion that claimed the call may still be running its
-        // cleanup, with the status not yet published: leave it alone too.
-        if call.claimed.load(Ordering::Acquire) {
-            return;
-        }
+    if let Some(call) = call(block)
+        && let Some(guard) = call.enter_cancel(block)
+    {
         call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
-        complete_call(&call, block, E_ABORT, 0);
+        guard.finish(E_ABORT, 0);
     }
 }
 
@@ -1493,6 +1654,92 @@ mod tests {
         XTaskQueueCloseHandle(q);
     }
 
+    /// A status waiter must still find the call while OP_CLEANUP is running.
+    /// Cleanup is deliberately paused to place the waiter in the old
+    /// remove-before-status race window.
+    #[test]
+    fn status_waiter_sees_call_until_cleanup_finishes() {
+        use std::sync::mpsc::{channel, Receiver, Sender};
+        use std::time::Duration;
+
+        struct Gate {
+            entered: Mutex<Option<Sender<()>>>,
+            resume: Mutex<Receiver<()>> ,
+            cleaned: AtomicU32,
+        }
+
+        extern "system" fn gated(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the runtime passes valid provider data and the test
+            // keeps the boxed Gate alive until both worker threads join.
+            let data = unsafe { &*data };
+            let gate = unsafe { &*data.context.cast::<Gate>() };
+            match op {
+                OP_BEGIN => E_PENDING,
+                OP_CLEANUP => {
+                    if let Some(entered) = lock(&gate.entered).take() {
+                        let _ = entered.send(());
+                    }
+                    let _ = lock(&gate.resume).recv();
+                    gate.cleaned.fetch_add(1, Ordering::SeqCst);
+                    S_OK
+                }
+                _ => S_OK,
+            }
+        }
+
+        let (entered_tx, entered_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        let gate = Box::new(Gate {
+            entered: Mutex::new(Some(entered_tx)),
+            resume: Mutex::new(resume_rx),
+            cleaned: AtomicU32::new(0),
+        });
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let block_ptr = &mut block as *mut AsyncBlock;
+        assert_eq!(
+            XAsyncBegin(
+                block_ptr,
+                (&*gate as *const Gate).cast_mut().cast(),
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(gated),
+            ),
+            S_OK
+        );
+
+        let address = block_ptr as usize;
+        let finalizer = std::thread::spawn(move || {
+            XAsyncComplete(address as *mut AsyncBlock, E_ABORT, 0);
+        });
+        let entered = entered_rx.recv_timeout(Duration::from_secs(2));
+
+        let (found_tx, found_rx) = channel();
+        *lock(&STATUS_WAIT_HOOK) = Some((address, found_tx));
+        let waiter = std::thread::spawn(move || XAsyncGetStatus(address as *mut AsyncBlock, true));
+        let found = found_rx.recv_timeout(Duration::from_secs(2));
+
+        // Always release cleanup, including on a failed synchronization
+        // assertion, so the finalizer and waiter cannot leak or hang.
+        let _ = resume_tx.send(());
+        finalizer.join().unwrap();
+        let status = waiter.join().unwrap();
+        lock(&STATUS_WAIT_HOOK).take();
+
+        assert!(entered.is_ok(), "finalizer did not enter OP_CLEANUP");
+        assert!(
+            found.is_ok(),
+            "XAsyncGetStatus did not find the completion record during cleanup"
+        );
+        assert_eq!(status, E_ABORT);
+        assert_eq!(gate.cleaned.load(Ordering::SeqCst), 1);
+        assert_eq!(XAsyncGetStatus(block_ptr, false), E_ABORT);
+        assert!(call(block_ptr).is_none());
+    }
     #[test]
     fn run_returns_the_work_result() {
         extern "system" fn work(_: *mut AsyncBlock) -> HRESULT {
@@ -1701,5 +1948,453 @@ mod tests {
         assert_eq!(SEEN.load(Ordering::SeqCst), 1, "cleanup ran under the lock");
         assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
         *CLEANED.lock().unwrap() = None;
+    }
+
+    /// Canceling while `OP_DO_WORK` is running must still deliver `OP_CANCEL`
+    /// without blocking the caller, yet defer `OP_CLEANUP` and completion
+    /// publication until `OP_DO_WORK` has returned so neither provider context
+    /// nor the async block is freed underneath it.
+    #[test]
+    fn cancel_waits_for_in_flight_do_work_before_cleanup_and_completion() {
+        struct Context {
+            work_entered: std::sync::Barrier,
+            release_work: std::sync::Barrier,
+            cancels: AtomicU32,
+            cleanups: AtomicU32,
+            cleaned_during_work: AtomicBool,
+            completed: AtomicU32,
+        }
+
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the runtime passes valid provider data.
+            let data = unsafe { &*data };
+            // SAFETY: `Context` lives on the test stack until every thread joins.
+            let ctx = unsafe { &*data.context.cast::<Context>() };
+            match op {
+                OP_BEGIN => XAsyncSchedule(data.block, 0),
+                OP_DO_WORK => {
+                    ctx.work_entered.wait();
+                    ctx.release_work.wait();
+                    if ctx.cleanups.load(Ordering::SeqCst) != 0 {
+                        ctx.cleaned_during_work.store(true, Ordering::SeqCst);
+                    }
+                    E_PENDING
+                }
+                OP_CANCEL => {
+                    ctx.cancels.fetch_add(1, Ordering::SeqCst);
+                    S_OK
+                }
+                OP_CLEANUP => {
+                    ctx.cleanups.fetch_add(1, Ordering::SeqCst);
+                    S_OK
+                }
+                _ => S_OK,
+            }
+        }
+
+        extern "system" fn on_complete(block: *mut AsyncBlock) {
+            // SAFETY: `Context` lives on the test stack until every thread joins.
+            let ctx = unsafe { &*(*block).context.cast::<Context>() };
+            ctx.completed.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 3, &mut q), S_OK);
+        let ctx = Context {
+            work_entered: std::sync::Barrier::new(2),
+            release_work: std::sync::Barrier::new(2),
+            cancels: AtomicU32::new(0),
+            cleanups: AtomicU32::new(0),
+            cleaned_during_work: AtomicBool::new(false),
+            completed: AtomicU32::new(0),
+        };
+        let mut block = AsyncBlock {
+            queue: q,
+            context: std::ptr::from_ref(&ctx).cast_mut().cast(),
+            callback: Some(on_complete),
+            internal: [0; 4],
+        };
+        let null = std::ptr::null();
+        assert_eq!(
+            XAsyncBegin(
+                &mut block,
+                std::ptr::from_ref(&ctx).cast_mut().cast(),
+                null,
+                null.cast(),
+                Some(provider),
+            ),
+            S_OK
+        );
+
+        // Wait until the thread-pool worker is inside `OP_DO_WORK`.
+        ctx.work_entered.wait();
+
+        // Cancel must invoke `OP_CANCEL` and return without deadlocking on
+        // `OP_DO_WORK`, while keeping `OP_CLEANUP` and completion deferred.
+        XAsyncCancel(&mut block);
+        let cancels_during = ctx.cancels.load(Ordering::SeqCst);
+        let cleanups_during = ctx.cleanups.load(Ordering::SeqCst);
+        let completed_during = ctx.completed.load(Ordering::SeqCst);
+        let status_during = XAsyncGetStatus(&mut block, false);
+
+        // A second cancel must neither re-invoke `OP_CANCEL` nor clean up early.
+        XAsyncCancel(&mut block);
+        let cancels_after_second = ctx.cancels.load(Ordering::SeqCst);
+        let cleanups_after_second = ctx.cleanups.load(Ordering::SeqCst);
+
+        // Let `OP_DO_WORK` observe the still-live context and return.
+        ctx.release_work.wait();
+        let final_status = XAsyncGetStatus(&mut block, true);
+        XTaskQueueCloseHandle(q);
+
+        assert_eq!(cancels_during, 1);
+        assert_eq!(
+            cleanups_during, 0,
+            "cleanup freed provider context while OP_DO_WORK was still running"
+        );
+        assert_eq!(
+            completed_during, 0,
+            "completion callback ran while OP_DO_WORK was still running"
+        );
+        assert_eq!(status_during, E_PENDING);
+        assert_eq!(cancels_after_second, 1);
+        assert_eq!(cleanups_after_second, 0);
+        assert_eq!(final_status, E_ABORT);
+        assert!(!ctx.cleaned_during_work.load(Ordering::SeqCst));
+        assert_eq!(ctx.cleanups.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.completed.load(Ordering::SeqCst), 1);
+    }
+
+    /// Completing a call while `OP_CANCEL` is running must defer `OP_CLEANUP`
+    /// until `OP_CANCEL` returns, and a racing `XAsyncCancel` must never enter
+    /// `OP_CANCEL` after completion or cleanup.
+    #[test]
+    fn complete_waits_for_in_flight_cancel_and_blocks_late_cancel() {
+        struct Context {
+            cancel_entered: std::sync::Barrier,
+            release_cancel: std::sync::Barrier,
+            cancels: AtomicU32,
+            cleanups: AtomicU32,
+            cleaned_during_cancel: AtomicBool,
+        }
+
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: `Context` lives on the test stack until all scoped threads join.
+            let ctx = unsafe { &*(*data).context.cast::<Context>() };
+            match op {
+                OP_CANCEL => {
+                    ctx.cancels.fetch_add(1, Ordering::SeqCst);
+                    ctx.cancel_entered.wait();
+                    ctx.release_cancel.wait();
+                    if ctx.cleanups.load(Ordering::SeqCst) != 0 {
+                        ctx.cleaned_during_cancel.store(true, Ordering::SeqCst);
+                    }
+                    S_OK
+                }
+                OP_CLEANUP => {
+                    ctx.cleanups.fetch_add(1, Ordering::SeqCst);
+                    S_OK
+                }
+                _ => S_OK,
+            }
+        }
+
+        let ctx = Context {
+            cancel_entered: std::sync::Barrier::new(2),
+            release_cancel: std::sync::Barrier::new(2),
+            cancels: AtomicU32::new(0),
+            cleanups: AtomicU32::new(0),
+            cleaned_during_cancel: AtomicBool::new(false),
+        };
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let null = std::ptr::null();
+        assert_eq!(
+            XAsyncBegin(
+                &mut block,
+                std::ptr::from_ref(&ctx).cast_mut().cast(),
+                null,
+                null.cast(),
+                Some(provider),
+            ),
+            S_OK
+        );
+        let block_addr = (&raw mut block) as usize;
+        let (cleanups_during, status_during, cancels_during) = std::thread::scope(|scope| {
+            let canceler = scope.spawn(move || {
+                XAsyncCancel(block_addr as *mut AsyncBlock);
+            });
+            ctx.cancel_entered.wait();
+
+            // Complete while `OP_CANCEL` is in flight: `S_OK` wins the result,
+            // but cleanup and status publication wait until `OP_CANCEL` returns.
+            XAsyncComplete(block_addr as *mut AsyncBlock, S_OK, 0);
+            let cleanups_during = ctx.cleanups.load(Ordering::SeqCst);
+            let status_during = XAsyncGetStatus(block_addr as *mut AsyncBlock, false);
+
+            // A second concurrent cancel sees the call is already canceling/claimed.
+            XAsyncCancel(block_addr as *mut AsyncBlock);
+            let cancels_during = ctx.cancels.load(Ordering::SeqCst);
+
+            ctx.release_cancel.wait();
+            canceler.join().unwrap();
+            (cleanups_during, status_during, cancels_during)
+        });
+
+        assert_eq!(
+            cleanups_during, 0,
+            "cleanup ran while OP_CANCEL was still executing"
+        );
+        assert_eq!(status_during, E_PENDING);
+        assert_eq!(cancels_during, 1);
+        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+        assert!(!ctx.cleaned_during_cancel.load(Ordering::SeqCst));
+        assert_eq!(ctx.cleanups.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.cancels.load(Ordering::SeqCst), 1);
+
+        // Unsynchronized race: `OP_CANCEL` must never run after `OP_CLEANUP`,
+        // and `OP_CLEANUP` must run exactly once.
+        struct Race {
+            cancels: AtomicU32,
+            cleanups: AtomicU32,
+            cancel_after_cleanup: AtomicBool,
+        }
+        extern "system" fn race_provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: `Race` outlives the scoped threads.
+            let race = unsafe { &*(*data).context.cast::<Race>() };
+            match op {
+                OP_CANCEL => {
+                    race.cancels.fetch_add(1, Ordering::SeqCst);
+                    if race.cleanups.load(Ordering::SeqCst) != 0 {
+                        race.cancel_after_cleanup.store(true, Ordering::SeqCst);
+                    }
+                    S_OK
+                }
+                OP_CLEANUP => {
+                    race.cleanups.fetch_add(1, Ordering::SeqCst);
+                    S_OK
+                }
+                _ => S_OK,
+            }
+        }
+        for _ in 0..64 {
+            let race = Race {
+                cancels: AtomicU32::new(0),
+                cleanups: AtomicU32::new(0),
+                cancel_after_cleanup: AtomicBool::new(false),
+            };
+            let mut block = AsyncBlock {
+                queue: std::ptr::null(),
+                context: std::ptr::null_mut(),
+                callback: None,
+                internal: [0; 4],
+            };
+            assert_eq!(
+                XAsyncBegin(
+                    &mut block,
+                    std::ptr::from_ref(&race).cast_mut().cast(),
+                    null,
+                    null.cast(),
+                    Some(race_provider),
+                ),
+                S_OK
+            );
+            let addr = (&raw mut block) as usize;
+            let start = std::sync::Barrier::new(3);
+            std::thread::scope(|scope| {
+                let c1 = scope.spawn(|| {
+                    start.wait();
+                    XAsyncCancel(addr as *mut AsyncBlock);
+                });
+                let c2 = scope.spawn(|| {
+                    start.wait();
+                    XAsyncCancel(addr as *mut AsyncBlock);
+                });
+                start.wait();
+                XAsyncComplete(addr as *mut AsyncBlock, S_OK, 0);
+                c1.join().unwrap();
+                c2.join().unwrap();
+            });
+            let hr = XAsyncGetStatus(&mut block, true);
+            assert!(hr == S_OK || hr == E_ABORT, "unexpected status {hr:#x}");
+            assert!(!race.cancel_after_cleanup.load(Ordering::SeqCst));
+            assert!(race.cancels.load(Ordering::SeqCst) <= 1);
+            assert_eq!(race.cleanups.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// Completion from another thread while `OP_BEGIN` or `OP_CANCEL` is still
+    /// running defers finalization until that operation returns, preserving
+    /// payload results and preventing premature cleanup.
+    #[test]
+    fn concurrent_completion_defers_cleanup_during_begin_and_preserves_payload_on_cancel() {
+        // Case 1: a worker completes with no payload while `OP_BEGIN` is still running.
+        struct BeginCtx {
+            completed_called: std::sync::Barrier,
+            cleanups: AtomicU32,
+            cleaned_during_begin: AtomicBool,
+        }
+        extern "system" fn begin_provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the runtime passes valid provider data.
+            let data = unsafe { &*data };
+            // SAFETY: `BeginCtx` outlives the call and its worker thread.
+            let ctx = unsafe { &*data.context.cast::<BeginCtx>() };
+            match op {
+                OP_BEGIN => {
+                    let block = data.block as usize;
+                    let ctx_ptr = data.context as usize;
+                    let worker = std::thread::spawn(move || {
+                        XAsyncComplete(block as *mut AsyncBlock, S_OK, 0);
+                        // SAFETY: `BeginCtx` lives until `worker.join()`.
+                        let ctx = unsafe { &*(ctx_ptr as *const BeginCtx) };
+                        ctx.completed_called.wait();
+                    });
+                    ctx.completed_called.wait();
+                    if ctx.cleanups.load(Ordering::SeqCst) != 0 {
+                        ctx.cleaned_during_begin.store(true, Ordering::SeqCst);
+                    }
+                    worker.join().unwrap();
+                    S_OK
+                }
+                OP_CLEANUP => {
+                    ctx.cleanups.fetch_add(1, Ordering::SeqCst);
+                    S_OK
+                }
+                _ => S_OK,
+            }
+        }
+        let begin_ctx = BeginCtx {
+            completed_called: std::sync::Barrier::new(2),
+            cleanups: AtomicU32::new(0),
+            cleaned_during_begin: AtomicBool::new(false),
+        };
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let null = std::ptr::null();
+        assert_eq!(
+            XAsyncBegin(
+                &mut block,
+                std::ptr::from_ref(&begin_ctx).cast_mut().cast(),
+                null,
+                null.cast(),
+                Some(begin_provider),
+            ),
+            S_OK
+        );
+        assert!(!begin_ctx.cleaned_during_begin.load(Ordering::SeqCst));
+        assert_eq!(begin_ctx.cleanups.load(Ordering::SeqCst), 1);
+        assert_eq!(XAsyncGetStatus(&mut block, false), S_OK);
+
+        // Case 2: `OP_DO_WORK` wins with a payload while `OP_CANCEL` is active.
+        struct PayloadCtx {
+            work_entered: std::sync::Barrier,
+            cancel_entered: std::sync::Barrier,
+            work_completed: std::sync::Barrier,
+            release_cancel: std::sync::Barrier,
+            cleanups: AtomicU32,
+            value: u64,
+        }
+        extern "system" fn payload_provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the runtime passes valid provider data.
+            let data = unsafe { &*data };
+            // SAFETY: `PayloadCtx` lives on the test stack until all threads finish.
+            let ctx = unsafe { &*data.context.cast::<PayloadCtx>() };
+            match op {
+                OP_BEGIN => XAsyncSchedule(data.block, 0),
+                OP_DO_WORK => {
+                    ctx.work_entered.wait();
+                    ctx.cancel_entered.wait();
+                    XAsyncComplete(data.block, S_OK, size_of::<u64>());
+                    ctx.work_completed.wait();
+                    S_OK
+                }
+                OP_CANCEL => {
+                    ctx.cancel_entered.wait();
+                    ctx.release_cancel.wait();
+                    S_OK
+                }
+                OP_GET_RESULT => {
+                    // SAFETY: the runtime checked room for 8 bytes.
+                    unsafe { data.buffer.cast::<u64>().write(ctx.value) };
+                    S_OK
+                }
+                OP_CLEANUP => {
+                    ctx.cleanups.fetch_add(1, Ordering::SeqCst);
+                    S_OK
+                }
+                _ => S_OK,
+            }
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 0, &mut q), S_OK);
+        let payload_ctx = PayloadCtx {
+            work_entered: std::sync::Barrier::new(2),
+            cancel_entered: std::sync::Barrier::new(2),
+            work_completed: std::sync::Barrier::new(2),
+            release_cancel: std::sync::Barrier::new(2),
+            cleanups: AtomicU32::new(0),
+            value: 0xfeed_face_cafe_beef,
+        };
+        let identity = 0x99 as *const c_void;
+        let mut block = AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(
+            XAsyncBegin(
+                &mut block,
+                std::ptr::from_ref(&payload_ctx).cast_mut().cast(),
+                identity,
+                null.cast(),
+                Some(payload_provider),
+            ),
+            S_OK
+        );
+        // Ensure `OP_DO_WORK` is already executing before starting `XAsyncCancel`.
+        payload_ctx.work_entered.wait();
+        let addr = (&raw mut block) as usize;
+        let status_during_cancel = std::thread::scope(|scope| {
+            let canceler = scope.spawn(move || {
+                XAsyncCancel(addr as *mut AsyncBlock);
+            });
+            // Wait until `OP_CANCEL` has entered and `OP_DO_WORK` has called
+            // `XAsyncComplete(..., S_OK, 8)` while `OP_CANCEL` is still active.
+            payload_ctx.work_completed.wait();
+            let status_during_cancel = XAsyncGetStatus(addr as *mut AsyncBlock, false);
+            payload_ctx.release_cancel.wait();
+            canceler.join().unwrap();
+            status_during_cancel
+        });
+        assert_eq!(
+            status_during_cancel, E_PENDING,
+            "status published while OP_CANCEL was still executing"
+        );
+        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+        assert_eq!(payload_ctx.cleanups.load(Ordering::SeqCst), 0);
+        let mut got = 0u64;
+        let mut used = 0usize;
+        assert_eq!(
+            XAsyncGetResult(
+                &mut block,
+                identity,
+                size_of::<u64>(),
+                (&raw mut got).cast(),
+                &mut used,
+            ),
+            S_OK
+        );
+        assert_eq!((got, used), (0xfeed_face_cafe_beef, size_of::<u64>()));
+        assert_eq!(payload_ctx.cleanups.load(Ordering::SeqCst), 1);
+        XTaskQueueCloseHandle(q);
     }
 }
