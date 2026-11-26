@@ -51,6 +51,9 @@ pub struct Program {
     /// hardware or a called fetch routine set up (user SGPRs, system values,
     /// vertex inputs).
     pub inputs: Vec<(Reg, Value)>,
+    /// Values recovered from VGPR lane spills by the conservative local
+    /// lookahead, keyed by the result value of the lane-relative read.
+    pub restored: HashMap<Value, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,12 +289,136 @@ pub fn build_bounded(
         }
     }
     remove_trivial_phis(&mut blocks, values);
+    let restored = restores(&blocks, vgprs);
     Ok(Program {
         wave64,
         vgprs,
         blocks,
         inputs,
+        restored,
     })
+}
+
+fn operand_number(op: Operand) -> Option<u32> {
+    match op {
+        Operand::Literal(x) => Some(x),
+        Operand::Const(c) => crate::resource::inline(c),
+        _ => None,
+    }
+}
+
+fn parked_scalar(inst: &Inst, op: Operand) -> Option<Value> {
+    match op {
+        Operand::Scalar { code, .. } if code != gfx10::NULL => inst.read(Reg::S(code)),
+        _ => None,
+    }
+}
+
+/// Finds scalar values parked in VGPR lanes and restored by constant lane
+/// reads or an unambiguous M0-relative read, within each straight-line block.
+/// Unknown writes invalidate the affected lane/register instead of allowing
+/// an older scalar mapping to survive.
+fn restores(blocks: &[Block], vgprs: u16) -> HashMap<Value, Value> {
+    let mut out = HashMap::new();
+    for block in blocks {
+        let mut parked: HashMap<(u8, u32), Value> = HashMap::new();
+        let mut m0 = None;
+        for inst in &block.insts {
+            let name = inst.name();
+            if inst.write(Reg::S(M0)).is_some() {
+                m0 = if name == "s_mov_b32" {
+                    match &inst.fields {
+                        Fields::Sop { src, .. } => {
+                            src.first().copied().and_then(operand_number)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+            }
+
+            let Fields::Valu(v) = &inst.fields else {
+                for (reg, _) in &inst.writes {
+                    if let Reg::V(r) = *reg {
+                        parked.retain(|&(p, _), _| p != r);
+                    }
+                }
+                continue;
+            };
+
+            if name == "v_writelane_b32" {
+                if let Some(Operand::Vector { reg, .. }) = v.dst {
+                    match v.src.get(1).copied().and_then(operand_number) {
+                        Some(lane) => {
+                            // This instruction overwrites this lane even when
+                            // the new value is not a recoverable scalar.
+                            parked.remove(&(reg, lane));
+                            if let Some(scalar) =
+                                v.src.first().copied().and_then(|op| parked_scalar(inst, op))
+                            {
+                                parked.insert((reg, lane), scalar);
+                            }
+                        }
+                        None => {
+                            // A dynamic lane can overwrite any lane in the
+                            // destination register.
+                            parked.retain(|&(p, _), _| p != reg);
+                        }
+                    }
+                } else {
+                    for (reg, _) in &inst.writes {
+                        if let Reg::V(r) = *reg {
+                            parked.retain(|&(p, _), _| p != r);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if name == "v_readlane_b32" {
+                let lane = v.src.get(1).copied().and_then(operand_number);
+                let reg = match v.src.first() {
+                    Some(Operand::Vector { reg, .. }) => Some(*reg),
+                    _ => None,
+                };
+                if let (Some(reg), Some(lane)) = (reg, lane)
+                    && let Some(&scalar) = parked.get(&(reg, lane))
+                    && let Some((_, result)) = inst.writes.first()
+                {
+                    out.insert(*result, scalar);
+                }
+            } else if matches!(
+                name,
+                "v_movrels_b32" | "v_movreld_b32" | "v_swaprel_b32"
+            ) {
+                let base = match v.src.first() {
+                    Some(Operand::Vector { reg, .. }) => Some(*reg),
+                    _ => None,
+                };
+                if let (Some(base), Some(delta)) = (base, m0) {
+                    let reg = u32::from(base) + delta;
+                    if reg < u32::from(vgprs)
+                        && let Ok(reg) = u8::try_from(reg)
+                    {
+                        let mut found = parked.iter().filter(|((r, _), _)| *r == reg);
+                        if let (Some((_, &scalar)), None) = (found.next(), found.next())
+                            && let Some((_, result)) = inst.writes.first()
+                        {
+                            out.insert(*result, scalar);
+                        }
+                    }
+                }
+            }
+
+            for (reg, _) in &inst.writes {
+                if let Reg::V(r) = *reg {
+                    parked.retain(|&(p, _), _| p != r);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Placeholder before renaming.
@@ -1098,6 +1225,85 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    #[test]
+    fn overwritten_non_scalar_lane_invalidates_parked_scalar() {
+        let p = build_words(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE80_036A, // s_mov_b32 s0, vcc_lo
+                0xD761_0001,
+                0x0001_0600, // v_writelane_b32 v1, s0, 3
+                0xD761_0001,
+                0x0001_0702, // v_writelane_b32 v1, v2, 3
+                0xD760_0005,
+                0x0001_0701, // v_readlane_b32 s5, v1, 3
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let restored = p.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "v_readlane_b32")
+            .and_then(|i| i.write(Reg::S(5)))
+            .unwrap();
+        assert!(
+            !p.restored.contains_key(&restored),
+            "a vector overwrite must invalidate the previous scalar spill"
+        );
+    }
+
+    #[test]
+    fn dynamic_lane_write_invalidates_all_parked_lanes() {
+        let p = build_words(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE80_036A, // s_mov_b32 s0, vcc_lo
+                0xD761_0001,
+                0x0001_0600, // v_writelane_b32 v1, s0, 3
+                0xD761_0001,
+                0x0000_0401, // v_writelane_b32 v1, s1, s2 (dynamic lane)
+                0xD760_0005,
+                0x0001_0701, // v_readlane_b32 s5, v1, 3
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let restored = p.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "v_readlane_b32")
+            .and_then(|i| i.write(Reg::S(5)))
+            .unwrap();
+        assert!(
+            !p.restored.contains_key(&restored),
+            "a dynamic lane write may overwrite every parked lane"
+        );
+    }
+
+    #[test]
+    fn m0_relative_restore_finds_a_unique_parked_scalar() {
+        let p = build_words(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE80_036A, // s_mov_b32 s0, vcc_lo
+                0xD761_0007,
+                0x0001_0000, // v_writelane_b32 v0, s0, 0
+                0xBEFC_0383, // s_mov_b32 m0, 3
+                0x7E00_8704, // v_movrels_b32 v0, v4
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let restored = p.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "v_movrels_b32")
+            .and_then(|i| i.writes.first().map(|(_, v)| *v))
+            .unwrap();
+        assert!(p.restored.contains_key(&restored));
     }
 
     #[test]
