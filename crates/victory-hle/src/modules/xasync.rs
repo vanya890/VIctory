@@ -2520,7 +2520,12 @@ mod tests {
         // releases CALLS / publishes done.
         entered.wait();
         assert_eq!(XAsyncGetStatus(address as *mut AsyncBlock, false), S_OK);
-        block.internal = [0; 4];
+        assert!(CALLS.try_lock().is_err(), "CALLS must stay locked through publication");
+        let (status_word, size_word) = words(&mut block);
+        status_word.store(0, Ordering::SeqCst);
+        size_word.store(0, Ordering::SeqCst);
+        block.internal[0] = 0;
+        block.internal[3] = 0;
 
         // A new call on the same address must wait for the old publication
         // transaction instead of observing an unfinished old call.
