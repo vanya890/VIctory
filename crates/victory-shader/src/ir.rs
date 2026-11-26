@@ -738,10 +738,12 @@ fn effects(
             reason: "register range out of bounds",
         })
     };
+    // MUBUF cache invalidations take no operands and do not depend on EXEC.
+    let buffer_inv = matches!(name, "buffer_gl0_inv" | "buffer_gl1_inv");
     let vector = !matches!(
         fields,
         Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }
-    );
+    ) && !buffer_inv;
     match fields {
         Fields::Sop { dst, src, .. } => {
             if name.starts_with("s_movrel")
@@ -904,6 +906,7 @@ fn effects(
                 r.push((Reg::S(M0), NONE));
             }
         }
+        Fields::Buffer { .. } if buffer_inv => {}
         Fields::Buffer {
             data,
             addr,
@@ -1477,5 +1480,97 @@ mod tests {
         assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
         assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
         assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
+    }
+
+    #[test]
+    fn buffer_cache_invalidations_have_no_register_effects() {
+        // Exact GFX10 MUBUF encodings from LLVM's gfx10_mubuf.txt:
+        // buffer_gl0_inv (0x071), buffer_gl1_inv (0x072), and SMEM s_gl1_inv
+        // (0x01f) for parity. Hardware ignores every operand field and EXEC.
+        let cases = [
+            ([0xE1C4_0000, 0x0000_0000, S_ENDPGM], "buffer_gl0_inv"),
+            ([0xE1C8_0000, 0x0000_0000, S_ENDPGM], "buffer_gl1_inv"),
+            ([0xF47C_0000, 0x0000_0000, S_ENDPGM], "s_gl1_inv"),
+        ];
+        for wave64 in [false, true] {
+            for (words, expected) in cases {
+                let p = build_words(&words, wave64);
+                let [inv, end] = &p.blocks[0].insts[..] else {
+                    panic!("{expected} (wave64={wave64}): {:?}", p.blocks[0].insts);
+                };
+                assert_eq!(inv.name(), expected);
+                assert_eq!(end.name(), "s_endpgm");
+                assert!(
+                    inv.reads.is_empty(),
+                    "{expected} (wave64={wave64}) must not read registers: {:?}",
+                    inv.reads
+                );
+                assert!(
+                    inv.writes.is_empty(),
+                    "{expected} (wave64={wave64}) must not write registers: {:?}",
+                    inv.writes
+                );
+                assert!(
+                    p.inputs.is_empty(),
+                    "{expected} (wave64={wave64}) must not fabricate program inputs: {:?}",
+                    p.inputs
+                );
+            }
+        }
+
+        // Negative control: a real MUBUF load still reads rsrc, soffset, old
+        // vdata (for disabled lanes), and EXEC, and writes vdata.
+        let load = build_words(&[0xE030_0000, 0x0302_0500, S_ENDPGM], false);
+        let inst = &load.blocks[0].insts[0];
+        assert_eq!(inst.name(), "buffer_load_dword");
+        assert!(inst.write(Reg::V(5)).is_some());
+        for reg in [
+            Reg::S(8),
+            Reg::S(9),
+            Reg::S(10),
+            Reg::S(11),
+            Reg::S(3),
+            Reg::V(5),
+            Reg::S(EXEC),
+        ] {
+            assert!(
+                inst.read(reg).is_some(),
+                "buffer_load_dword must still read {reg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn buffer_cache_invalidations_do_not_create_phantom_phis() {
+        // Writing s0..s3 and EXEC on one side of a branch before
+        // buffer_gl0_inv / buffer_gl1_inv must not keep them live or force
+        // phantom SSA PHIs at the merge block.
+        let code = [
+            0xBF06_8004, // 0:  s_cmp_eq_u32 s4, 0
+            0xBF85_0005, // 4:  s_cbranch_scc1 -> 28
+            0xBE80_0381, // 8:  s_mov_b32 s0, 1
+            0xBE81_0382, // 12: s_mov_b32 s1, 2
+            0xBE82_0383, // 16: s_mov_b32 s2, 3
+            0xBE83_0384, // 20: s_mov_b32 s3, 4
+            0xBEFE_0380, // 24: s_mov_b32 exec_lo, 0
+            0xE1C4_0000, // 28: buffer_gl0_inv
+            0x0000_0000,
+            0xE1C8_0000, // 36: buffer_gl1_inv
+            0x0000_0000,
+            S_ENDPGM, // 44: s_endpgm
+        ];
+        for wave64 in [false, true] {
+            let p = build_words(&code, wave64);
+            let merge = p.blocks.last().unwrap();
+            assert_eq!(merge.insts[0].name(), "buffer_gl0_inv");
+            assert_eq!(merge.insts[1].name(), "buffer_gl1_inv");
+            assert!(
+                merge.phis.is_empty(),
+                "wave64={wave64}: phantom PHIs at merge: {:?}",
+                merge.phis
+            );
+            let input_regs: Vec<Reg> = p.inputs.iter().map(|&(r, _)| r).collect();
+            assert_eq!(input_regs, [Reg::S(4)], "wave64={wave64}");
+        }
     }
 }

@@ -92,6 +92,23 @@ fn last(kind: u32) -> &'static AtomicU64 {
     &LAST[(kind as usize).min(LAST.len() - 1)]
 }
 
+/// Computes a tick from an explicit clock snapshot. Keeping this arithmetic
+/// pure makes the deadline boundary testable without relying on OS scheduling.
+fn next_tick_at(
+    first: u64,
+    interval: Duration,
+    elapsed: Duration,
+    previous: u64,
+    limit: Duration,
+) -> (u64, Duration, bool) {
+    let elapsed = elapsed.as_nanos();
+    let interval = interval.as_nanos().max(1);
+    let tick = (first + (elapsed / interval) as u64).max(previous + 1);
+    let at = u128::from(tick - first) * interval;
+    let wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
+    (tick, wait, wait <= limit)
+}
+
 /// The tick a wait for `kind` ends on, and how long until it: the first
 /// one after the last a wait for `kind` took (an event happens once per
 /// tick: a wait woken a little early must not let the next one end on the
@@ -100,9 +117,9 @@ fn last(kind: u32) -> &'static AtomicU64 {
 /// an event signalled at the tick and left signalled until a wait takes it
 /// would (assumed: nothing we have says what a late wait does); waiting for
 /// the next tick instead cost the cutscene's frames 0-33 ms each (4 % of
-/// the frame thread, run perf3). A wait that
-/// comes within `limit` takes the tick here, under the clock's lock, so two
-/// threads waiting for one kind never take the same tick.
+/// the frame thread, run perf3). A wait that comes within `limit` takes the
+/// tick here, under the clock's lock, so two threads waiting for one kind
+/// never take the same tick.
 fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
@@ -110,12 +127,14 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
         interval: SIXTIETH,
         first: 0,
     });
-    let elapsed = c.start.elapsed().as_nanos();
-    let interval = c.interval.as_nanos().max(1);
-    let tick = (c.first + (elapsed / interval) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
-    let at = u128::from(tick - c.first) * interval;
-    let wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
-    if wait <= limit {
+    let (tick, wait, take) = next_tick_at(
+        c.first,
+        c.interval,
+        c.start.elapsed(),
+        last(kind).load(Ordering::Relaxed),
+        limit,
+    );
+    if take {
         last(kind).fetch_max(tick, Ordering::Relaxed);
     }
     (tick, wait)
@@ -217,8 +236,31 @@ pub(crate) extern "system" fn statistics(
 mod tests {
     use super::*;
 
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn tick_deadline_boundary_is_deterministic() {
+        let interval = Duration::from_micros(2_000);
+        assert_eq!(
+            next_tick_at(0, interval, Duration::ZERO, 0, Duration::ZERO),
+            (1, interval, false),
+            "before the tick, a zero-timeout poll cannot take it"
+        );
+        assert_eq!(
+            next_tick_at(0, interval, interval, 0, Duration::ZERO),
+            (1, Duration::ZERO, true),
+            "after the tick, a zero-timeout poll takes the already-passed tick"
+        );
+        assert_eq!(
+            next_tick_at(0, interval, Duration::ZERO, 1, Duration::ZERO),
+            (2, interval * 2, false),
+            "a kind never takes the same tick twice"
+        );
+    }
+
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
@@ -228,17 +270,23 @@ mod tests {
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
         assert!(second > first);
         assert!(before.elapsed() <= Duration::from_millis(50));
-        assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
-        // Tokens count frames, a frame started early on a time-out too.
+
+        // A zero-timeout poll may find that its tick passed while the thread
+        // was descheduled. Both outcomes are valid; only a successful poll
+        // advances the token without TOKEN_ON_TIMEOUT.
+        let poll = wait(null, 0, 0, std::ptr::null(), 0, &mut second);
+        assert!(poll == TIMEOUT || poll == S_OK);
+        let polled_frame = u64::from(poll == S_OK);
+
+        // Tokens count frames, including one deliberately started on timeout.
         let mut early = 0;
         let flags = TOKEN_ON_TIMEOUT;
-        assert_eq!(
-            wait(null, 0, 0, std::ptr::null(), flags, &mut early),
-            TIMEOUT
-        );
+        let early_hr = wait(null, 0, 0, std::ptr::null(), flags, &mut early);
+        assert!(early_hr == TIMEOUT || early_hr == S_OK);
         let mut next = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut next), S_OK);
-        assert!(early == second + 1 && next == early + 1);
+        assert_eq!(early, second + polled_frame + 1);
+        assert_eq!(next, early + 1);
         assert!(LAST[0].load(Ordering::Relaxed) >= 2);
 
         // The title's loop (the clock is global, so in the same test): an
@@ -280,6 +328,7 @@ mod tests {
     /// none. The old code marked the tick after the sleep, so both got it.
     #[test]
     fn waits_begun_together_take_different_ticks() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         const VBLANK: u32 = 1;
         let long = Duration::from_secs(1);
         let (first, _) = next_tick(VBLANK, long);

@@ -26,6 +26,9 @@ use crate::host::{HostList, host};
 use crate::object::This;
 use windows::core::Interface;
 
+#[cfg(test)]
+mod staging_tests;
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -120,8 +123,7 @@ const KEPT_BYTES: u64 = 64 << 20;
 pub(crate) fn recycle() {
     {
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
-        (c.current, c.used) = (0, 0);
-        c.all.truncate(CHUNKS_KEPT);
+        c.recycle();
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
@@ -165,22 +167,95 @@ fn staging_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
 /// textures take a part of one instead of a buffer of their own (making
 /// upload buffers was 10 % of the submitting thread in a new shot, run
 /// evict5). Rewound at each submission ([`recycle`]): the last one has run.
-struct Chunks {
-    /// (buffer, mapping), [`CHUNK`] bytes each.
-    all: Vec<(ID3D12Resource, usize)>,
+struct Chunks<T> {
+    all: Vec<Chunk<T>>,
     /// The chunk being carved and the bytes taken from it.
     current: usize,
     used: u64,
+    /// Preferred maximum size for new chunks in this submission.
+    growth: u64,
+}
+
+struct Chunk<T> {
+    buffer: T,
+    data: usize,
+    size: u64,
+}
+
+impl<T: Clone> Chunks<T> {
+    const fn new() -> Self {
+        Self {
+            all: Vec::new(),
+            current: 0,
+            used: 0,
+            growth: CHUNK,
+        }
+    }
+
+    fn recycle(&mut self) {
+        (self.current, self.used, self.growth) = (0, 0, CHUNK);
+        // Once large allocations work again, keep their capacity for the
+        // next submission instead of pinning the first small chunks forever.
+        if self.all.len() > CHUNKS_KEPT && self.all[..CHUNKS_KEPT].iter().any(|chunk| chunk.size < CHUNK) {
+            self.all.select_nth_unstable_by_key(CHUNKS_KEPT, |chunk| std::cmp::Reverse(chunk.size));
+        }
+        self.all.truncate(CHUNKS_KEPT);
+        // Large chunks should be considered before smaller retained chunks
+        // in the next submission. A large request can skip a small chunk in
+        // this submission; sorting here ensures it is reused after recycling.
+        self.all.sort_unstable_by_key(|chunk| std::cmp::Reverse(chunk.size));
+    }
+
+    fn take(
+        &mut self,
+        size: u64,
+        mut allocate: impl FnMut(u64) -> Option<(T, usize)>,
+    ) -> Option<(T, u64, usize)> {
+        debug_assert!(size <= CHUNK);
+        while let Some(chunk) = self.all.get(self.current) {
+            let at = self.used.next_multiple_of(512);
+            if at + size <= chunk.size {
+                self.used = at + size;
+                return Some((chunk.buffer.clone(), at, chunk.data + at as usize));
+            }
+            (self.current, self.used) = (self.current + 1, 0);
+        }
+
+        let minimum = size.max(MIN_CHUNK).next_multiple_of(MIN_CHUNK);
+        let mut bytes = self.growth.max(minimum);
+        loop {
+            if let Some((buffer, data)) = allocate(bytes) {
+                let piece = (buffer.clone(), 0, data);
+                self.all.push(Chunk {
+                    buffer,
+                    data,
+                    size: bytes,
+                });
+                self.used = size;
+                return Some(piece);
+            }
+            // Keep servicing requests with available space. New chunks
+            // start smaller after a refusal, unless the request needs more.
+            self.growth = self
+                .growth
+                .min((bytes.next_power_of_two() / 2).max(MIN_CHUNK));
+            if bytes == minimum {
+                return None;
+            }
+            bytes = self.growth.max(minimum);
+        }
+    }
 }
 
 // SAFETY: the mappings are persistent mappings of the upload buffers.
-unsafe impl Send for Chunks {}
-
-static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks { all: Vec::new(), current: 0, used: 0 });
+unsafe impl Send for Chunks<ID3D12Resource> {}
 
 const CHUNK: u64 = 32 << 20;
+const MIN_CHUNK: u64 = 64 << 10;
 /// Chunks kept between submissions (more are made while one needs them).
 const CHUNKS_KEPT: usize = 16;
+
+static CHUNKS: Mutex<Chunks<ID3D12Resource>> = Mutex::new(Chunks::new());
 
 /// `size` bytes of staging space: a buffer, the offset of the space in it
 /// (a multiple of 512, as texture copies need) and its mapping there.
@@ -190,21 +265,12 @@ fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
         return staging_buffer(size).map(|(b, data)| (b, 0, data));
     }
     let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
-    loop {
-        if let Some((buffer, data)) = c.all.get(c.current) {
-            let at = c.used.next_multiple_of(512);
-            if at + size <= CHUNK {
-                let made = (buffer.clone(), at, (*data + at as usize) as *mut u8);
-                c.used = at + size;
-                return Some(made);
-            }
-            (c.current, c.used) = (c.current + 1, 0);
-            continue;
-        }
-        let (buffer, data) = host()?.upload_buffer(CHUNK)?;
+    let (buffer, at, data) = c.take(size, |bytes| {
+        let (buffer, data) = host()?.upload_buffer(bytes)?;
         crate::host::name(&buffer, || "texture staging chunk".into());
-        c.all.push((buffer, data as usize));
-    }
+        Some((buffer, data as usize))
+    })?;
+    Some((buffer, at, data as *mut u8))
 }
 
 // SAFETY: the title memory is only read, under `last`'s lock.
@@ -222,8 +288,13 @@ unsafe impl Sync for Staging {}
 /// get its upload.
 pub(crate) fn host_writes(list: &HostList, resource: This) {
     if let Some(copy) = crate::resource::host_copy(resource) {
-        list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
+        host_writes_copy(list, &copy);
     }
+}
+
+fn host_writes_copy(list: &HostList, copy: &Arc<crate::resource::HostTexture>) {
+    let copy = copy.clone();
+    list.defer_host(move || copy.note_host_written());
 }
 
 fn is_host_written(resource: This) -> bool {
@@ -234,9 +305,14 @@ fn is_host_written(resource: This) -> bool {
 /// Whether `resource`'s host copy takes its contents from title memory:
 /// a texture the host GPU does not render to or write.
 pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
-    const TARGET_DEPTH_UNORDERED: i32 = 0x7;
     // SAFETY: a live resource.
-    unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
+    title_written_flags(unsafe { texture.GetDesc() }.Flags.0 as u32)
+}
+
+/// `title_written` for cached D3D12 resource flags.
+pub(crate) fn title_written_flags(flags: u32) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    flags & TARGET_DEPTH_UNORDERED == 0
 }
 
 /// Copies [`alias_copy`] recorded since the last frame-rate line.
@@ -250,18 +326,24 @@ pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// subresource with its own format, as many as have the same bytes per
 /// row and rows in both; `to` no longer takes its contents from title
 /// memory.
-pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
+pub(crate) fn alias_copy(
+    list: &HostList,
+    from: &Arc<crate::resource::HostTexture>,
+    to: This,
+) {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
-    let (Some(a), Some(b), Some(host)) = (
-        crate::resource::host_resource(from),
-        crate::resource::host_resource(to),
-        host(),
-    ) else {
+    // Pin `to`'s host copy once so concurrent eviction cannot swap the
+    // destination between GetDesc, state tracking and CopyTextureRegion.
+    let (Some(to_copy), Some(host)) = (crate::resource::host_copy(to), host()) else {
         return;
     };
+    if Arc::ptr_eq(from, &to_copy) {
+        return;
+    }
+    let (a, b) = (&from.texture, &to_copy.texture);
     // An odd key: textures' own first uses are keyed by the host texture.
-    if !list.first_use(to as usize | 1) {
+    if !list.first_use(Arc::as_ptr(&to_copy) as usize | 1) {
         return;
     }
     // SAFETY: live resources.
@@ -300,9 +382,9 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     }
     let Some(buffer) = host.default_buffer(total) else { return };
     list.keep(&buffer);
-    crate::texture::host_writes(list, to);
-    crate::list::ensure_state(list, from, COPY_SOURCE);
-    crate::list::ensure_state(list, to, COPY_DEST);
+    host_writes_copy(list, &to_copy);
+    crate::list::ensure_copy_state(list, from, COPY_SOURCE);
+    crate::list::ensure_copy_state(list, &to_copy, COPY_DEST);
     let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the copy does not release.
         pResource: unsafe { std::mem::transmute_copy(r) },
@@ -319,7 +401,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     // SAFETY: an open list; live resources in the states named.
     unsafe {
         for i in 0..n {
-            l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(&a, i), None);
+            l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(a, i), None);
         }
         l.ResourceBarrier(&[crate::host::transition(
             &buffer,
@@ -327,15 +409,25 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         )]);
         for i in 0..n {
-            l.CopyTextureRegion(&sub(&b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
+            l.CopyTextureRegion(&sub(b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
         }
     }
     ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static LOGGED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
     let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
-    if logged.len() < 64 && !logged.contains(&(from as usize, to as usize)) {
-        logged.push((from as usize, to as usize));
-        tracing::info!(from = ?from, to = ?to, a = da.Format.0, b = db.Format.0, w = da.Width, h = da.Height, subresources = n, "aliased texture copied");
+    let pair = (Arc::as_ptr(from) as usize, Arc::as_ptr(&to_copy) as usize);
+    if logged.len() < 64 && !logged.contains(&pair) {
+        logged.push(pair);
+        tracing::info!(
+            from = format_args!("{:#x}", pair.0),
+            to = ?to,
+            a = da.Format.0,
+            b = db.Format.0,
+            w = da.Width,
+            h = da.Height,
+            subresources = n,
+            "aliased texture copied"
+        );
     }
 }
 
@@ -347,21 +439,10 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
     // Once per list for each host texture, however many title textures of
     // its memory the list samples.
     if is_host_written(resource) {
-        #[cfg(feature = "diagnostics")]
-        {
-            static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
-            if SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(resource as usize) {
-                let memory = crate::resource::texture_memory(resource).map(|(m, _)| m);
-                // SAFETY: a live resource.
-                let desc = unsafe { texture.GetDesc() };
-                tracing::debug!(?resource, ?memory, ?desc, "a sampled texture keeps what the host copied into it: not uploaded from title memory");
-            }
-        }
+        kept_host_contents(resource, texture);
         return;
     }
     if !list.first_use(texture.as_raw() as usize) {
@@ -370,9 +451,53 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let (Some(staging), Some(copy)) = (staging(resource, texture), crate::resource::host_copy(resource)) else {
         return;
     };
-    // Each list recorded the copy before (run perf7: 149 textures uploaded
-    // 3,195 times in a frame, 17 ms of GPU time), changed or not.
     list.defer_texture(staging, copy);
+}
+
+/// Uploads a caller-pinned host copy, avoiding a second host-copy lookup
+/// between upload and state transition.
+pub(crate) fn upload_copy(
+    list: &HostList,
+    resource: This,
+    copy: &Arc<crate::resource::HostTexture>,
+) {
+    if copy.host_written.load(std::sync::atomic::Ordering::Relaxed) {
+        kept_host_contents(resource, &copy.texture);
+        return;
+    }
+    if !list.first_use(copy.texture.as_raw() as usize) {
+        return;
+    }
+    let Some(staging) = staging_copy(resource, &copy.texture, copy) else {
+        return;
+    };
+    list.defer_texture(staging, copy.clone());
+}
+
+/// Diagnostics: record once per title texture that its host-written
+/// contents are intentionally retained rather than re-uploaded.
+#[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+fn kept_host_contents(resource: This, texture: &ID3D12Resource) {
+    #[cfg(feature = "diagnostics")]
+    {
+        static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+        if SEEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_default()
+            .insert(resource as usize)
+        {
+            let memory = crate::resource::texture_memory(resource).map(|(m, _)| m);
+            // SAFETY: a live resource.
+            let desc = unsafe { texture.GetDesc() };
+            tracing::debug!(
+                ?resource,
+                ?memory,
+                ?desc,
+                "a sampled texture keeps what the host copied into it: not uploaded from title memory"
+            );
+        }
+    }
 }
 
 /// Records into `list` the copy of `buffer` (laid out as `staging` says)
@@ -780,6 +905,15 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 /// (one for all title textures of its memory).
 pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let copy = crate::resource::host_copy(resource)?;
+    staging_copy(resource, texture, &copy)
+}
+
+/// Gets staging state for the exact host copy already pinned by the caller.
+fn staging_copy(
+    resource: This,
+    texture: &ID3D12Resource,
+    copy: &Arc<crate::resource::HostTexture>,
+) -> Option<Arc<Staging>> {
     let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = held.as_ref() {
         return Some(s.clone());
@@ -846,6 +980,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cached_title_written_flags_match_resource_flag_semantics() {
+        assert!(title_written_flags(0));
+        assert!(!title_written_flags(0x1)); // render target
+        assert!(!title_written_flags(0x2)); // depth/stencil
+        assert!(!title_written_flags(0x4)); // unordered access
+        assert!(!title_written_flags(0x7)); // any host-written use
+        assert!(title_written_flags(0x8)); // deny shader resource alone
+    }
+
+    #[test]
     fn subresource_len_stays_inside_staging_total() {
         // A 4x4 RGBA8 texture has RowPitch=256, rows=4, last_row=16 -> total=784.
         // Padded size (1024) must be clamped to 784 so from_raw_parts_mut stays in bounds.
@@ -877,5 +1021,304 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn alias_copy_survives_source_resource_release_after_alias_source() {
+        type Release = extern "system" fn(This) -> u32;
+        const RESOURCE_IID: crate::object::Iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        const RENDER_TARGET: u32 = 0x4;
+        const COPY_SOURCE: u32 = 0x800;
+
+        let Some(host) = host() else { return };
+        let _ = host.log_messages();
+
+        let backing = vec![0u8; 64 << 10];
+        let va = backing.as_ptr() as u64;
+        // R32G32_FLOAT (16) 4x4 linear render target (8 bytes/texel => 32 bytes/row, 4 rows)
+        // aliased by BC1_UNORM (71) 16x16 linear texture (8 bytes/4x4 block => 32 bytes/row, 4 rows).
+        let src_words: [u32; 14] = [3, 0, 0, 0, 4, 0, 4, 1 | (1 << 16), 16, 1, 0, 1, 1, 0];
+        let dst_words: [u32; 14] = [3, 0, 0, 0, 16, 0, 16, 1 | (1 << 16), 71, 1, 0, 1, 0, 0];
+        let (mut src, mut dst) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(
+            crate::resource::create_at_address(
+                std::ptr::null(),
+                va,
+                src_words.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IID,
+                &mut src,
+            ),
+            0
+        );
+        assert_eq!(
+            crate::resource::create_at_address(
+                std::ptr::null(),
+                va,
+                dst_words.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IID,
+                &mut dst,
+            ),
+            0
+        );
+
+        let src_copy = crate::resource::host_copy(src).expect("source host texture");
+        let dst_copy = crate::resource::host_copy(dst).expect("destination host texture");
+        assert!(
+            !Arc::ptr_eq(&src_copy, &dst_copy),
+            "BC1 and R32G32_FLOAT aliases use distinct host textures"
+        );
+
+        // Write a known non-zero pattern to `src` on the GPU.
+        let clear = host.new_list().unwrap();
+        crate::list::ensure_state(&clear, src, RENDER_TARGET);
+        let rtv = host.rtv(&src_copy.texture, None);
+        // SAFETY: open command list, live render target in RENDER_TARGET state.
+        unsafe { clear.list.ClearRenderTargetView(rtv, &[1.0, 2.0, 0.0, 0.0], None) };
+        clear.close();
+        host.execute(&[&clear]);
+        drop(src_copy);
+
+        // Lookup the alias source, then legally Release() the source Resource before alias_copy runs.
+        let found = crate::resource::alias_source(dst).expect("GPU-written alias source");
+        let freed_addr = src as usize;
+        assert_eq!(crate::object::slot::<Release>(src, 0x10)(src), 0);
+
+        // Recycle the freed Box<Resource> slot with newly created buffer resources of the same size.
+        let mut decoys = Vec::new();
+        for _ in 0..256 {
+            let buf = crate::resource::test_buffer(64);
+            let reused = buf as usize == freed_addr;
+            decoys.push(buf);
+            if reused {
+                break;
+            }
+        }
+
+        let copy = host.new_list().unwrap();
+        alias_copy(&copy, &found, dst);
+
+        // Read back the BC1 destination blocks to confirm the alias copy landed.
+        let (readback, mapped) = host.shared_buffer(4096).expect("readback buffer");
+        // SAFETY: mapped readback buffer.
+        unsafe { std::ptr::write_bytes(mapped, 0, 4096) };
+        // SAFETY: live destination host texture.
+        let dst_desc = unsafe { dst_copy.texture.GetDesc() };
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        // SAFETY: valid resource desc and out pointer.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &dst_desc,
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                None,
+            );
+        }
+        crate::list::ensure_state(&copy, dst, COPY_SOURCE);
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer kept alive until execute finishes.
+            pResource: unsafe { std::mem::transmute_copy(&readback) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: footprint,
+            },
+        };
+        let from_tex = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer kept alive by `dst_copy`.
+            pResource: unsafe { std::mem::transmute_copy(&dst_copy.texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        // SAFETY: open command list, destination in COPY_SOURCE state.
+        unsafe { copy.list.CopyTextureRegion(&to, 0, 0, 0, &from_tex, None) };
+        copy.close();
+        host.execute(&[&copy]);
+
+        let expected = [1.0f32.to_bits(), 2.0f32.to_bits()];
+        for row in 0..4usize {
+            for col in 0..4usize {
+                let offset = row * footprint.Footprint.RowPitch as usize + col * 8;
+                // SAFETY: inside mapped readback buffer.
+                let got = unsafe { mapped.add(offset).cast::<[u32; 2]>().read_unaligned() };
+                assert_eq!(got, expected, "BC1 block ({col}, {row}) after source Release()");
+            }
+        }
+        assert_eq!(host.log_messages(), None, "no D3D12 debug layer errors");
+
+        drop(dst_copy);
+        for buf in decoys {
+            assert_eq!(crate::object::slot::<Release>(buf, 0x10)(buf), 0);
+        }
+        assert_eq!(crate::object::slot::<Release>(dst, 0x10)(dst), 0);
+    }
+
+    #[test]
+    fn alias_source_and_copy_handle_concurrent_release_and_destination_eviction() {
+        use std::sync::Barrier;
+
+        type Release = extern "system" fn(This) -> u32;
+        const RESOURCE_IID: crate::object::Iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        const RENDER_TARGET: u32 = 0x4;
+        const COPY_SOURCE: u32 = 0x800;
+
+        let Some(host) = host() else { return };
+        let _ = host.log_messages();
+
+        let make_pair = |va: u64, color: [f32; 4]| -> (This, This) {
+            let src_words: [u32; 14] = [3, 0, 0, 0, 4, 0, 4, 1 | (1 << 16), 16, 1, 0, 1, 1, 0];
+            let dst_words: [u32; 14] = [3, 0, 0, 0, 16, 0, 16, 1 | (1 << 16), 71, 1, 0, 1, 0, 0];
+            let (mut src, mut dst) = (std::ptr::null(), std::ptr::null());
+            assert_eq!(
+                crate::resource::create_at_address(
+                    std::ptr::null(),
+                    va,
+                    src_words.as_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    &RESOURCE_IID,
+                    &mut src,
+                ),
+                0
+            );
+            assert_eq!(
+                crate::resource::create_at_address(
+                    std::ptr::null(),
+                    va,
+                    dst_words.as_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    &RESOURCE_IID,
+                    &mut dst,
+                ),
+                0
+            );
+            let src_copy = crate::resource::host_copy(src).expect("source host texture");
+            let dst_copy = crate::resource::host_copy(dst).expect("destination host texture");
+            assert!(!Arc::ptr_eq(&src_copy, &dst_copy));
+            let clear = host.new_list().unwrap();
+            crate::list::ensure_state(&clear, src, RENDER_TARGET);
+            let rtv = host.rtv(&src_copy.texture, None);
+            // SAFETY: open command list, live render target in RENDER_TARGET state.
+            unsafe { clear.list.ClearRenderTargetView(rtv, &color, None) };
+            clear.close();
+            host.execute(&[&clear]);
+            (src, dst)
+        };
+
+        let read_first_block = |list: &HostList, dst: This| -> [u32; 2] {
+            let dst_copy = crate::resource::host_copy(dst).expect("destination host texture");
+            let (readback, mapped) = host.shared_buffer(4096).expect("readback buffer");
+            // SAFETY: mapped readback buffer.
+            unsafe { std::ptr::write_bytes(mapped, 0, 4096) };
+            // SAFETY: live destination host texture.
+            let dst_desc = unsafe { dst_copy.texture.GetDesc() };
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            // SAFETY: valid resource desc and out pointer.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &dst_desc,
+                    0,
+                    1,
+                    0,
+                    Some(&mut footprint),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            crate::list::ensure_copy_state(list, &dst_copy, COPY_SOURCE);
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: borrowed pointer kept alive until execute finishes.
+                pResource: unsafe { std::mem::transmute_copy(&readback) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprint,
+                },
+            };
+            let from_tex = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: borrowed pointer kept alive by `dst_copy`.
+                pResource: unsafe { std::mem::transmute_copy(&dst_copy.texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            // SAFETY: open command list, destination in COPY_SOURCE state.
+            unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from_tex, None) };
+            list.close();
+            host.execute(&[list]);
+            // SAFETY: inside mapped readback buffer.
+            unsafe { mapped.cast::<[u32; 2]>().read_unaligned() }
+        };
+
+        // Part A: real two-thread race between `alias_source` + `alias_copy` and `src->Release()`.
+        let backing = vec![0u8; 64 << 10];
+        let va = backing.as_ptr() as u64;
+        for round in 0..16u32 {
+            let color = [(round + 1) as f32, (round + 101) as f32, 0.0, 0.0];
+            let expected = [color[0].to_bits(), color[1].to_bits()];
+            let (src, dst) = make_pair(va, color);
+            let src_raw = src as usize;
+            let dst_raw = dst as usize;
+            let start = Barrier::new(2);
+            let found = std::thread::scope(|s| {
+                let releaser = s.spawn(|| {
+                    start.wait();
+                    let r = src_raw as This;
+                    assert_eq!(crate::object::slot::<Release>(r, 0x10)(r), 0);
+                    let decoy = crate::resource::test_buffer(64);
+                    assert_eq!(crate::object::slot::<Release>(decoy, 0x10)(decoy), 0);
+                });
+                start.wait();
+                let source = crate::resource::alias_source(dst_raw as This);
+                releaser.join().unwrap();
+                source
+            });
+            if let Some(source) = found {
+                let copy = host.new_list().unwrap();
+                alias_copy(&copy, &source, dst);
+                assert_eq!(
+                    read_first_block(&copy, dst),
+                    expected,
+                    "round {round} concurrent Release() readback"
+                );
+            }
+            assert_eq!(crate::object::slot::<Release>(dst, 0x10)(dst), 0);
+        }
+
+        // Part B: destination evicted between `alias_source` and `alias_copy` still copies into a
+        // single consistent recreated destination host texture with zero D3D12 errors.
+        let (src, dst) = make_pair(va, [3.0, 4.0, 0.0, 0.0]);
+        let found = crate::resource::alias_source(dst).expect("GPU-written alias source");
+        assert!(crate::resource::give_up_now(dst), "destination evicted");
+        assert_eq!(crate::object::slot::<Release>(src, 0x10)(src), 0);
+        let copy = host.new_list().unwrap();
+        alias_copy(&copy, &found, dst);
+        assert_eq!(
+            read_first_block(&copy, dst),
+            [3.0f32.to_bits(), 4.0f32.to_bits()],
+            "copy lands on recreated destination after eviction and source Release()"
+        );
+        assert_eq!(host.log_messages(), None, "no D3D12 debug layer errors");
+        assert_eq!(crate::object::slot::<Release>(dst, 0x10)(dst), 0);
     }
 }

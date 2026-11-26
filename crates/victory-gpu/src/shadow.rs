@@ -508,8 +508,18 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
+        // One buffer per thread for the title's page, not a fresh zeroed
+        // 64 KiB for each (thousands of marked pages a world frame; a fresh
+        // allocation's pages fault in again). Every byte of it up to `n` is
+        // read from the title before use.
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut title = TITLE.with(|t| std::mem::take(&mut *t.borrow_mut()));
+        title.resize(n, 0);
+        let give_back = |title: Vec<u8>| TITLE.with(|t| *t.borrow_mut() = title);
         if !crate::host::read_into(from as *const u8, &mut title) {
+            give_back(title);
             return 0;
         }
         let written = match &saved {
@@ -525,6 +535,7 @@ impl Shadow {
             let _writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
         }
+        give_back(title);
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
             t.taken(&[page / PAGE]);
@@ -815,25 +826,23 @@ pub(crate) fn view_writes(memory: bool) -> Option<u64> {
 
 /// Heap slots whose texture views shaders read: the marks seen so far (a
 /// slot's stays set in the bitmap until [`forget_read`]), and the slots to
-/// clear at the next [`take_reads`].
+/// clear before the next submission.
 static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()));
 
-/// After a submission: the heap slots its shaders first read texture views
-/// at (`victory_shader::emit`, "Read marks"), each once until
-/// [`forget_read`]. Clears the slots forgotten since first.
-pub(crate) fn take_reads() -> Vec<u32> {
+/// Clear forgotten read marks after the previous submission has finished and
+/// before the next one runs. Doing this before execution matters: clearing in
+/// [`take_reads`] would also erase a new mark written by that next submission.
+pub(crate) fn clear_forgotten() {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
-    // Both bitmaps: shaders that use title memory mark their reads in theirs.
     let mut maps: Vec<&mut [u32]> = [false, true]
         .into_iter()
         .filter_map(bitmap)
-        // SAFETY: the mapped bitmap's read marks; the GPU is done with them
-        // (one submission runs at a time).
+        // SAFETY: the previous submission is done and the next has not run.
         .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
         .collect();
     if maps.is_empty() {
-        return Vec::new();
+        return;
     }
     let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
     let (seen, forgotten) = &mut *reads;
@@ -845,6 +854,28 @@ pub(crate) fn take_reads() -> Vec<u32> {
             seen[w] &= !bit;
         }
     }
+}
+
+/// After a submission: the heap slots its shaders first read texture views
+/// at (`victory_shader::emit`, "Read marks"), each once until
+/// [`forget_read`].
+pub(crate) fn take_reads() -> Vec<u32> {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
+    // Both bitmaps: shaders that use title memory mark their reads in theirs.
+    let maps: Vec<&mut [u32]> = [false, true]
+        .into_iter()
+        .filter_map(bitmap)
+        // SAFETY: the mapped bitmap's read marks; the GPU is done with them
+        // (one submission runs at a time).
+        .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
+        .collect();
+    if maps.is_empty() {
+        return Vec::new();
+    }
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    let (seen, _) = &mut *reads;
+    seen.resize(words, 0);
     let mut new = Vec::new();
     for (w, s) in seen.iter_mut().enumerate() {
         let mut fresh = maps.iter().fold(0, |x, bits| x | bits[w]) & !*s;
@@ -886,6 +917,34 @@ pub(crate) fn reads_since() -> Vec<u32> {
 /// marked again.
 pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
+}
+
+/// Take whether heap slot `slot` was queued to be marked again
+/// ([`forget_read`]); removes the test's entry so it cannot affect another test.
+#[cfg(test)]
+pub(crate) fn take_forgotten(slot: u32) -> bool {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
+    let mut maps: Vec<&mut [u32]> = [false, true]
+        .into_iter()
+        .filter_map(bitmap)
+        // SAFETY: this test-only cleanup runs with no submission in flight.
+        .map(|b| unsafe {
+            std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words)
+        })
+        .collect();
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(at) = reads.1.iter().position(|&s| s == slot) else {
+        return false;
+    };
+    reads.1.remove(at);
+    let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
+    if w < words {
+        maps.iter_mut().for_each(|bits| bits[w] &= !bit);
+        reads.0.resize(words, 0);
+        reads.0[w] &= !bit;
+    }
+    true
 }
 
 /// After a submission: every page its shaders marked as written through
@@ -1523,6 +1582,44 @@ pub(crate) mod tests {
         let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
+        unregister(p, p as u64);
+    }
+
+    /// Marked pages go back one after another through one buffer for the
+    /// title's bytes: a whole page the shaders filled, then the copy's last
+    /// page, held in part, which the title and a shader both wrote. None of
+    /// the first page's bytes reach the second.
+    #[test]
+    fn a_partial_marked_page_after_a_whole_one_takes_none_of_its_bytes() {
+        let p = crate::watch::tests::pool(2);
+        let len = PAGE + PAGE / 2;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        // The shaders fill page 0 and write a byte of page 1; the title
+        // writes another byte of page 1 meanwhile.
+        copy.write_host(p as u64, &vec![0xee; PAGE]);
+        copy.write_host((p + PAGE + 20) as u64, &[0xbb]);
+        let title = |at: usize| (p + at) as *mut u8;
+        // SAFETY: (title writes and reads below) bytes of our pool.
+        unsafe { title(PAGE + 40).write_volatile(0x11) };
+        let bits = b.data as *mut u32;
+        for n in [base, base + 1] {
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *bits.add(n / 32) |= 1 << (n % 32) };
+        }
+        copy_back_marks(&[], false);
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { title(at).read_volatile() };
+        assert!((0..PAGE).all(|at| read(at) == 0xee), "page 0 went back whole");
+        assert_eq!((read(PAGE + 20), read(PAGE + 40)), (0xbb, 0x11), "both writers' bytes, page 1");
+        let stale = (PAGE..len).filter(|&at| at != PAGE + 20 && at != PAGE + 40).find(|&at| read(at) != 0);
+        assert_eq!(stale, None, "a byte of page 1 the first page's buffer left");
         unregister(p, p as u64);
     }
 

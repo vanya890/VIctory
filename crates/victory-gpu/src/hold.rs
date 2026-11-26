@@ -83,6 +83,8 @@ pub(crate) struct Pumped {
     pub(crate) waited: Vec<(usize, Duration)>,
     /// Waits with a comparison we do not know (taken as holding).
     pub(crate) unknown: u32,
+    /// Whether any queue still has work waiting after this pump.
+    pub(crate) blocked: bool,
 }
 
 /// Every queue's held work.
@@ -131,7 +133,30 @@ impl<S, F> Held<S, F> {
     }
 
     /// Runs every queue's heads that may run, until none can.
+    ///
+    /// Each memory word is read at most once between executions in this
+    /// pump. Running a piece may write wait words, so execution invalidates
+    /// the cache before any queue is tested again.
     pub(crate) fn pump(&mut self, w: &mut World<S, F>) -> Pumped {
+        let World {
+            read,
+            fence,
+            run,
+            signal,
+        } = w;
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read = |address: u64, bytes: u8| {
+            let mut cache = reads.borrow_mut();
+            if let Some((_, _, value)) = cache
+                .iter()
+                .find(|(a, b, _)| *a == address && *b == bytes)
+            {
+                return *value;
+            }
+            let value = read(address, bytes);
+            cache.push((address, bytes, value));
+            value
+        };
         let mut done = Pumped::default();
         loop {
             let mut moved = false;
@@ -143,7 +168,7 @@ impl<S, F> Held<S, F> {
                         Some((Item::Segment(_, waits), since, fresh)) => {
                             let mut ok = true;
                             for wait in waits.iter() {
-                                match wait.holds(w.read) {
+                                match wait.holds(&read) {
                                     Some(true) => {}
                                     Some(false) => ok = false,
                                     None => done.unknown += 1,
@@ -160,13 +185,14 @@ impl<S, F> Held<S, F> {
                         // it runs first.
                         Some((Item::Signal(..), ..)) => {
                             if !piece.is_empty() {
-                                (w.run)(*queue, std::mem::take(&mut piece));
+                                run(*queue, std::mem::take(&mut piece));
+                                reads.borrow_mut().clear();
                                 done.pieces += 1;
                             }
                             true
                         }
-                        Some((Item::FenceWait(fence, value), _, fresh)) => {
-                            let ok = (w.fence)(fence) >= *value;
+                        Some((Item::FenceWait(f, value), _, fresh)) => {
+                            let ok = fence(f) >= *value;
                             if !ok {
                                 *fresh = false;
                             }
@@ -182,13 +208,22 @@ impl<S, F> Held<S, F> {
                             piece.push(s);
                             done.segments += 1;
                         }
-                        Some(Item::Signal(fence, value)) => (w.signal)(fence, value),
-                        Some(Item::FenceWait(fence, _)) => drop(fence),
+                        Some(Item::Signal(fence, value)) => {
+                            signal(fence, value);
+                            reads.borrow_mut().clear();
+                        },
+                        Some(Item::FenceWait(fence, _)) => {
+                            drop(fence);
+                            // A completed fence is a synchronization boundary: work
+                            // signaled outside this pump may have changed a cached wait word.
+                            reads.borrow_mut().clear();
+                        }
                         None => {}
                     }
                 }
                 if !piece.is_empty() {
-                    (w.run)(*queue, piece);
+                    run(*queue, piece);
+                    reads.borrow_mut().clear();
                     done.pieces += 1;
                 }
             }
@@ -197,6 +232,10 @@ impl<S, F> Held<S, F> {
             }
         }
         self.queues.retain(|(_, items)| !items.is_empty());
+        // Derive this from the final queue state, not from an observation
+        // made during an earlier pass: later queues may have released a
+        // previously blocked head. FenceWait heads also keep the timer alive.
+        done.blocked = !self.queues.is_empty();
         done
     }
 
@@ -328,6 +367,122 @@ mod tests {
         let p = pump(&mut held, &fake);
         assert_eq!(fake.borrow().log, ["q2: a b"], "one piece");
         assert_eq!((p.pieces, p.waited.len()), (1, 0));
+    }
+
+    #[test]
+    fn a_pump_reads_each_address_and_width_once_until_work_runs() {
+        use std::cell::Cell;
+
+        let reads = Cell::new(0);
+        let read = |address: u64, _bytes: u8| {
+            reads.set(reads.get() + 1);
+            Some(u64::from(address == 0x200))
+        };
+        let fence = |_: &usize| 0;
+        let mut run = |_: usize, _: Vec<&'static str>| {};
+        let mut signal = |_: usize, _: u64| {};
+        let mut held = Held::default();
+        held.push(
+            1,
+            Item::Segment("same-word", vec![ge(0x100, 1), ge(0x100, 2)]),
+        );
+        let narrow = ValueWait {
+            address: 0x100,
+            bytes: 4,
+            comparison: GREATER_EQUAL,
+            reference: 1,
+            mask: 0xffff_ffff,
+        };
+        held.push(2, Item::Segment("different-width", vec![narrow]));
+
+        let pumped = held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        });
+
+        assert!(pumped.blocked);
+        assert_eq!(
+            reads.get(),
+            2,
+            "same address at 8 and 4 bytes is two cache keys"
+        );
+    }
+
+    /// A completed external fence may publish memory writes while this pump
+    /// still holds a cached pre-fence value for the same wait word.
+    #[test]
+    fn a_satisfied_fence_wait_invalidates_the_wait_word_cache() {
+        use std::cell::Cell;
+
+        let memory = RefCell::new(HashMap::from([(0x100, 0)]));
+        let reads = Cell::new(0);
+        let read = |address: u64, _bytes: u8| {
+            reads.set(reads.get() + 1);
+            Some(*memory.borrow().get(&address).unwrap_or(&0))
+        };
+        let fence = |value: &usize| {
+            if *value == 5 {
+                // Model work completed before the fence was signaled.
+                memory.borrow_mut().insert(0x100, 1);
+                5
+            } else {
+                0
+            }
+        };
+        let ran = RefCell::new(Vec::new());
+        let mut run = |queue: usize, segments: Vec<&'static str>| {
+            ran.borrow_mut().push((queue, segments));
+        };
+        let mut signal = |_: usize, _: u64| {};
+        let mut held = Held::default();
+        // Queue 1 seeds the cache with X=0 and blocks.
+        held.push(1, Item::Segment("queue-a", vec![ge(0x100, 1)]));
+        // Queue 2 observes the completed fence, which makes X=1 visible.
+        held.push(2, Item::FenceWait(5, 5));
+        held.push(2, Item::Segment("after-fence", vec![ge(0x100, 1)]));
+
+        let pumped = held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        });
+        assert_eq!(*ran.borrow(), vec![(2, vec!["after-fence"]), (1, vec!["queue-a"])]);
+        assert_eq!(reads.get(), 3, "the post-fence read must not reuse X=0");
+        assert!(!pumped.blocked);
+        assert!(held.is_empty());
+    }
+    #[test]
+    fn a_queue_unblocked_by_later_work_does_not_remain_blocked() {
+        let fake = RefCell::new(Fake::default());
+        fake.borrow_mut().writes.insert("release", vec![(0x100, 1)]);
+        let mut held = Held::default();
+        // Queue 1 is tested before queue 2, so it blocks on the first pass.
+        held.push(1, Item::Segment("waiting", vec![ge(0x100, 1)]));
+        held.push(2, Item::Segment("release", vec![]));
+
+        let p = pump(&mut held, &fake);
+
+        assert_eq!(
+            fake.borrow().log,
+            ["q2: release", "q1: waiting"]
+        );
+        assert!(!p.blocked, "all queues drained during the later pump pass");
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn a_pending_fence_wait_keeps_the_pump_blocked() {
+        let fake = RefCell::new(Fake::default());
+        let mut held = Held::default();
+        held.push(2, Item::FenceWait(5, 2));
+
+        let p = pump(&mut held, &fake);
+
+        assert!(p.blocked, "FenceWait must keep the timer polling active");
+        assert!(held.holds_work(2));
     }
 
     /// A list's second segment waits for a value the other queue writes

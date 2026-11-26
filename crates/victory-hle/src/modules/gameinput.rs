@@ -1270,43 +1270,265 @@ mod host {
         }
     }
 
+    /// One scripted key: pressed from `from`, until `to`; with `every` it
+    /// is pressed again each `every` (each press lasts [`PRESS`]).
+    #[derive(Debug, PartialEq)]
+    #[cfg(any(test, feature = "diagnostics"))]
+    struct Scripted {
+        from: Duration,
+        to: Duration,
+        every: Option<Duration>,
+        /// How long each repeated press is held (`+<hold>`; 0.2 s by default).
+        hold: Duration,
+        vk: u8,
+    }
+
+    /// How long each scripted press is held.
+    #[cfg(any(test, feature = "diagnostics"))]
+    const PRESS: Duration = Duration::from_millis(200);
+
+    /// The virtual key a script names: a letter, a digit, or `Enter`, `Esc`,
+    /// `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn key_named(name: &str) -> Option<u8> {
+        Some(match name.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
+    /// The entries of a `VICTORY_KEYS` list; one that does not parse is
+    /// left out.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn parse_script(list: &str) -> Vec<Scripted> {
+        let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
+        list.split(',')
+            .filter_map(|entry| {
+                let (at, key) = entry.split_once(':')?;
+                let vk = key_named(key)?;
+                // `<from>-<to>/<every>[+<hold>]`: the `/<every>` part is optional,
+                // and `+<hold>` (shorter than `<every>`) lengthens each press,
+                // e.g. for prompts that skip only while the key is held.
+                let (span, every, hold) = match at.split_once('/') {
+                    Some((span, rest)) => {
+                        // A repeat period only makes sense over an explicit range.
+                        span.split_once('-')?;
+                        let (every, hold) = match rest.split_once('+') {
+                            Some((every, hold)) => (time(every)?, time(hold)?),
+                            None => (time(rest)?, PRESS),
+                        };
+                        if hold.is_zero() || every <= hold {
+                            return None;
+                        }
+                        (span, Some(every), hold)
+                    }
+                    None => (at, None, PRESS),
+                };
+                let (from, to) = match span.split_once('-') {
+                    Some((from, to)) => (time(from)?, time(to)?),
+                    None => (time(span)?, time(span)? + PRESS),
+                };
+                Some(Scripted { from, to, every, hold, vk })
+            })
+            .collect()
+    }
+
+    /// The keys of `script` held `now` after input started.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn held_at(script: &[Scripted], now: Duration) -> Vec<u8> {
+        script
+            .iter()
+            .filter(|k| {
+                if !(k.from..k.to).contains(&now) {
+                    return false;
+                }
+                match k.every {
+                    // Held for the whole span, or pressed again each period.
+                    None => true,
+                    Some(every) => (now - k.from).as_nanos() % every.as_nanos() < k.hold.as_nanos(),
+                }
+            })
+            .map(|k| k.vk)
+            .collect()
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
+    /// time; `<from>-<to>/<every>:<key>`: pressed for 0.2 s every `<every>`
+    /// seconds in that time, e.g. `2-120/1:Enter` to get through menus a
+    /// second after they are ready, not up to a period late;
+    /// `<from>-<to>/<every>+<hold>:<key>`: held `<hold>` seconds each time,
+    /// e.g. `2-200/3+2.5:Enter` both steps through menus and holds long
+    /// enough to skip a hold-to-skip cutscene), with or
+    /// without focus. A key is a letter, a digit, or `Enter`, `Esc`, `Tab`,
+    /// `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in pad's table maps
+    /// them to buttons).
+    ///
+    /// `VICTORY_KEYS_FILE=<path>`: one key name per newline-terminated line
+    /// (as above), each pressed for 0.2 s once its line is there, in order,
+    /// so a script watching the log can press a key exactly when a screen is
+    /// ready (`Add-Content <path> Enter`). The file is append-only: do not
+    /// truncate or rewrite it. Incomplete final lines wait for their newline;
+    /// invalid complete names are consumed with a warning.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<Scripted>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
+            (Instant::now(), parse_script(&list))
         });
         let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+        let mut down = held_at(keys, start.elapsed());
+        down.extend(asked());
+        down
+    }
+
+    /// The next key of the lines in `VICTORY_KEYS_FILE`, while it is held.
+    #[cfg(feature = "diagnostics")]
+    fn asked() -> Option<u8> {
+        struct Asked {
+            looked: Instant,
+            done: usize,
+            held: Option<(Instant, u8)>,
+        }
+        static ASKED: LazyLock<Mutex<Asked>> = LazyLock::new(|| {
+            Mutex::new(Asked { looked: Instant::now(), done: 0, held: None })
+        });
+        static FILE: LazyLock<Option<std::ffi::OsString>> =
+            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE"));
+        let file = FILE.as_ref()?;
+        let mut a = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if let Some((since, vk)) = a.held {
+            let age = now - since;
+            if age < PRESS {
+                return Some(vk);
+            }
+            // A gap between two presses, so the title sees each one.
+            if age < PRESS * 3 {
+                return None;
+            }
+            a.held = None;
+        }
+        // The file is looked at ten times a second at most.
+        if !poll_due(now, &mut a.looked) {
+            return None;
+        }
+        let text = std::fs::read_to_string(file).ok()?;
+        loop {
+            let (line, next) = complete_line_at(&text, a.done)?;
+            a.done = next;
+            let name = line.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let Some(vk) = key_named(name) else {
+                tracing::warn!(line = a.done, key = name, "unknown key in VICTORY_KEYS_FILE; line consumed");
+                continue;
+            };
+            tracing::info!(key = name, "a key was asked for (VICTORY_KEYS_FILE)");
+            a.held = Some((now, vk));
+            return Some(vk);
+        }
+    }
+
+    /// Whether the file poll interval has elapsed; a skipped poll leaves the
+    /// previous timestamp untouched.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn poll_due(now: Instant, looked: &mut Instant) -> bool {
+        if now - *looked < Duration::from_millis(100) {
+            false
+        } else {
+            *looked = now;
+            true
+        }
+    }
+
+    /// Returns the zero-based cursor's complete line and its next value.
+    /// A final unterminated fragment stays invisible until its newline arrives.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn complete_line_at(text: &str, cursor: usize) -> Option<(&str, usize)> {
+        let line = text.split_inclusive('\n').filter_map(|line| line.strip_suffix('\n')).nth(cursor)?;
+        Some((line.strip_suffix('\r').unwrap_or(line), cursor + 1))
+    }
+
+    #[test]
+    fn scripts_repeat_and_hold() {
+        let s = |t: f64| Duration::from_secs_f64(t);
+        let script = parse_script("5:Enter, 2-10/1:Down,3-4:A,bad,7/0.1:Up,1/x:Up");
+        assert_eq!(script.len(), 3);
+        assert_eq!(held_at(&script, s(5.1)), [0x0D, 0x28]);
+        assert_eq!(held_at(&script, s(5.3)), Vec::<u8>::new());
+        // Pressed at 2.0, 3.0, ... for 0.2 s each.
+        assert_eq!(held_at(&script, s(2.1)), [0x28]);
+        assert_eq!(held_at(&script, s(2.5)), Vec::<u8>::new());
+        assert_eq!(held_at(&script, s(9.05)), [0x28]);
+        assert_eq!(held_at(&script, s(10.05)), Vec::<u8>::new());
+        // Held for the whole span, with no period.
+        assert_eq!(held_at(&script, s(3.5)), [b'A']);
+        assert_eq!(held_at(&script, s(3.05)), [0x28, b'A']);
+        // Long holds with a short release between them; a hold as long as the
+        // period (or zero) is refused. A repeat period without a from-to span
+        // is rejected rather than silently becoming a one-shot press.
+        let script = parse_script("2-20/3+2.5:Enter,2-20/1+1:A,2-20/1+0:A,7/1:Enter,7-10/1:Enter,21:Enter");
+        assert_eq!(script.len(), 3);
+        assert_eq!(held_at(&script, s(4.4)), [0x0D]);
+        assert_eq!(held_at(&script, s(4.6)), Vec::<u8>::new());
+        assert_eq!(held_at(&script, s(21.1)), [0x0D]);
+    }
+
+    #[test]
+    fn scripted_file_lines_wait_for_newline_and_keep_cursor_stable() {
+        let partial = "Ent";
+        assert_eq!(complete_line_at(partial, 0), None);
+        let completed = "Enter\n";
+        let (line, next) = complete_line_at(completed, 0).unwrap();
+        assert_eq!(line, "Enter");
+        assert_eq!(next, 1);
+        assert_eq!(key_named(line), Some(0x0D));
+
+        let lines = "bad-key\nEnter\n";
+        let (bad, cursor) = complete_line_at(lines, 0).unwrap();
+        assert_eq!(key_named(bad), None);
+        let (good, next) = complete_line_at(lines, cursor).unwrap();
+        assert_eq!(good, "Enter");
+        assert_eq!(key_named(good), Some(0x0D));
+        assert_eq!(next, 2);
+
+        let lines = "\r\nTab\r\n";
+        let (blank, cursor) = complete_line_at(lines, 0).unwrap();
+        assert!(blank.trim().is_empty());
+        let (crlf, next) = complete_line_at(lines, cursor).unwrap();
+        assert_eq!(crlf, "Tab");
+        assert_eq!(key_named(crlf), Some(0x09));
+        assert_eq!(next, 2);
+
+        // A partial append stays pending across throttled polls and becomes
+        // consumable only after both the interval and terminating newline.
+        let start = Instant::now();
+        let mut looked = start;
+        let mut cursor = 0;
+        let first = start + Duration::from_millis(100);
+        assert!(poll_due(first, &mut looked));
+        assert_eq!(complete_line_at("Ent", cursor), None);
+        let appended = first + Duration::from_millis(50);
+        assert!(!poll_due(appended, &mut looked));
+        assert_eq!(cursor, 0);
+        let ready = first + Duration::from_millis(100);
+        assert!(poll_due(ready, &mut looked));
+        let (line, next) = complete_line_at("Enter\n", cursor).unwrap();
+        assert_eq!(line, "Enter");
+        cursor = next;
+        assert_eq!(cursor, 1);
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

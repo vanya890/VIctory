@@ -10,7 +10,8 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex, MutexGuard};
+use std::thread::ThreadId;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -27,56 +28,149 @@ type Routine = extern "system" fn(flag: u8, context: *mut c_void);
 /// Registration id, routine and context.
 type Registration = (usize, Routine, usize);
 
+/// Registered routines and the invocations currently running outside the lock.
+struct NotificationState {
+    entries: Vec<Registration>,
+    running: Vec<(usize, ThreadId)>,
+}
+
+/// A notification list that keeps callback context safe until any in-flight
+/// invocation on another thread has returned after unregistration.
+struct Notifications {
+    state: Mutex<NotificationState>,
+    done: Condvar,
+}
+
+impl Notifications {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(NotificationState {
+                entries: Vec::new(),
+                running: Vec::new(),
+            }),
+            done: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, NotificationState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn len(&self) -> usize {
+        self.lock().entries.len()
+    }
+
+    /// Adds `routine` and writes its registration id before publishing it.
+    fn register(
+        &self,
+        routine: Option<Routine>,
+        context: *mut c_void,
+        registration: *mut usize,
+    ) -> u32 {
+        let Some(routine) = routine else {
+            return ERROR_INVALID_PARAMETER;
+        };
+        if registration.is_null() {
+            return ERROR_INVALID_PARAMETER;
+        }
+        static NEXT: AtomicUsize = AtomicUsize::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut state = self.lock();
+        // SAFETY: checked non-null; the title passes room for its registration.
+        unsafe { registration.write(id) };
+        state.entries.push((id, routine, context as usize));
+        0
+    }
+
+    /// Removes `registration` and waits for any in-flight invocation on
+    /// another thread to finish before returning.
+    fn unregister(&self, registration: usize) {
+        let me = std::thread::current().id();
+        let mut state = self.lock();
+        state.entries.retain(|&(id, ..)| id != registration);
+        while state
+            .running
+            .iter()
+            .any(|&(id, thread)| id == registration && thread != me)
+        {
+            state = self.done.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Invokes each registered routine with `flag`, re-checking registration
+    /// before each call so routines unregistered mid-dispatch are skipped.
+    fn notify(&self, flag: u8) {
+        let ids: Vec<usize> = self.lock().entries.iter().map(|&(id, ..)| id).collect();
+        let me = std::thread::current().id();
+        for id in ids {
+            let target = {
+                let mut state = self.lock();
+                let found = state
+                    .entries
+                    .iter()
+                    .find(|&&(entry_id, ..)| entry_id == id)
+                    .map(|&(_, routine, context)| (routine, context));
+                if found.is_some() {
+                    state.running.push((id, me));
+                }
+                found
+            };
+            let Some((routine, context)) = target else {
+                continue;
+            };
+            let _active = Active {
+                notifications: self,
+                id,
+                thread: me,
+            };
+            routine(flag, context as *mut c_void);
+        }
+    }
+}
+
+/// RAII guard marking an in-flight callback finished even on unwind.
+struct Active<'a> {
+    notifications: &'a Notifications,
+    id: usize,
+    thread: ThreadId,
+}
+
+impl Drop for Active<'_> {
+    fn drop(&mut self) {
+        let mut state = self.notifications.lock();
+        if let Some(pos) = state
+            .running
+            .iter()
+            .rposition(|&(id, thread)| id == self.id && thread == self.thread)
+        {
+            state.running.swap_remove(pos);
+        }
+        drop(state);
+        self.notifications.done.notify_all();
+    }
+}
+
 /// Each suspend routine.
-static ROUTINES: Mutex<Vec<Registration>> = Mutex::new(Vec::new());
+static ROUTINES: Notifications = Notifications::new();
 
 /// Each constrained-change routine.
-static CONSTRAINED: Mutex<Vec<Registration>> = Mutex::new(Vec::new());
-
-fn routines() -> MutexGuard<'static, Vec<Registration>> {
-    ROUTINES.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn constrained() -> MutexGuard<'static, Vec<Registration>> {
-    CONSTRAINED.lock().unwrap_or_else(|e| e.into_inner())
-}
+static CONSTRAINED: Notifications = Notifications::new();
 
 /// How long the console lets suspend routines run before it ends the title.
 const SUSPEND_DEADLINE: Duration = Duration::from_secs(1);
 
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
-/// Adds `routine` to `list` and writes its registration id.
-fn register(
-    mut list: MutexGuard<'static, Vec<Registration>>,
-    routine: Option<Routine>,
-    context: *mut c_void,
-    registration: *mut usize,
-) -> u32 {
-    let Some(routine) = routine else {
-        return ERROR_INVALID_PARAMETER;
-    };
-    if registration.is_null() {
-        return ERROR_INVALID_PARAMETER;
-    }
-    static NEXT: AtomicUsize = AtomicUsize::new(1);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    list.push((id, routine, context as usize));
-    // SAFETY: checked non-null; the title passes room for its registration.
-    unsafe { registration.write(id) };
-    0
-}
-
 pub extern "system" fn RegisterAppStateChangeNotification(
     routine: Option<Routine>,
     context: *mut c_void,
     registration: *mut usize,
 ) -> u32 {
-    register(routines(), routine, context, registration)
+    ROUTINES.register(routine, context, registration)
 }
 
 pub extern "system" fn UnregisterAppStateChangeNotification(registration: usize) {
-    routines().retain(|&(id, ..)| id != registration);
+    ROUTINES.unregister(registration);
 }
 
 /// The host's own version never calls the routine (a desktop app is never
@@ -86,11 +180,11 @@ pub extern "system" fn RegisterAppConstrainedChangeNotification(
     context: *mut c_void,
     registration: *mut usize,
 ) -> u32 {
-    register(constrained(), routine, context, registration)
+    CONSTRAINED.register(routine, context, registration)
 }
 
 pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: usize) {
-    constrained().retain(|&(id, ..)| id != registration);
+    CONSTRAINED.unregister(registration);
 }
 
 /// The window procedure a title window had before ours.
@@ -485,11 +579,9 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     if ENDING.swap(true, Ordering::SeqCst) {
         return;
     }
-    let constrain = constrained().clone();
-    let suspend = routines().clone();
     tracing::info!(
-        constrained = constrain.len(),
-        routines = suspend.len(),
+        constrained = CONSTRAINED.len(),
+        routines = ROUTINES.len(),
         "{why}: suspending the title"
     );
     // Whoever comes first (the routines or the deadline) runs `then`; the
@@ -507,7 +599,7 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     // Not on the calling thread: titles hand the suspend to their window
     // thread and wait for it inside the routine.
     std::thread::spawn(move || {
-        constrain_then_suspend(&constrain, &suspend);
+        constrain_then_suspend(&CONSTRAINED, &ROUTINES);
         finish("title suspended");
     });
     std::thread::spawn(move || {
@@ -520,10 +612,15 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
 /// routines (quiesced), as the console does when it suspends a title.
 /// Grand Theft Auto VI's suspend routine waits for a state that only its
 /// constrained routine brings about; called alone it never returns.
-fn constrain_then_suspend(constrain: &[Registration], suspend: &[Registration]) {
-    for &(_, routine, context) in constrain.iter().chain(suspend) {
-        routine(1, context as *mut c_void);
-    }
+/// `end_title`'s one-shot `ENDING` gate guarantees a single production dispatcher;
+/// concurrent dispatchers must not call this helper (two callbacks that both
+/// self-unregister could otherwise wait for one another). Each phase snapshots
+/// its registrations when `notify` starts, so a suspend routine registered by
+/// a constrained callback participates in this same shutdown; removals before
+/// a callback's turn are re-checked and skipped.
+fn constrain_then_suspend(constrain: &Notifications, suspend: &Notifications) {
+    constrain.notify(1);
+    suspend.notify(1);
 }
 
 /// Set in the environment of a relaunched `victory`: an inherited handle
@@ -617,6 +714,7 @@ mod tests {
 
     #[test]
     fn registrations_come_and_go() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (mut a, mut b) = (0, 0);
         assert_eq!(
             RegisterAppStateChangeNotification(Some(noop), std::ptr::null_mut(), &mut a),
@@ -627,12 +725,14 @@ mod tests {
             0
         );
         UnregisterAppStateChangeNotification(a);
-        let left: Vec<_> = routines().iter().map(|r| r.0).collect();
+        let left: Vec<_> = ROUTINES.lock().entries.iter().map(|r| r.0).collect();
         assert_eq!(left, [b]);
+        UnregisterAppStateChangeNotification(b);
     }
 
     #[test]
     fn constrained_registrations_come_and_go() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (mut a, mut b) = (0, 0);
         assert_eq!(
             RegisterAppConstrainedChangeNotification(Some(noop), std::ptr::null_mut(), &mut a),
@@ -647,8 +747,9 @@ mod tests {
             ERROR_INVALID_PARAMETER
         );
         UnregisterAppConstrainedChangeNotification(a);
-        let left: Vec<_> = constrained().iter().map(|r| r.0).collect();
+        let left: Vec<_> = CONSTRAINED.lock().entries.iter().map(|r| r.0).collect();
         assert_eq!(left, [b]);
+        UnregisterAppConstrainedChangeNotification(b);
     }
 
     /// What `recording_routine` saw: (context, flag) per call, in order.
@@ -660,9 +761,359 @@ mod tests {
 
     #[test]
     fn constrained_routines_run_before_suspend_routines() {
-        let r: Routine = recording_routine;
-        constrain_then_suspend(&[(1, r, 10), (2, r, 11)], &[(3, r, 20), (4, r, 21)]);
+        let constrain = Notifications::new();
+        let suspend = Notifications::new();
+        let mut id = 0;
+        for ctx in [10usize, 11] {
+            assert_eq!(
+                constrain.register(Some(recording_routine), ctx as *mut c_void, &mut id),
+                0
+            );
+        }
+        for ctx in [20usize, 21] {
+            assert_eq!(
+                suspend.register(Some(recording_routine), ctx as *mut c_void, &mut id),
+                0
+            );
+        }
+        constrain_then_suspend(&constrain, &suspend);
         assert_eq!(*CALLS.lock().unwrap(), [(10, 1), (11, 1), (20, 1), (21, 1)]);
+    }
+
+    #[test]
+    fn suspend_routines_registered_during_constrained_phase_run_in_same_dispatch() {
+        struct Registration {
+            suspend: *const Notifications,
+            calls: *const AtomicUsize,
+        }
+
+        extern "system" fn count_suspend(_: u8, context: *mut c_void) {
+            // SAFETY: points to the atomic owned by this test until dispatch returns.
+            let calls = unsafe { &*context.cast::<AtomicUsize>() };
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        extern "system" fn register_suspend(_: u8, context: *mut c_void) {
+            // SAFETY: points to the registration context owned by this test.
+            let context = unsafe { &*context.cast::<Registration>() };
+            // SAFETY: the referenced Notifications remains alive through the synchronous dispatch.
+            let suspend = unsafe { &*context.suspend };
+            let mut id = 0;
+            assert_eq!(
+                suspend.register(
+                    Some(count_suspend),
+                    context.calls as *mut c_void,
+                    &mut id,
+                ),
+                0
+            );
+        }
+
+        let constrain = Notifications::new();
+        let suspend = Notifications::new();
+        let calls = AtomicUsize::new(0);
+        let context = Registration {
+            suspend: &suspend,
+            calls: &calls,
+        };
+        let mut id = 0;
+        assert_eq!(
+            constrain.register(
+                Some(register_suspend),
+                (&context as *const Registration).cast_mut().cast(),
+                &mut id,
+            ),
+            0
+        );
+
+        constrain_then_suspend(&constrain, &suspend);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn unregister_waits_for_in_flight_lifecycle_callbacks() {
+        use std::sync::mpsc;
+
+        struct Context {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            destroyed: AtomicBool,
+            saw_destroyed: AtomicBool,
+        }
+
+        extern "system" fn slow_routine(_: u8, ctx: *mut c_void) {
+            // SAFETY: points to `Context` kept alive until the test joins both threads.
+            let ctx = unsafe { &*ctx.cast::<Context>() };
+            let _ = ctx.entered.send(());
+            let _ = ctx.release.lock().unwrap().recv();
+            if ctx.destroyed.load(Ordering::Acquire) {
+                ctx.saw_destroyed.store(true, Ordering::Release);
+            }
+        }
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for is_constrained in [false, true] {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let ctx = std::sync::Arc::new(Context {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                destroyed: AtomicBool::new(false),
+                saw_destroyed: AtomicBool::new(false),
+            });
+            let mut reg = 0usize;
+            let raw = std::sync::Arc::as_ptr(&ctx) as *mut c_void;
+            let rc = if is_constrained {
+                RegisterAppConstrainedChangeNotification(Some(slow_routine), raw, &mut reg)
+            } else {
+                RegisterAppStateChangeNotification(Some(slow_routine), raw, &mut reg)
+            };
+            assert_eq!(rc, 0);
+
+            let dispatch = std::thread::spawn(|| {
+                constrain_then_suspend(&CONSTRAINED, &ROUTINES);
+            });
+
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("callback entered");
+
+            let (unreg_tx, unreg_rx) = mpsc::channel();
+            let ctx_unreg = ctx.clone();
+            let unreg = std::thread::spawn(move || {
+                if is_constrained {
+                    UnregisterAppConstrainedChangeNotification(reg);
+                } else {
+                    UnregisterAppStateChangeNotification(reg);
+                }
+                ctx_unreg.destroyed.store(true, Ordering::Release);
+                let _ = unreg_tx.send(());
+            });
+
+            let returned_early = unreg_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+            let _ = release_tx.send(());
+            if !returned_early {
+                unreg_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("unregister completed after callback returned");
+            }
+            dispatch.join().unwrap();
+            unreg.join().unwrap();
+            assert!(
+                !returned_early && !ctx.saw_destroyed.load(Ordering::Acquire),
+                "unregister returned while callback was still running (constrained={is_constrained}, returned_early={returned_early}, saw_destroyed={})",
+                ctx.saw_destroyed.load(Ordering::Acquire),
+            );
+        }
+    }
+
+    #[test]
+    fn unregister_skips_unstarted_sibling_and_suspend_callbacks() {
+        struct UnregOther {
+            called: AtomicBool,
+            targets: [(bool, AtomicUsize); 2],
+        }
+        struct Flag(AtomicBool);
+
+        extern "system" fn unreg_siblings(_: u8, ctx: *mut c_void) {
+            // SAFETY: points to `UnregOther` live for the duration of the test.
+            let ctx = unsafe { &*ctx.cast::<UnregOther>() };
+            ctx.called.store(true, Ordering::SeqCst);
+            for (is_constrained, target) in &ctx.targets {
+                let id = target.load(Ordering::Acquire);
+                if id != 0 {
+                    if *is_constrained {
+                        UnregisterAppConstrainedChangeNotification(id);
+                    } else {
+                        UnregisterAppStateChangeNotification(id);
+                    }
+                }
+            }
+        }
+        extern "system" fn mark_called(_: u8, ctx: *mut c_void) {
+            // SAFETY: points to `Flag` live for the duration of the test.
+            let flag = unsafe { &*ctx.cast::<Flag>() };
+            flag.0.store(true, Ordering::SeqCst);
+        }
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let c1_ctx = UnregOther {
+            called: AtomicBool::new(false),
+            targets: [(true, AtomicUsize::new(0)), (false, AtomicUsize::new(0))],
+        };
+        let c2_ctx = Flag(AtomicBool::new(false));
+        let s1_ctx = Flag(AtomicBool::new(false));
+        let s2_ctx = UnregOther {
+            called: AtomicBool::new(false),
+            targets: [(false, AtomicUsize::new(0)), (false, AtomicUsize::new(0))],
+        };
+        let s3_ctx = Flag(AtomicBool::new(false));
+
+        let (mut c1, mut c2, mut s1, mut s2, mut s3) = (0, 0, 0, 0, 0);
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(
+                Some(unreg_siblings),
+                (&raw const c1_ctx) as *mut c_void,
+                &mut c1
+            ),
+            0
+        );
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(
+                Some(mark_called),
+                (&raw const c2_ctx) as *mut c_void,
+                &mut c2
+            ),
+            0
+        );
+        assert_eq!(
+            RegisterAppStateChangeNotification(
+                Some(mark_called),
+                (&raw const s1_ctx) as *mut c_void,
+                &mut s1
+            ),
+            0
+        );
+        assert_eq!(
+            RegisterAppStateChangeNotification(
+                Some(unreg_siblings),
+                (&raw const s2_ctx) as *mut c_void,
+                &mut s2
+            ),
+            0
+        );
+        assert_eq!(
+            RegisterAppStateChangeNotification(
+                Some(mark_called),
+                (&raw const s3_ctx) as *mut c_void,
+                &mut s3
+            ),
+            0
+        );
+        c1_ctx.targets[0].1.store(c2, Ordering::Release);
+        c1_ctx.targets[1].1.store(s1, Ordering::Release);
+        s2_ctx.targets[0].1.store(s3, Ordering::Release);
+
+        constrain_then_suspend(&CONSTRAINED, &ROUTINES);
+
+        UnregisterAppConstrainedChangeNotification(c1);
+        UnregisterAppConstrainedChangeNotification(c2);
+        UnregisterAppStateChangeNotification(s1);
+        UnregisterAppStateChangeNotification(s2);
+        UnregisterAppStateChangeNotification(s3);
+
+        assert!(c1_ctx.called.load(Ordering::SeqCst));
+        assert!(s2_ctx.called.load(Ordering::SeqCst));
+        assert!(
+            !c2_ctx.0.load(Ordering::SeqCst),
+            "unregistered sibling constrained callback must not run"
+        );
+        assert!(
+            !s1_ctx.0.load(Ordering::SeqCst),
+            "suspend callback unregistered during constrained phase must not run"
+        );
+        assert!(
+            !s3_ctx.0.load(Ordering::SeqCst),
+            "unregistered sibling suspend callback must not run"
+        );
+    }
+
+    #[test]
+    fn self_unregister_does_not_deadlock_while_other_thread_waits_and_unrelated_returns() {
+        use std::sync::mpsc;
+
+        struct Context {
+            is_constrained: bool,
+            reg: AtomicUsize,
+            self_unregistered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            destroyed: AtomicBool,
+            saw_destroyed: AtomicBool,
+        }
+
+        extern "system" fn self_unreg_routine(_: u8, ctx: *mut c_void) {
+            // SAFETY: points to `Context` kept alive until all threads join.
+            let ctx = unsafe { &*ctx.cast::<Context>() };
+            let reg = ctx.reg.load(Ordering::Acquire);
+            if ctx.is_constrained {
+                UnregisterAppConstrainedChangeNotification(reg);
+            } else {
+                UnregisterAppStateChangeNotification(reg);
+            }
+            let _ = ctx.self_unregistered.send(());
+            let _ = ctx.release.lock().unwrap().recv();
+            if ctx.destroyed.load(Ordering::Acquire) {
+                ctx.saw_destroyed.store(true, Ordering::Release);
+            }
+        }
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for is_constrained in [false, true] {
+            let (self_tx, self_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let ctx = std::sync::Arc::new(Context {
+                is_constrained,
+                reg: AtomicUsize::new(0),
+                self_unregistered: self_tx,
+                release: Mutex::new(release_rx),
+                destroyed: AtomicBool::new(false),
+                saw_destroyed: AtomicBool::new(false),
+            });
+            let mut reg = 0usize;
+            let raw = std::sync::Arc::as_ptr(&ctx) as *mut c_void;
+            let rc = if is_constrained {
+                RegisterAppConstrainedChangeNotification(Some(self_unreg_routine), raw, &mut reg)
+            } else {
+                RegisterAppStateChangeNotification(Some(self_unreg_routine), raw, &mut reg)
+            };
+            assert_eq!(rc, 0);
+            ctx.reg.store(reg, Ordering::Release);
+
+            let dispatch = std::thread::spawn(|| {
+                constrain_then_suspend(&CONSTRAINED, &ROUTINES);
+            });
+
+            self_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("callback self-unregistered without deadlocking");
+
+            // Unregistering zero or an unrelated registration must not block
+            // behind this in-flight callback.
+            UnregisterAppStateChangeNotification(0);
+            UnregisterAppConstrainedChangeNotification(0);
+            UnregisterAppStateChangeNotification(usize::MAX);
+            UnregisterAppConstrainedChangeNotification(usize::MAX);
+
+            // Another thread unregistering the same registration must still wait
+            // until the dispatch thread finishes running the callback.
+            let (other_tx, other_rx) = mpsc::channel();
+            let ctx_other = ctx.clone();
+            let other = std::thread::spawn(move || {
+                if is_constrained {
+                    UnregisterAppConstrainedChangeNotification(reg);
+                } else {
+                    UnregisterAppStateChangeNotification(reg);
+                }
+                ctx_other.destroyed.store(true, Ordering::Release);
+                let _ = other_tx.send(());
+            });
+
+            let returned_early = other_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+            let _ = release_tx.send(());
+            if !returned_early {
+                other_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("other thread's unregister finished after callback returned");
+            }
+            dispatch.join().unwrap();
+            other.join().unwrap();
+            assert!(
+                !returned_early && !ctx.saw_destroyed.load(Ordering::Acquire),
+                "other thread's unregister returned while self-unregistered callback was still running (constrained={is_constrained})",
+            );
+        }
     }
 
     #[test]

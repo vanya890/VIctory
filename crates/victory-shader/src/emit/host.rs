@@ -64,6 +64,14 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Root constants to set: `data`, or one zero where it is empty. The
+/// parameter declares at least one value (`root_signature_for`), and an
+/// empty slice's pointer is dangling: NVIDIA's driver reads it even for a
+/// count of 0 (an access violation at 0x4).
+fn constants(data: &[u32]) -> &[u32] {
+    if data.is_empty() { &[0] } else { data }
+}
+
 /// A D3D12 device kept alive for the process so concurrent callers do not
 /// race creating and tearing down the same singleton adapter device.
 struct SharedDevice(ID3D12Device);
@@ -159,6 +167,11 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
 static WARP_LOCK: Mutex<()> = Mutex::new(());
 
 impl Host {
+    #[cfg(test)]
+    pub(super) fn is_warp(&self) -> bool {
+        self.warp
+    }
+
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
         self.warp
             .then(|| WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
@@ -693,6 +706,7 @@ impl Host {
             );
             list.SetDescriptorHeaps(&[Some(views.clone())]);
             list.SetComputeRootSignature(&root);
+            let user_data = constants(&user_data);
             list.SetComputeRoot32BitConstants(
                 0,
                 user_data.len() as u32,
@@ -1156,12 +1170,10 @@ impl Host {
             list.SetGraphicsRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        let data = constants(data);
+                        list.SetGraphicsRoot32BitConstants(*param, data.len() as u32, data.as_ptr().cast(), 0)
+                    }
                     Root::Table { sampler, index } => {
                         let (heap, size) = if *sampler {
                             (&sampler_heap, sampler_size)
@@ -1919,12 +1931,10 @@ impl Host {
             list.SetComputeRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetComputeRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        let data = constants(data);
+                        list.SetComputeRoot32BitConstants(*param, data.len() as u32, data.as_ptr().cast(), 0)
+                    }
                     Root::Table { sampler, index } => {
                         let (h, size) = if *sampler {
                             (&samplers, sampler_size)

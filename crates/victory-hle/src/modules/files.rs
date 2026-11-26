@@ -528,25 +528,24 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // destinations and retry a failed `ReadFile` forever. So the destination
 // is opened first.
 
-pub extern "system" fn ReadFile(
-    file: *mut c_void,
-    buffer: *mut u8,
-    len: u32,
-    read: *mut u32,
-    overlapped: *mut c_void,
-) -> i32 {
-    let _writing = victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
-        file, buffer, len, read, overlapped,
-    )
-}
+mod reads;
+
+pub use reads::{
+    CancelIo, CancelIoEx, CloseHandle, GetOverlappedResult, GetOverlappedResultEx,
+    GetQueuedCompletionStatus, GetQueuedCompletionStatusEx, ReadFile, ReadFileEx, ReadFileScatter,
+    WaitForMultipleObjects, WaitForMultipleObjectsEx, WaitForSingleObject, WaitForSingleObjectEx,
+};
 
 /// The host CRT reads large requests straight into the caller's buffer.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    let _writing = victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+    let writing = reads::will_write(buffer as usize, size.saturating_mul(count));
+    let n = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
-    )
+    );
+    if writing.is_some() {
+        reads::keep_last_error(|| drop(writing));
+    }
+    n
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
@@ -686,6 +685,9 @@ pub(crate) fn module() -> HleModule {
             "kernel32.dll",
             "kernelbase.dll",
             "api-ms-win-core-file-*",
+            "api-ms-win-core-io-*",
+            "api-ms-win-core-handle-*",
+            "api-ms-win-core-synch-*",
             "api-ms-win-core-processenvironment-*",
             "ucrtbase.dll",
             "api-ms-win-crt-stdio-*",
@@ -695,6 +697,19 @@ pub(crate) fn module() -> HleModule {
         ],
         exports: vec![
             hle_export!(ReadFile),
+            hle_export!(ReadFileEx),
+            hle_export!(ReadFileScatter),
+            hle_export!(GetOverlappedResult),
+            hle_export!(GetOverlappedResultEx),
+            hle_export!(GetQueuedCompletionStatus),
+            hle_export!(GetQueuedCompletionStatusEx),
+            hle_export!(CancelIo),
+            hle_export!(CancelIoEx),
+            hle_export!(CloseHandle),
+            hle_export!(WaitForSingleObject),
+            hle_export!(WaitForSingleObjectEx),
+            hle_export!(WaitForMultipleObjects),
+            hle_export!(WaitForMultipleObjectsEx),
             hle_export!(fread),
             hle_export!(CreateFileW),
             hle_export!(CreateFileA),
