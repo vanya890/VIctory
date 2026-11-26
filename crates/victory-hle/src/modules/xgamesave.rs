@@ -187,7 +187,8 @@ fn version_number(file: &str) -> Option<u64> {
 }
 
 /// The names in version folder `dir`: container, display, blobs; `None` if
-/// its manifest is missing or does not parse.
+/// its manifest is missing, does not parse, or any listed blob file is
+/// missing.
 fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     let bytes = match std::fs::read(dir.join(MANIFEST)) {
         Ok(bytes) => bytes,
@@ -198,6 +199,14 @@ fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
         return Ok(None);
     };
     let blobs = names.split_off(2);
+    for i in 0..blobs.len() {
+        match std::fs::metadata(dir.join(i.to_string())) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
     let [name, display] = <[String; 2]>::try_from(names).expect("two names, checked by the parser");
     Ok(Some((name, display, blobs)))
 }
@@ -339,15 +348,19 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let dir = container_dir(root, name);
     let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
-        let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
-            .ok()?
-            .flatten()
-            .filter_map(|e| {
-                let blob = decode(e.file_name().to_str()?)?;
-                Some((blob, std::fs::read(e.path()).ok()?))
-            })
-            .collect();
+        let display = match std::fs::read_to_string(old.join(".display")) {
+            Ok(display) => display,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return None,
+        };
+        let mut blobs = Vec::new();
+        for entry in std::fs::read_dir(old).ok()? {
+            let entry = entry.ok()?;
+            let Some(blob) = entry.file_name().to_str().and_then(decode) else {
+                continue;
+            };
+            blobs.push((blob, std::fs::read(entry.path()).ok()?));
+        }
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
@@ -508,7 +521,12 @@ impl Update {
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
-        let number = current.as_ref().map_or(1, |v| v.highest + 1);
+        let Some(number) = current
+            .as_ref()
+            .map_or(Some(1), |v| v.highest.checked_add(1))
+        else {
+            return NO_ACCESS;
+        };
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
@@ -1212,6 +1230,87 @@ mod tests {
         assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
     }
 
+    #[cfg(windows)]
+    fn assert_locked_legacy_entry_delays_migration(entry: &str) {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
+        let old = root.join("Player");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("readable%20blob"), b"first payload").unwrap();
+        std::fs::write(old.join("locked%20blob"), b"second payload").unwrap();
+        std::fs::write(old.join(".display"), b"Chapter 1").unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(old.join(entry))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(old.join(entry)).unwrap_err().raw_os_error(),
+            Some(32),
+            "the fixture must deny a second read with ERROR_SHARING_VIOLATION: {entry}"
+        );
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        let c = p.container("Player");
+        assert!(old.is_dir(), "the unreadable source must be retained");
+        assert!(
+            !c.dir.join("v1").exists(),
+            "migration must not commit a version missing the locked entry: {entry}"
+        );
+        drop(locked);
+        assert_eq!(std::fs::read(old.join("readable%20blob")).unwrap(), b"first payload");
+        assert_eq!(std::fs::read(old.join("locked%20blob")).unwrap(), b"second payload");
+        assert_eq!(std::fs::read(old.join(".display")).unwrap(), b"Chapter 1");
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(!old.exists(), "a complete migration may remove its source");
+        let c = p.container("Player");
+        assert_eq!(
+            read(&c, None).unwrap(),
+            [
+                ("locked blob".into(), b"second payload".to_vec()),
+                ("readable blob".into(), b"first payload".to_vec()),
+            ]
+        );
+        let v = current_named(&c.dir, "Player").unwrap().unwrap();
+        assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
+    }
+
+    /// A Windows reader denying sharing must delay migration of the whole
+    /// legacy save, not commit a partial version that hides the locked blob.
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_legacy_blob_delays_migration_until_it_can_be_read() {
+        assert_locked_legacy_entry_delays_migration("locked%20blob");
+    }
+
+    /// Display metadata has the same retry guarantee as the blobs it names.
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_legacy_display_delays_migration_until_it_can_be_read() {
+        assert_locked_legacy_entry_delays_migration(".display");
+    }
+
+    /// Old containers need not have display metadata; absence means empty,
+    /// whereas an existing but unreadable file must delay migration.
+    #[test]
+    fn missing_legacy_display_metadata_can_still_migrate() {
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
+        let old = root.join("Player");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("blob"), b"kept payload").unwrap();
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(!old.exists());
+        let c = p.container("Player");
+        assert_eq!(read(&c, None).unwrap(), [("blob".into(), b"kept payload".to_vec())]);
+        let v = current_named(&c.dir, "Player").unwrap().unwrap();
+        assert_eq!(v.display, "");
+    }
+
     /// An empty configuration id names none. As a folder name it would be
     /// the folder every configuration lives in, whose folders then look
     /// like containers of the old layout and are converted away.
@@ -1441,17 +1540,23 @@ mod tests {
     }
 
     /// A newer version folder that does not read (an empty folder, a file,
-    /// a broken manifest) neither hides the committed save, nor removes it,
-    /// nor blocks the next update, which goes above it.
+    /// a broken manifest, or a manifest with missing blobs) neither hides the
+    /// committed save, nor removes it, nor blocks the next update, which goes
+    /// above it.
     #[test]
     fn an_unreadable_newer_version_does_not_cost_the_save() {
         type Make = fn(&Path);
-        let strays: [(&str, Make); 3] = [
+        let strays: [(&str, Make); 4] = [
             ("empty folder", |p| std::fs::create_dir(p).unwrap()),
             ("file", |p| std::fs::write(p, b"not a version").unwrap()),
             ("broken manifest", |p| {
                 std::fs::create_dir(p).unwrap();
                 std::fs::write(p.join(MANIFEST), [9, 0, 0, 0, b'x']).unwrap();
+            }),
+            ("missing blob", |p| {
+                std::fs::create_dir(p).unwrap();
+                std::fs::write(p.join(MANIFEST), manifest("Slot", "broken", &["a", "b"])).unwrap();
+                std::fs::write(p.join("0"), b"only first").unwrap();
             }),
         ];
         for (what, make) in strays {
@@ -1488,5 +1593,25 @@ mod tests {
         assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
         assert!(slot.join("v1").join("0").is_file());
         assert!(!slot.join("v2").exists());
+    }
+
+    /// A stray `v18446744073709551615` (`u64::MAX`) folder next to a committed
+    /// save must fail the update with `NO_ACCESS` instead of panicking or
+    /// wrapping to `v0` and removing the good version (#2497).
+    #[test]
+    fn stray_u64_max_version_does_not_lose_the_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        let slot = container_dir(root, "Slot");
+        std::fs::create_dir(slot.join(format!("v{}", u64::MAX))).unwrap();
+
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
+        assert!(slot.join("v1").is_dir());
+        assert!(!slot.join("v0").exists());
+        assert_eq!(state(root), old_state());
     }
 }
