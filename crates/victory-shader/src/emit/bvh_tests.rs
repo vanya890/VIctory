@@ -876,7 +876,7 @@ fn intersections_on_nodes_in_title_memory_equal_the_reference() {
     run_cases(true, 4, true);
 }
 
-/// A dropped low-word carry must land on an unmapped page.
+/// A dropped low-word carry must land on a zeroed decoy page, not the node copy.
 #[test]
 fn root_derived_bvh_addresses_preserve_low_word_carries() {
     // `memory = false` selects the Source::Built root-descriptor path.
