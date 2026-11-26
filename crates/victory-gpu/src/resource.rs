@@ -285,11 +285,35 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
+    if this.is_null() {
+        return None;
+    }
     let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own).then_some(own)
+    if format == own {
+        return None;
+    }
+    let recorded = resource(this)
+        .rtv_format
+        .load(std::sync::atomic::Ordering::Relaxed);
+    Some(if recorded != 0 { recorded } else { own })
+}
+
+/// Records the actual typed RTV format at OMSetRenderTargets time. The
+/// resource description alone cannot distinguish UNORM/SNORM/FLOAT views of
+/// a typeless texture.
+#[cfg(windows)]
+pub(crate) fn record_rtv_view_format(this: This, format: Option<u32>) {
+    if this.is_null() {
+        return;
+    }
+    if let Some(format) = format.filter(|&format| format != 0) {
+        resource(this)
+            .rtv_format
+            .store(format, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -785,6 +809,9 @@ struct Resource {
     /// The creation's initial state and clear value, for the host texture.
     #[cfg(windows)]
     made_with: (u32, Option<[u32; 5]>),
+    /// The most recently bound typed RTV view, used when presenting typeless resources.
+    #[cfg(windows)]
+    rtv_format: std::sync::atomic::AtomicU32,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1795,6 +1822,8 @@ fn hand_out_resource(
         #[cfg(windows)]
         // SAFETY: the title passes a whole clear value (or null).
         made_with: (state, (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() })),
+        #[cfg(windows)]
+        rtv_format: 0.into(),
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
