@@ -2107,6 +2107,20 @@ mod tests {
     };
     use tracing::{Event, Metadata, Subscriber, span};
 
+    /// Keep ordinary host-less unit runs portable, but never let a forced
+    /// WARP validation step silently pass without creating the requested host.
+    #[cfg(windows)]
+    fn host_or_skip() -> bool {
+        if crate::host::host().is_some() {
+            return true;
+        }
+        assert!(
+            !crate::switch::on("VICTORY_D3D12_WARP"),
+            "VICTORY_D3D12_WARP=1 was set, but D3D12 WARP host creation failed"
+        );
+        false
+    }
+
     struct PipelineBinds(Arc<AtomicUsize>);
 
     impl Subscriber for PipelineBinds {
@@ -2572,8 +2586,8 @@ mod tests {
     fn concurrent_list_release_while_held_keeps_upload_memory_alive() {
         use std::sync::{Arc, Barrier};
 
-        if crate::host::host().is_none() {
-            return; // no host GPU here
+        if !host_or_skip() {
+            return; // no host GPU here outside forced-WARP validation
         }
         let null = std::ptr::null();
         let mut allocator = null;
@@ -2645,8 +2659,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::{Arc, Barrier};
 
-        if crate::host::host().is_none() {
-            return; // no host GPU here
+        if !host_or_skip() {
+            return; // no host GPU here outside forced-WARP validation
         }
         let null = std::ptr::null();
         let queue_iid = guid(
