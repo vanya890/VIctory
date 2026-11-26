@@ -39,4 +39,4 @@ jobs:
         env:
           VICTORY_D3D12_WARP: "1"
           VICTORY_D3D12_DEBUG: "1"
-        run: cargo test -p victory-gpu --features diagnostics --lib host::tests::keep_deduplicates_repeated_objects_until_reset --locked -- --nocapture --test-threads=1
+        run: cargo test --locked -p victory-gpu --features diagnostics --lib host::tests::keep_deduplicates_repeated_objects_until_reset -- --nocapture --test-threads=1
