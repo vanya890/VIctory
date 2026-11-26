@@ -3539,14 +3539,14 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
                 list.ResourceBarrier(&before);
-                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                let mut dst = D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::ManuallyDrop::new(Some(back.clone())),
                     Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                         SubresourceIndex: 0,
                     },
                 };
-                let src = D3D12_TEXTURE_COPY_LOCATION {
+                let mut src = D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::ManuallyDrop::new(Some(texture.clone())),
                     Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
@@ -3554,6 +3554,12 @@ impl Host {
                     },
                 };
                 list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                // SAFETY: the command list has consumed both locations; drop
+                // the COM references we placed in their ManuallyDrop fields.
+                unsafe {
+                    std::mem::ManuallyDrop::drop(&mut dst.pResource);
+                    std::mem::ManuallyDrop::drop(&mut src.pResource);
+                }
                 #[cfg(all(test, feature = "diagnostics"))]
                 let capture = {
                     // Inspect what reached the swap chain, before Present.
