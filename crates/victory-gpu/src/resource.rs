@@ -2533,7 +2533,7 @@ mod tests {
 
         // BC1 64x64 and R32G32_UINT 16x16 have the same title-memory layout.
         let read = place(&texture(64, 64, 71, 1));
-        assert!(made(resource(read)).is_some());
+        assert!(host_copy(read).is_some());
         assert!(alias_source(read).is_none(), "alone at its memory");
         assert!(alias_source(read).is_none(), "the negative answer is cached");
 
@@ -2542,8 +2542,8 @@ mod tests {
             ..texture(16, 16, 17, 1)
         });
         let (read_copy, target_copy) = (
-            made(resource(read)).unwrap(),
-            made(resource(target)).unwrap(),
+            host_copy(read).unwrap(),
+            host_copy(target).unwrap(),
         );
         assert!(
             !std::sync::Arc::ptr_eq(&read_copy, &target_copy),
