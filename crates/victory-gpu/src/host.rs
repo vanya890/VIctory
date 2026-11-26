@@ -3263,7 +3263,7 @@ impl<'a> PresentPlane<'a> {
     /// the actual typed view that produced its pixels; a denied-SRV resource
     /// cannot be sampled at all.
     fn srv_format(&self) -> Option<DXGI_FORMAT> {
-        let desc = unsafe { self.texture().GetDesc() };
+        // SAFETY: this plane owns a live host resource.\n        let desc = unsafe { self.texture().GetDesc() };
         if desc.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 != 0 {
             return None;
         }
@@ -3318,7 +3318,7 @@ impl Host {
     ) -> Option<bool> {
         let planes: Vec<_> = planes
             .iter()
-            .map(|&(texture, state)| PresentPlane::Raw(texture, state))
+            .map(|&(texture, state)| PresentPlane::Raw(texture, state, None))
             .collect();
         self.present_planes_with_compositor(&planes, frame, create_compositor, inspect)
             .0
@@ -4442,7 +4442,7 @@ mod present_state_sync_tests {
             let _ = tests::issued();
             let (shown, state) = host.present_planes_with_compositor(
                 &[
-                    PresentPlane::Tracked(&scene_copy),
+                    PresentPlane::Tracked(&scene_copy, None),
                     PresentPlane::Tracked(&overlay_copy),
                 ],
                 2,
