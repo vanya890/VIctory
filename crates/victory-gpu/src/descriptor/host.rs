@@ -2718,4 +2718,136 @@ mod tests {
         assert_eq!(release(heap), 0);
         assert_eq!(host_gpu.log_messages(), None);
     }
+    /// Exercise the fork-only depth-twin path through HostHeap::make_at:
+    /// invalid descriptors must become typed null UAVs, while valid views
+    /// must keep the actual twin plane alive.
+    #[test]
+    fn depth_twin_uav_ranges_fall_back_to_null_before_d3d12_creation() {
+        let Some(host_gpu) = host() else {
+            assert!(
+                std::env::var_os("VICTORY_D3D12_WARP").is_none(),
+                "VICTORY_D3D12_WARP=1 was requested, but no D3D12 WARP device could be created"
+            );
+            eprintln!("SKIP: no host D3D12 device; depth-twin integration path not exercised");
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 8) else {
+            assert!(
+                std::env::var_os("VICTORY_D3D12_WARP").is_none(),
+                "VICTORY_D3D12_WARP=1 was requested, but the D3D12 descriptor heap could not be created"
+            );
+            eprintln!("SKIP: could not create the host descriptor heap");
+            return;
+        };
+        eprintln!("EXERCISE: host-backed depth-twin UAV validation");
+        let _ = host_gpu.log_messages();
+
+        // R32G8X24_TYPELESS D32S8 array, four slices and two mips. Its
+        // writable twin exposes R32_UINT depth and R8_UINT stencil planes.
+        let desc: [u32; 14] = [
+            3,
+            0,
+            0,
+            0,
+            16,
+            0,
+            16,
+            4 | (2 << 16),
+            19, // R32G8X24_TYPELESS
+            1,
+            0,
+            0,
+            2,
+            0,
+        ];
+        let props: [u32; 5] = [1, 0, 0, 0, 0];
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut resource: crate::object::This = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_committed(
+                std::ptr::null(),
+                props.as_ptr().cast(),
+                0,
+                desc.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &iid,
+                &mut resource,
+            ),
+            0,
+            "create depth array resource"
+        );
+        assert!(crate::resource::host_resource(resource).is_some());
+
+        let mut words = [0u32; 10];
+        words[0] = 42; // R32_UINT view of the R32_TYPELESS twin plane
+        words[1] = 5; // TEXTURE2DARRAY
+        words[2] = 1; // final valid mip
+        words[3] = 2; // first slice
+        words[4] = 2; // exactly reaches the end
+        words[5] = 0; // plane
+        heap.make_at(
+            0,
+            &crate::descriptor::View::Unordered(resource as usize, 0, Some(words)),
+        );
+        assert!(heap.kept(0), "valid array boundary is retained");
+
+        words[2] = 2; // equal to MipLevels
+        heap.make_at(
+            1,
+            &crate::descriptor::View::Unordered(resource as usize, 0, Some(words)),
+        );
+        assert!(!heap.kept(1), "out-of-range mip becomes null");
+
+        words[2] = 1;
+        words[4] = u32::MAX; // remaining-slices sentinel
+        heap.make_at(
+            2,
+            &crate::descriptor::View::Unordered(resource as usize, 0, Some(words)),
+        );
+        assert!(
+            heap.kept(2),
+            "remaining-slices sentinel is accepted by the twin path"
+        );
+
+        words[4] = 2;
+        words[3] = 3;
+        heap.make_at(
+            3,
+            &crate::descriptor::View::Unordered(resource as usize, 0, Some(words)),
+        );
+        assert!(!heap.kept(3), "out-of-range first slice becomes null");
+
+        words[3] = 2;
+        words[0] = 62; // R8_UINT view of the R8_TYPELESS stencil twin
+        words[5] = 1;
+        heap.make_at(
+            4,
+            &crate::descriptor::View::Unordered(resource as usize, 0, Some(words)),
+        );
+        assert!(heap.kept(4), "valid stencil plane is retained");
+
+        words[0] = 42; // R32_UINT view
+        words[5] = 2; // D32S8 has only two twin planes
+        heap.make_at(
+            5,
+            &crate::descriptor::View::Unordered(resource as usize, 0, Some(words)),
+        );
+        assert!(!heap.kept(5), "missing third plane becomes null");
+
+        // SAFETY: plain device query.
+        assert!(unsafe { host_gpu.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(host_gpu.log_messages(), None);
+
+        let release = |o: crate::object::This| {
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(o, 0x10)(o)
+        };
+        assert_eq!(release(resource), 0);
+    }
+
 }

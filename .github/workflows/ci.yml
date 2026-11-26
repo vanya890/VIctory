@@ -35,3 +35,10 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      # Force the depth-twin descriptor path through the software D3D12 adapter.
+      # The test fails closed if WARP cannot be initialized; ordinary workspace
+      # tests are still allowed to skip when no host adapter is available.
+      - name: D3D12 WARP depth-twin UAV regression
+        run: cargo test -p victory-gpu --features diagnostics --lib --locked depth_twin_uav_ranges_fall_back_to_null_before_d3d12_creation -- --nocapture
+        env:
+          VICTORY_D3D12_WARP: "1"
