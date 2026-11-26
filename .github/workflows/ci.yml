@@ -38,6 +38,7 @@ jobs:
       # Host-backed GPU tests must run on WARP in headless CI; the default
       # adapter path intentionally skips them when no D3D12 device is present.
       - name: D3D12 WARP copy-back regressions
+        if: ${{ !cancelled() }}
         run: cargo test -p victory-gpu --features diagnostics --lib --locked host::withholding -- --nocapture
         env:
           VICTORY_D3D12_WARP: "1"
