@@ -479,7 +479,7 @@ impl Instruction {
                         v.neg = (ext >> 20 & 1 | ext >> 27 & 2) as u8;
                         v.abs = (ext >> 21 & 1 | ext >> 28 & 2) as u8;
                         if compare {
-                            if ext >> 15 & 1 == 1 {
+                            if ext >> 15 & 1 == 1 && !name.starts_with("v_cmpx") {
                                 v.dst = Some(scalar((ext >> 8 & 0x7F) as u8, lanes));
                             }
                             v.sdwa = Some(Sdwa {
@@ -603,7 +603,13 @@ impl Instruction {
                 }
                 let vdst = w0 & 0xFF;
                 v.dst = Some(if compare {
-                    scalar(vdst as u8, lanes)
+                    // GFX10+ v_cmpx_* in VOP3 writes EXEC and ignores w0[7:0].
+                    let code = if name.starts_with("v_cmpx") {
+                        EXEC
+                    } else {
+                        vdst as u8
+                    };
+                    scalar(code, lanes)
                 } else {
                     valu_dst(name, vdst, dst_n)
                 });
