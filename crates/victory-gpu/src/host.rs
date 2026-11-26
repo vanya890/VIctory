@@ -1467,7 +1467,7 @@ impl Host {
         let mut text = String::new();
         let mut fault_va = None;
         // SAFETY: the outputs are the runtime's, valid while the device
-        // lives; nodes are walked as linked, histories have their counts.
+        // lives; nodes are walked as linked, command histories are read only through accessible pages.
         unsafe {
             if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
                 && fault.PageFaultVA != 0
@@ -1555,18 +1555,15 @@ impl Host {
             for (p, index) in nodes.iter().zip(&index) {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
-                    let history =
-                        std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
-                    text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
-                        p.BreadcrumbCount, history[done as usize].0
-                    ));
+                    let history = readable_history(p.pCommandHistory, p.BreadcrumbCount);
+                    text.push_str(&stopped_at(&history, p.BreadcrumbCount, done));
                     let run = index.map(|i| runs[i]);
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
                         let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
                         history
+                            .ops
                             .iter()
                             .enumerate()
                             .filter(|(_, op)| **op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER)
@@ -1581,9 +1578,11 @@ impl Host {
                     let markers: Vec<(u32, String)> = Vec::new();
                     #[cfg(not(feature = "diagnostics"))]
                     let _ = fault_va;
-                    if done > 0 {
-                        text.push_str(&in_flight(history, &markers, done as usize));
-                    } else if let Some(r) = run {
+                    if done > 0 && (done as usize) < history.ops.len() {
+                        text.push_str(&in_flight(&history.ops, &markers, done as usize));
+                    } else if done == 0
+                        && let Some(r) = run
+                    {
                         let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }
@@ -3895,6 +3894,220 @@ fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
 /// barriers overlaps on the GPU), by kind, and what the markers just
 /// before them say (`HostList::note_op`: diagnostics builds with
 /// device-removed data on).
+const MAX_BREADCRUMB_HISTORY_BYTES: usize = 64 << 20;
+const BREADCRUMB_PAGE_BYTES: usize = 4 << 10;
+const BREADCRUMB_OPS_PER_PAGE: usize =
+    BREADCRUMB_PAGE_BYTES / std::mem::size_of::<D3D12_AUTO_BREADCRUMB_OP>();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryStop {
+    Complete,
+    Unreadable,
+    Limit,
+    Allocation,
+    Invalid,
+}
+
+struct BreadcrumbHistory {
+    ops: Vec<D3D12_AUTO_BREADCRUMB_OP>,
+    stop: HistoryStop,
+    limit_bytes: usize,
+}
+
+fn readable_history(
+    history: *const D3D12_AUTO_BREADCRUMB_OP,
+    count: u32,
+) -> BreadcrumbHistory {
+    readable_history_with_limit(history, count, MAX_BREADCRUMB_HISTORY_BYTES)
+}
+
+fn readable_history_with_limit(
+    history: *const D3D12_AUTO_BREADCRUMB_OP,
+    count: u32,
+    max_bytes: usize,
+) -> BreadcrumbHistory {
+    let element = std::mem::size_of::<D3D12_AUTO_BREADCRUMB_OP>();
+    let invalid = || BreadcrumbHistory {
+        ops: Vec::new(),
+        stop: HistoryStop::Invalid,
+        limit_bytes: max_bytes,
+    };
+    let Some(requested) = element.checked_mul(count as usize) else {
+        return invalid();
+    };
+    let limit_bytes = max_bytes - max_bytes % element;
+    let length = requested.min(limit_bytes);
+    let limited = requested > length;
+    if length == 0 {
+        return BreadcrumbHistory {
+            ops: Vec::new(),
+            stop: if limited { HistoryStop::Limit } else { HistoryStop::Complete },
+            limit_bytes,
+        };
+    }
+    let start = history as usize;
+    if !start.is_multiple_of(std::mem::align_of::<D3D12_AUTO_BREADCRUMB_OP>()) {
+        return invalid();
+    }
+    let Some(end) = start.checked_add(length) else {
+        return invalid();
+    };
+
+    let mut ops = Vec::new();
+    let mut piece = [D3D12_AUTO_BREADCRUMB_OP(0); BREADCRUMB_OPS_PER_PAGE];
+    let mut at = start;
+    while at < end {
+        let n = (BREADCRUMB_PAGE_BYTES - at % BREADCRUMB_PAGE_BYTES).min(end - at);
+        let elements = n / element;
+        // The source is element-aligned and page boundaries are multiples of
+        // the enum size, so this page-sized destination is sufficient.
+        if !read(at as *const u8, piece.as_mut_ptr().cast(), n) {
+            return BreadcrumbHistory {
+                ops,
+                stop: HistoryStop::Unreadable,
+                limit_bytes,
+            };
+        }
+        if ops.try_reserve(elements).is_err() {
+            return BreadcrumbHistory {
+                ops,
+                stop: HistoryStop::Allocation,
+                limit_bytes,
+            };
+        }
+        ops.extend_from_slice(&piece[..elements]);
+        at += n;
+    }
+    BreadcrumbHistory {
+        ops,
+        stop: if limited { HistoryStop::Limit } else { HistoryStop::Complete },
+        limit_bytes,
+    }
+}
+
+fn stopped_at(history: &BreadcrumbHistory, count: u32, done: u32) -> String {
+    let op = history
+        .ops
+        .get(done as usize)
+        .map_or_else(|| "unknown".to_owned(), |op| op.0.to_string());
+    let mut text = format!("; a list stopped at command {done} of {count} (op {op})");
+    match history.stop {
+        HistoryStop::Complete => {}
+        HistoryStop::Unreadable => text.push_str(&format!(
+            ", only its first {} commands could be read",
+            history.ops.len()
+        )),
+        HistoryStop::Limit => text.push_str(&format!(
+            ", breadcrumb history read capped at {} bytes after {} commands",
+            history.limit_bytes,
+            history.ops.len()
+        )),
+        HistoryStop::Allocation => text.push_str(&format!(
+            ", breadcrumb history allocation failed after {} commands",
+            history.ops.len()
+        )),
+        HistoryStop::Invalid => text.push_str(
+            ", breadcrumb history pointer or length was invalid; no commands were read",
+        ),
+    }
+    text
+}
+
+#[cfg(test)]
+mod breadcrumbs {
+    use super::{HistoryStop, readable_history_with_limit, stopped_at};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_AUTO_BREADCRUMB_OP, D3D12_AUTO_BREADCRUMB_OP_DISPATCH,
+        D3D12_AUTO_BREADCRUMB_OP_SETMARKER,
+    };
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree,
+    };
+
+    const PAGE: usize = 4 << 10;
+
+    fn op(i: usize) -> D3D12_AUTO_BREADCRUMB_OP {
+        if i.is_multiple_of(2) {
+            D3D12_AUTO_BREADCRUMB_OP_SETMARKER
+        } else {
+            D3D12_AUTO_BREADCRUMB_OP_DISPATCH
+        }
+    }
+
+    /// Reserve `pages` pages and commit/fill only the listed page indices.
+    fn reserved(pages: usize, committed: &[usize]) -> *mut D3D12_AUTO_BREADCRUMB_OP {
+        // SAFETY: a fresh reservation; only committed pages are written.
+        unsafe {
+            let base = VirtualAlloc(
+                std::ptr::null(),
+                pages * PAGE,
+                MEM_RESERVE,
+                PAGE_NOACCESS,
+            )
+            .cast::<D3D12_AUTO_BREADCRUMB_OP>();
+            assert!(!base.is_null());
+            for &page in committed {
+                let at = base.cast::<u8>().add(page * PAGE);
+                assert!(!VirtualAlloc(at.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+                let first = page * PAGE / 4;
+                for i in 0..PAGE / 4 {
+                    base.add(first + i).write(op(first + i));
+                }
+            }
+            base
+        }
+    }
+
+    fn release(base: *mut D3D12_AUTO_BREADCRUMB_OP) {
+        // SAFETY: a reservation returned by `reserved`.
+        assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn history_stops_at_the_first_unreadable_page() {
+        let base = reserved(3, &[0, 2]);
+        let count = (3 * PAGE / 4) as u32;
+        let history = readable_history_with_limit(base, count, 3 * PAGE);
+        assert_eq!(history.ops.len(), PAGE / 4);
+        assert_eq!(history.stop, HistoryStop::Unreadable);
+        assert!(stopped_at(&history, count, (PAGE / 4) as u32).contains("op unknown"));
+        assert!(stopped_at(&history, count, 0).contains("only its first 1024 commands could be read"));
+        release(base);
+    }
+
+    #[test]
+    fn unreadable_first_page_returns_an_empty_prefix() {
+        let base = reserved(1, &[]);
+        let count = (PAGE / 4) as u32;
+        let history = readable_history_with_limit(base, count, PAGE);
+        assert!(history.ops.is_empty());
+        assert_eq!(history.stop, HistoryStop::Unreadable);
+        let report = stopped_at(&history, count, 0);
+        assert!(report.contains("op unknown"));
+        assert!(report.contains("only its first 0 commands could be read"));
+        release(base);
+    }
+
+    #[test]
+    fn readable_history_is_capped_before_allocating_the_report() {
+        let base = reserved(2, &[0, 1]);
+        let count = (2 * PAGE / 4) as u32;
+        let history = readable_history_with_limit(base, count, PAGE);
+        assert_eq!(history.ops.len(), PAGE / 4);
+        assert_eq!(history.stop, HistoryStop::Limit);
+        assert!(stopped_at(&history, count, (PAGE / 4) as u32).contains("capped at 4096 bytes"));
+        release(base);
+    }
+
+    #[test]
+    fn overflowing_history_address_is_rejected_without_reading() {
+        let base = (usize::MAX - 3) as *const D3D12_AUTO_BREADCRUMB_OP;
+        let history = readable_history_with_limit(base, 2, PAGE);
+        assert!(history.ops.is_empty());
+        assert_eq!(history.stop, HistoryStop::Invalid);
+    }
+}
 fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], done: usize) -> String {
     let barrier = |op: &D3D12_AUTO_BREADCRUMB_OP| *op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER;
     let from = history[..done].iter().rposition(barrier).map_or(0, |b| b + 1);
