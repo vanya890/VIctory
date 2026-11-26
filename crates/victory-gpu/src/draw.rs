@@ -4312,6 +4312,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             Some(11),
             "the most recently bound RTV format must be retained for PresentX"
         );
+        assert_eq!(crate::object::slot::<Close>(list, 0x48)(list), S_OK);
         assert_eq!(
             crate::object::slot::<Reset>(list, 0x50)(list, alloc, null),
             S_OK
