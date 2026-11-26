@@ -114,9 +114,10 @@ fn target_ensure_matches<T>(
     *old_generation == generation
         && *old_depth == depth.map_or(0, |copy| std::sync::Arc::as_ptr(copy) as usize)
         && old_targets.len() == targets.len()
-        && old_targets.iter().zip(targets).all(|(old, copy)| {
-            *old == std::sync::Arc::as_ptr(copy) as usize
-        })
+        && old_targets
+            .iter()
+            .zip(targets)
+            .all(|(old, copy)| *old == std::sync::Arc::as_ptr(copy) as usize)
 }
 
 /// The identity key retained after a target-state ensure.
@@ -126,7 +127,10 @@ fn target_ensure_key<T>(
     generation: u64,
 ) -> (Vec<usize>, usize, u64) {
     (
-        targets.iter().map(|copy| std::sync::Arc::as_ptr(copy) as usize).collect(),
+        targets
+            .iter()
+            .map(|copy| std::sync::Arc::as_ptr(copy) as usize)
+            .collect(),
         depth.map_or(0, |copy| std::sync::Arc::as_ptr(copy) as usize),
         generation,
     )
@@ -515,8 +519,16 @@ impl State {
     fn bind_targets(
         &mut self,
         list: &HostList,
-        targets: impl IntoIterator<Item = (Target<D3D12_RENDER_TARGET_VIEW_DESC>, std::sync::Arc<crate::resource::HostTexture>)>,
-        depth: Option<(Target<D3D12_DEPTH_STENCIL_VIEW_DESC>, std::sync::Arc<crate::resource::HostTexture>)>,
+        targets: impl IntoIterator<
+            Item = (
+                Target<D3D12_RENDER_TARGET_VIEW_DESC>,
+                std::sync::Arc<crate::resource::HostTexture>,
+            ),
+        >,
+        depth: Option<(
+            Target<D3D12_DEPTH_STENCIL_VIEW_DESC>,
+            std::sync::Arc<crate::resource::HostTexture>,
+        )>,
     ) {
         let Some(host) = crate::host::host() else {
             return;
@@ -4803,11 +4815,14 @@ void main(uint3 id : SV_DispatchThreadID) {
     fn target_ensure_key_tracks_host_copy_identity_and_generation() {
         let first = std::sync::Arc::new(());
         let replacement = std::sync::Arc::new(());
+        let first_depth = std::sync::Arc::new(());
+        let replacement_depth = std::sync::Arc::new(());
         let targets = [first.clone()];
-        let key = Some(target_ensure_key(&targets, None, 7));
-        assert!(target_ensure_matches(&key, &targets, None, 7));
-        assert!(!target_ensure_matches(&key, &[replacement], None, 7));
-        assert!(!target_ensure_matches(&key, &targets, None, 8));
+        let key = Some(target_ensure_key(&targets, Some(&first_depth), 7));
+        assert!(target_ensure_matches(&key, &targets, Some(&first_depth), 7));
+        assert!(!target_ensure_matches(&key, &[replacement], Some(&first_depth), 7));
+        assert!(!target_ensure_matches(&key, &targets, Some(&replacement_depth), 7));
+        assert!(!target_ensure_matches(&key, &targets, Some(&first_depth), 8));
     }
 
     /// A draw read must use the same pinned host copy for upload and state.
