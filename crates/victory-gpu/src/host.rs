@@ -1740,7 +1740,12 @@ impl Host {
         // Some bitmap-held pages have no declared range in back, so drop
         // those separately after every declared copy-back has completed.
         for (_copy, page) in held_pages {
-            crate::memory::drop_withheld(page, crate::watch::PAGE);
+            if !withheld
+                .iter()
+                .any(|(_, address, len)| page_overlaps_range(page, *address, *len))
+            {
+                crate::memory::drop_withheld(page, crate::watch::PAGE);
+            }
         }
         // Texture views left null that shaders read: make them only after all
         // copy-backs and retakes, so their backing copies reflect final memory.
@@ -4831,6 +4836,12 @@ mod batch {   // `mod tests` is already taken at the top of this file
 }
 
 
+fn page_overlaps_range(page: usize, address: usize, len: usize) -> bool {
+    len != 0
+        && address < page.saturating_add(crate::watch::PAGE)
+        && page < address.saturating_add(len)
+}
+
 #[cfg(test)]
 mod withholding {
     /// A list in which a program using title memory missed memory: what
@@ -4881,6 +4892,86 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+
+    /// A withheld marked page must not be retaken before another Shadow's
+    /// ordinary-bitmap marked copy-back on the same physical page.
+    #[test]
+    fn withheld_marked_drop_runs_after_other_copy_marked_copy_back() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(1);
+        // SAFETY: our pool, not guarded yet.
+        unsafe {
+            ((p + 16) as *mut u8).write_volatile(0x11);
+            ((p + 32) as *mut u8).write_volatile(0x22);
+        }
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        crate::shadow::register(p + 1, p as u64, PAGE as u64);
+        let outer = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        let inner = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&outer, &inner));
+
+        let list = host.new_list().unwrap();
+        {
+            // Outer has a title-memory withheld marked write.
+            let _writer = list.writer_uses_memory(true);
+            outer.refresh(&list, p as u64, PAGE as u64);
+            outer.gpu_writes(&list, p as u64, PAGE as u64, true);
+        }
+        {
+            // Both copies also have ordinary-bitmap marked writes.
+            let _writer = list.writer_uses_memory(false);
+            outer.gpu_writes(&list, p as u64, PAGE as u64, true);
+            inner.refresh(&list, p as u64, PAGE as u64);
+            inner.gpu_writes(&list, p as u64, PAGE as u64, true);
+        }
+        let (o, i) = (outer.clone(), inner.clone());
+        list.defer(move || {
+            o.write_host((p + 16) as u64, &[0xaa]);
+            o.mark_page_for_test(p, true);
+            o.mark_page_for_test(p, false);
+            i.write_host((p + 32) as u64, &[0xbb]);
+            i.mark_page_for_test(p, false);
+        });
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: bytes in our one-page pool.
+        let title = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!(
+            title(16),
+            0x11,
+            "withheld outer write must not reach title memory"
+        );
+        assert_eq!(
+            title(32),
+            0xbb,
+            "inner marked write must copy back before the outer page is retaken"
+        );
+        assert_eq!(outer.update(p, PAGE), PAGE);
+        assert_eq!(inner.update(p, PAGE), PAGE);
+        assert_eq!(outer.read_host((p + 16) as u64, 1)[0] & 0xff, 0x11);
+        assert_eq!(inner.read_host((p + 32) as u64, 1)[0] & 0xff, 0xbb);
+
+        crate::shadow::unregister(p + 1, p as u64);
+        crate::shadow::unregister(p, p as u64);
+        drop((outer, inner));
+        crate::watch::tests::free(p);
+    }
+
+    #[test]
+    fn held_page_drop_is_deduplicated_against_withheld_ranges() {
+        use crate::watch::PAGE;
+        let page = PAGE * 4;
+        assert!(super::page_overlaps_range(page, page, PAGE));
+        assert!(super::page_overlaps_range(page, page + PAGE - 1, 1));
+        assert!(!super::page_overlaps_range(page, page + PAGE, PAGE));
+        assert!(!super::page_overlaps_range(page, page - PAGE, PAGE));
+        assert!(!super::page_overlaps_range(page, page, 0));
     }
 
     /// A withheld page is retaken only after an overlapping ordinary
