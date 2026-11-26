@@ -1851,6 +1851,23 @@ mod tests {
         assert_eq!(view_stride(&uav(12, 0, 0)) | view_kind(&uav(12, 0, 0)), 8 | VIEW_INTEGER);
     }
 
+    /// Dynamic buffer reads distinguish constant-buffer slots from texture
+    /// and empty slots: CBVs are mirrored as raw buffer views (stride 4),
+    /// while textures have no buffer stride and are redirected to the null
+    /// raw-buffer descriptor by the shader's buffer guard.
+    #[test]
+    fn cbv_slots_remain_distinct_from_texture_slots_for_dynamic_buffer_reads() {
+        let cbv = View::Constant(0x1_0000_1000, 256);
+        let null_cbv = View::Constant(0, 0);
+        let texture = View::Shader(0, Some([28, 3, 0, 0, 0, 0, 1, 0, 0, 0]));
+
+        assert_eq!(view_stride(&cbv), 4, "a CBV is exposed as a raw buffer");
+        assert_eq!(view_stride(&null_cbv), 4, "a null CBV keeps the buffer slot kind");
+        assert_eq!(view_stride(&texture), 0, "a texture is not a buffer view");
+        assert_eq!(view_kind(&cbv), 0);
+        assert_eq!(view_kind(&texture), 0);
+    }
+
     /// A placed texture's view the title writes into a heap is left null
     /// and noted once: heap syncs (every submission) pass it by, a draw
     /// reading it through a table makes it.
