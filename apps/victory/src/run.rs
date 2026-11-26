@@ -57,7 +57,7 @@ pub fn run(
         // device, the caches) takes the space the title's 32-bit memory needs.
         victory_hle::modules::xmem::low_guards::install();
     }
-    let cfg = victory_core::Config::load()?;
+    let (exe, cfg) = launch_paths(exe, victory_core::Config::load()?)?;
     // Before the import registry is first used: it holds the module only
     // when the host's FidelityFX serves.
     victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
@@ -199,6 +199,19 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(code)
+}
+
+/// Capture runner-owned paths before title code can change the process CWD.
+/// `absolute` preserves launch-directory semantics without requiring paths to exist.
+#[cfg(any(windows, test))]
+fn launch_paths(
+    exe: &Path,
+    mut cfg: victory_core::Config,
+) -> Result<(std::path::PathBuf, victory_core::Config)> {
+    let exe = std::path::absolute(exe).context("resolving the title executable path")?;
+    cfg.cache_dir = std::path::absolute(&cfg.cache_dir).context("resolving the cache directory")?;
+    cfg.data_dir = std::path::absolute(&cfg.data_dir).context("resolving the data directory")?;
+    Ok((exe, cfg))
 }
 
 #[cfg(windows)]
@@ -487,6 +500,58 @@ mod absent_tests {
         let wanted = |dll: &str| dll.starts_with("Title");
         assert!(absent_title_dlls(&["Title.dll", "Host.dll"], &["TITLE.DLL"], &wanted).is_empty());
         assert!(absent_title_dlls(&[], &[], &wanted).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod launch_path_tests {
+    use super::launch_paths;
+    use std::path::Path;
+    use std::process::Command;
+
+    const CHILD: &str = "VICTORY_LAUNCH_PATHS_TEST_CHILD";
+
+    #[test]
+    fn paths_remain_anchored_after_the_title_changes_cwd() {
+        if let Some(destination) = std::env::var_os(CHILD) {
+            let launch_dir = std::env::current_dir().unwrap();
+            let cfg = victory_core::Config {
+                cache_dir: "cache".into(),
+                data_dir: "data".into(),
+                ..Default::default()
+            };
+            let (exe, cfg) = launch_paths(Path::new("package/title.exe"), cfg).unwrap();
+            assert_eq!(
+                exe,
+                std::path::absolute(launch_dir.join("package/title.exe")).unwrap()
+            );
+            std::env::set_current_dir(destination).unwrap();
+            let cache = cfg.cache_subdir("images").unwrap();
+            let data = cfg.data_subdir("saves").unwrap();
+            assert_eq!(
+                cache,
+                std::path::absolute(launch_dir.join("cache/images")).unwrap()
+            );
+            assert_eq!(
+                data,
+                std::path::absolute(launch_dir.join("data/saves")).unwrap()
+            );
+            assert!(cache.is_dir());
+            assert!(data.is_dir());
+            return;
+        }
+
+        let launch_dir = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .current_dir(launch_dir.path())
+            .arg("--exact")
+            .arg("run::launch_path_tests::paths_remain_anchored_after_the_title_changes_cwd")
+            .arg("--nocapture")
+            .env(CHILD, destination.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }
 
