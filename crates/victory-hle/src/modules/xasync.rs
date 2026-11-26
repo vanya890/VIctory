@@ -2488,7 +2488,7 @@ mod tests {
 
         extern "system" fn second(op: u32, _: *const ProviderData) -> HRESULT {
             match op {
-                OP_BEGIN => E_ABORT,
+                OP_BEGIN => return E_ABORT,
                 OP_CLEANUP => {
                     CLEANUPS.fetch_add(1, Ordering::SeqCst);
                 }
