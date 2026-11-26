@@ -2935,11 +2935,22 @@ mod tests {
     #[test]
     fn texture_views_with_invalid_dimensions_ranges_or_mapping_fall_back_to_null() {
         let Some(host) = host() else {
+            assert!(
+                std::env::var_os("VICTORY_D3D12_WARP").is_none(),
+                "VICTORY_D3D12_WARP=1 was requested, but no D3D12 WARP device could be created"
+            );
+            eprintln!("SKIP: no host D3D12 device; texture-view integration path not exercised");
             return;
         };
         let Some(heap) = HostHeap::new(false, 64) else {
+            assert!(
+                std::env::var_os("VICTORY_D3D12_WARP").is_none(),
+                "VICTORY_D3D12_WARP=1 was requested, but the D3D12 descriptor heap could not be created"
+            );
+            eprintln!("SKIP: could not create the host descriptor heap");
             return;
         };
+        eprintln!("EXERCISE: host-backed texture SRV/UAV validation");
         let make_res = |dim: u32,
                         w: u64,
                         h: u32,
