@@ -3549,7 +3549,10 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mode = wave::barrier_mode(self.writes_uavs, self.relaxed_barriers.contains(&(b, i)));
+                let mode = wave::barrier_mode(
+                    self.writes_uavs,
+                    self.relaxed_barriers.contains(&(b, i)),
+                );
                 #[cfg(test)]
                 self.barrier_modes.push(mode);
                 let mode = self.s.m.i32(mode);
