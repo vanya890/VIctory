@@ -2534,8 +2534,8 @@ mod tests {
         // BC1 64x64 and R32G32_UINT 16x16 have the same title-memory layout.
         let read = place(&texture(64, 64, 71, 1));
         assert!(made(resource(read)).is_some());
-        assert_eq!(alias_source(read), None, "alone at its memory");
-        assert_eq!(alias_source(read), None, "the negative answer is cached");
+        assert!(alias_source(read).is_none(), "alone at its memory");
+        assert!(alias_source(read).is_none(), "the negative answer is cached");
 
         let target = place(&ResourceDesc {
             flags: UNORDERED,
@@ -2551,12 +2551,12 @@ mod tests {
         );
         let alias = alias_source(read).expect("the newly-created writer invalidates the cache");
         assert!(std::sync::Arc::ptr_eq(&alias, &target_copy));
-        assert_eq!(alias_source(target), None, "the writer has no other writer");
+        assert!(alias_source(target).is_none(), "the writer has no other writer");
         drop(alias);
         drop((read_copy, target_copy));
 
         assert_eq!(slot::<Release>(target, 0x10)(target), 0);
-        assert_eq!(alias_source(read), None, "releasing the writer invalidates the cache");
+        assert!(alias_source(read).is_none(), "releasing the writer invalidates the cache");
         assert_eq!(slot::<Release>(read, 0x10)(read), 0);
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
     }
