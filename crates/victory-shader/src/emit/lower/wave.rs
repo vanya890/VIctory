@@ -1,7 +1,8 @@
 //! Host-wave safety decisions for native group barriers and wave64 shaders.
 use std::collections::HashSet;
 
-use crate::ir::{Fields, Program, Value};
+use crate::gfx10::Fields;
+use crate::ir::{Program, Value};
 use crate::native::StageIo;
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
