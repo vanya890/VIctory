@@ -64,7 +64,15 @@ impl Lower<'_> {
             }
         }
         let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+        // A paired p1ll writes the low half. If p2 also writes low, the
+        // high half being preserved is still the pre-p1 value; p2's read is
+        // the missing p1 result, so use the recovered pre-p1 value instead.
+        let old_value = if !high {
+            guard_old.or_else(|| inst.read(Reg::V(reg)))
+        } else {
+            inst.read(Reg::V(reg))
+        };
+        let old = match old_value.map(|o| self.i32_of(o)) {
             Some(Ok(o)) if keep => o,
             _ => self.s.m.i32(0),
         };

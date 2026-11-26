@@ -2017,7 +2017,7 @@ mod tests {
                 (
                     "v_interp_p2_f16_shared",
                     &ps_p2_f16_shared,
-                    (0.25, None),
+                    (0.25, Some(2.0)),
                     (1.0, Some(2.0)),
                 ),
                 (
