@@ -35,3 +35,8 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      - name: WARP: verify HostList COM lifetime regression
+        env:
+          VICTORY_D3D12_WARP: "1"
+          VICTORY_D3D12_DEBUG: "1"
+        run: cargo test -p victory-gpu --features diagnostics --lib host::tests::keep_deduplicates_repeated_objects_until_reset --locked -- --nocapture --test-threads=1
