@@ -1338,13 +1338,13 @@ fn current(this: This) -> bool {
 /// [`castable`]'s formats (colour textures, through the enhanced-barrier
 /// creation; it starts in the common state) where the host takes that.
 #[cfg(windows)]
-#[cfg(windows)]
 thread_local! {
     static OUT_OF_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(test)]
     static FAIL_NEXT: std::cell::Cell<Option<windows::core::HRESULT>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(windows)]
 fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<HostTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
@@ -1608,7 +1608,6 @@ fn made(r: &Resource) -> Option<std::sync::Arc<HostTexture>> {
 
 /// Milliseconds since the first call: host textures' use stamps.
 #[cfg(windows)]
-#[cfg(windows)]
 const RETRY_MS: u64 = if cfg!(test) { 100 } else { 500 };
 
 #[cfg(windows)]
@@ -1616,6 +1615,7 @@ fn retry_wait(n: u32) -> u64 {
     RETRY_MS << n.saturating_sub(1).min(4)
 }
 
+#[cfg(windows)]
 fn now_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
