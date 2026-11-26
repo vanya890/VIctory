@@ -64,11 +64,11 @@ pub(crate) struct Staging {
     copied: std::sync::atomic::AtomicU64,
 }
 
-/// What was last detiled: the hash of the memory (not tracked), or of each
-/// subresource's bytes (tracked).
+/// What was last detiled: a fast digest of untracked memory, or BLAKE3
+/// digests of tracked subresources (where 64 KiB false-sharing is confirmed).
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<[u64; 2]>,
     hashes: Vec<Option<blake3::Hash>>,
 }
 
@@ -723,8 +723,8 @@ impl Staging {
             }
             // A changed page that holds only the subresource's bytes says it
             // changed. Pages it shares with other data the title writes
-            // (small textures): its own bytes decide. (Hashing a movie frame
-            // cost 8 ms a frame.)
+            // (small textures): its own bytes decide. Keep BLAKE3 here: this
+            // is the final false-sharing guard for tracked subresources.
             let page = crate::watch::PAGE;
             last.hashes.resize(n, None);
             let fresh: Vec<u32> = touched
@@ -770,12 +770,12 @@ impl Staging {
             let zeros = vec![0u8; size];
             let every = all();
             let buffer = self.detile(&zeros, &every);
-            last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
+            last.hash = buffer.is_some().then(|| content_hash(&zeros));
             return (0, buffer.map(|(b, at)| (b, at, every)));
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = content_hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -975,9 +975,141 @@ fn staging_copy(
     Some(s)
 }
 
+
+/// Fast 128-bit non-cryptographic content digest for detecting changes in
+/// untracked texture memory. Processes 32 bytes per iteration across four
+/// independent 64-bit accumulators to stay memory-bandwidth-bound.
+///
+/// This is a change detector, not an authentication primitive. A collision
+/// is theoretically possible; callers use it only to avoid reprocessing
+/// unchanged, untracked source bytes.
+fn content_hash(bytes: &[u8]) -> [u64; 2] {
+    const K0: u64 = 0x9E37_79B1_85EB_CA87;
+    const K1: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    const K2: u64 = 0x1656_67B1_9E37_79F9;
+    const K3: u64 = 0x85EB_CA77_C2B2_AE63;
+
+    #[inline(always)]
+    fn mix64(mut x: u64) -> u64 {
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    }
+
+    let mut a0 = K0 ^ (bytes.len() as u64);
+    let mut a1 = K1;
+    let mut a2 = K2;
+    let mut a3 = K3;
+
+    let (chunks, tail32) = bytes.as_chunks::<32>();
+    for chunk in chunks {
+        let w0 = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+        let w2 = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
+        let w3 = u64::from_le_bytes(chunk[24..32].try_into().unwrap());
+        a0 = a0.wrapping_add(w0).wrapping_mul(K0).rotate_left(31);
+        a1 = a1.wrapping_add(w1).wrapping_mul(K1).rotate_left(29);
+        a2 = a2.wrapping_add(w2).wrapping_mul(K2).rotate_left(33);
+        a3 = a3.wrapping_add(w3).wrapping_mul(K3).rotate_left(27);
+    }
+
+    let (words, tail) = tail32.as_chunks::<8>();
+    for (i, word) in words.iter().enumerate() {
+        let w = u64::from_le_bytes(*word);
+        match i {
+            0 => a0 = a0.wrapping_add(w).wrapping_mul(K0).rotate_left(31),
+            1 => a1 = a1.wrapping_add(w).wrapping_mul(K1).rotate_left(29),
+            _ => a2 = a2.wrapping_add(w).wrapping_mul(K2).rotate_left(33),
+        }
+    }
+
+    if !tail.is_empty() {
+        let mut buf = [0u8; 8];
+        buf[..tail.len()].copy_from_slice(tail);
+        let w = u64::from_le_bytes(buf);
+        a3 = a3.wrapping_add(w).wrapping_mul(K3).rotate_left(27);
+    }
+
+    let lo = mix64(a0 ^ a2.rotate_left(17) ^ (bytes.len() as u64).wrapping_mul(K1));
+    let hi = mix64(a1 ^ a3.rotate_left(23) ^ lo.wrapping_mul(K2));
+    [lo, hi]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_hash_detects_single_bit_tail_and_order_changes() {
+        let mut data: Vec<u8> = (0..4099).map(|i| (i * 37 + 13) as u8).collect();
+        let base = content_hash(&data);
+        assert_eq!(base, content_hash(&data));
+        // Single-bit flips in the 32-byte blocks, the 8-byte words and the tail.
+        for pos in [0, 7, 8, 31, 32, 1024, 4088, 4095, 4096, 4098] {
+            data[pos] ^= 1;
+            assert_ne!(content_hash(&data), base, "missed bit flip at {pos}");
+            data[pos] ^= 1;
+        }
+        data.swap(0, 8);
+        assert_ne!(content_hash(&data), base, "missed a swap");
+        data.swap(0, 8);
+        assert_ne!(content_hash(&data[..4098]), base, "missed a length change");
+    }
+
+    #[test]
+    fn content_hash_detects_single_bit_changes_at_chunk_and_tail_boundaries() {
+        for len in [0, 1, 7, 8, 31, 32, 33, 39, 40, 63, 64, 65, 127, 128, 129] {
+            let mut data: Vec<u8> = (0..len).map(|i| (i * 37 + 13) as u8).collect();
+            let base = content_hash(&data);
+            for byte in 0..len {
+                for bit in 0..8 {
+                    data[byte] ^= 1 << bit;
+                    assert_ne!(
+                        content_hash(&data),
+                        base,
+                        "missed bit flip at len={len}, byte={byte}, bit={bit}"
+                    );
+                    data[byte] ^= 1 << bit;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn content_hash_distinguishes_zero_fills_of_different_lengths() {
+        let hashes: std::collections::HashSet<_> =
+            (0..=65).map(|len| content_hash(&vec![0; len])).collect();
+        assert_eq!(hashes.len(), 66);
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn content_hash_vs_blake3_throughput() {
+        let buf: Vec<u8> = (0..(16 << 20)).map(|i| (i * 131) as u8).collect();
+        let t0 = std::time::Instant::now();
+        let mut b3 = [0u8; 32];
+        for _ in 0..10 {
+            b3 = *std::hint::black_box(blake3::hash(std::hint::black_box(&buf))).as_bytes();
+        }
+        let blake3_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = std::time::Instant::now();
+        let mut fast = [0u64; 2];
+        for _ in 0..10 {
+            fast = std::hint::black_box(content_hash(std::hint::black_box(&buf)));
+        }
+        let fast_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "160 MiB: blake3 {blake3_ms:.2} ms ({:.2} GB/s), content_hash {fast_ms:.2} ms ({:.2} GB/s), {:.1}x ({}, {:?})",
+            0.16 / (blake3_ms / 1000.0),
+            0.16 / (fast_ms / 1000.0),
+            blake3_ms / fast_ms,
+            b3[0],
+            fast,
+        );
+    }
+
 
     #[test]
     fn cached_title_written_flags_match_resource_flag_semantics() {
