@@ -858,10 +858,24 @@ mod tests {
     }
 
     #[test]
-    fn wave64_is_gated_by_maximum_host_width_unless_explicitly_enabled() {
+    fn unrestricted_wave64_compute_lowers_on_a_32_lane_host() {
+        let lowered = lower_wave_mode(
+            &[S_ENDPGM],
+            WaveMode::with_range(32, 32, false, GroupSync::Auto),
+            true,
+            32,
+        )
+        .unwrap();
+        assert!(!lowered.wave_ops);
+    }
+
+    #[test]
+    fn wave64_on_32_lane_host_is_gated_only_when_wave_semantics_are_needed() {
+        // v_readlane_b32 requires the console's native wave lane mapping.
+        let words = [0xD760_0005, 0x0001_0701, S_ENDPGM];
         assert!(matches!(
             lower_wave_mode(
-                &[S_ENDPGM],
+                &words,
                 WaveMode::with_range(32, 32, false, GroupSync::Auto),
                 true,
                 32,
@@ -870,8 +884,8 @@ mod tests {
         ));
         assert!(
             lower_wave_mode(
-                &[S_ENDPGM],
-                WaveMode::with_range(32, 64, false, GroupSync::Auto),
+                &words,
+                WaveMode::with_range(32, 32, true, GroupSync::Auto),
                 true,
                 32,
             )
@@ -879,8 +893,8 @@ mod tests {
         );
         assert!(
             lower_wave_mode(
-                &[S_ENDPGM],
-                WaveMode::with_range(32, 32, true, GroupSync::Auto),
+                &words,
+                WaveMode::with_range(32, 64, false, GroupSync::Auto),
                 true,
                 32,
             )
