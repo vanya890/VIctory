@@ -768,6 +768,16 @@ mod tests {
         wave64: bool,
         threads: u32,
     ) -> Result<lower::Lowered, ShaderError> {
+        lower_wave_mode_with_rsrc2(words, wave, wave64, threads, 1 << 15 | 2 << 1)
+    }
+
+    fn lower_wave_mode_with_rsrc2(
+        words: &[u32],
+        wave: WaveMode,
+        wave64: bool,
+        threads: u32,
+        rsrc2: u32,
+    ) -> Result<lower::Lowered, ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -776,7 +786,7 @@ mod tests {
             layout: vec![],
             used: vec![],
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 1 << 15 | 2 << 1,
+                rsrc2,
                 threads: [threads, 1, 1],
             }),
             code,
@@ -859,11 +869,12 @@ mod tests {
 
     #[test]
     fn unrestricted_wave64_compute_lowers_on_a_32_lane_host() {
-        let lowered = lower_wave_mode(
+        let lowered = lower_wave_mode_with_rsrc2(
             &[S_ENDPGM],
             WaveMode::with_range(32, 32, false, GroupSync::Auto),
             true,
             32,
+            0,
         )
         .unwrap();
         assert!(!lowered.wave_ops);
@@ -874,29 +885,32 @@ mod tests {
         // v_readlane_b32 requires the console's native wave lane mapping.
         let words = [0xD760_0005, 0x0001_0701, S_ENDPGM];
         assert!(matches!(
-            lower_wave_mode(
+            lower_wave_mode_with_rsrc2(
                 &words,
                 WaveMode::with_range(32, 32, false, GroupSync::Auto),
                 true,
                 32,
+                0,
             ),
             Err(ShaderError::Unsupported { .. })
         ));
         assert!(
-            lower_wave_mode(
+            lower_wave_mode_with_rsrc2(
                 &words,
                 WaveMode::with_range(32, 32, true, GroupSync::Auto),
                 true,
                 32,
+                0,
             )
             .is_ok()
         );
         assert!(
-            lower_wave_mode(
+            lower_wave_mode_with_rsrc2(
                 &words,
                 WaveMode::with_range(32, 64, false, GroupSync::Auto),
                 true,
                 32,
+                0,
             )
             .is_ok()
         );
