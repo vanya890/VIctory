@@ -4935,7 +4935,7 @@ mod present_plane_tests {
         assert!(ambiguous.0.is_none());
 
         let denied = make(
-            DXGI_FORMAT_R16G16B16A16_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
                 | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_RENDER_TARGET,
