@@ -850,9 +850,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 pub(crate) fn retake(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let g = guards();
-    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     mark(&g, first, last);
-    for page in others {
+    for &page in g.alias_of.range(first..last).flat_map(|(_, links)| links.iter()) {
         mark(&g, page, page + 1);
     }
 }
