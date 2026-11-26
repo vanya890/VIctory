@@ -744,3 +744,266 @@ fn d16_x_loads_read_r16_uint_and_r16_float_views() {
         }
     }
 }
+
+const fn s_mov_literal(sdst: u8, value: u32) -> [u32; 2] {
+    [0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | 0xFF, value]
+}
+
+/// SMEM `s_buffer_load_dword*` at `s[base:base+3]` with a null SGPR offset.
+const fn s_buffer_load(op: u32, sdata: u8, base: u8, offset: u32) -> [u32; 2] {
+    [
+        0xF400_0000 | op << 18 | (sdata as u32) << 6 | (base as u32) >> 1,
+        125 << 25 | offset,
+    ]
+}
+
+/// MUBUF `buffer_store_dword vdata, vaddr, s[srsrc:srsrc+3], 0 offset:byte_off`.
+const fn buffer_store_at(vdata: u8, vaddr: u8, srsrc: u8, byte_off: u32) -> [u32; 2] {
+    [
+        0xE070_0000 | byte_off,
+        0x8000_0000 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// A constant table read through a V# built around `s_getpc_b64`: a dword
+/// inside NUM_RECORDS reads the table, a dword past it reads zero, and a wide
+/// load zeroes only its own out-of-range dword.
+fn code_table_bounds_program() -> Vec<u32> {
+    let mut w = vec![
+        0xBE84_1F00, // s_getpc_b64 s[4:5]
+        0x8008_FF04, // s_add_u32 s8, s4, <table start - 4>
+        0,           // literal patched below
+        0xBE89_0305, // s_mov_b32 s9, s5 (the descriptor's dword 1: high base, stride 0)
+    ];
+    w.extend(s_mov_literal(10, 12)); // NUM_RECORDS = 12 bytes
+    w.extend(s_mov_literal(11, 0x3101_6FAC));
+    w.extend(s_buffer_load(8, 16, 8, 0)); // s16 = in range, offset 0
+    w.extend(s_buffer_load(8, 17, 8, 12)); // s17 = past NUM_RECORDS
+    w.extend(s_buffer_load(9, 18, 8, 8)); // s18 in range, s19 past it
+    w.push(0xBE94_0302); // s_mov_b32 s20, s2
+    w.push(0xBE95_0380); // s_mov_b32 s21, 0
+    w.extend([0xF408_060A, 0xFA00_0000]); // s_load_dwordx4 s[24:27], s[20:21], 0
+    w.push(0xBF8C_C07F); // s_waitcnt lgkmcnt(0)
+    w.push(0x7E00_0280); // v_mov_b32 v0, 0
+    w.extend([0x7E02_0210, 0x7E04_0211, 0x7E06_0212, 0x7E08_0213]); // v1..v4 = s16..s19
+    for (data, at) in [(1, 0), (2, 4), (3, 8), (4, 12)] {
+        w.extend(buffer_store_at(data, 0, 24, at));
+    }
+    w.push(0xBF81_0000); // s_endpgm
+    let table_start = 4 * w.len() as u32;
+    w[2] = table_start - 4; // s_getpc_b64 yields the byte after itself.
+    w.extend([
+        0xC0DE_0000,
+        0xC0DE_0001,
+        0xC0DE_0002,
+        0xC0DE_0003,
+        0xC0DE_0004,
+        0xC0DE_0005,
+    ]);
+    w
+}
+
+/// Four descriptor variants over one code table: stride 4 NUM_RECORDS 5,
+/// stride 1 NUM_RECORDS 17, and stride 0 NUM_RECORDS 16/21 — the measured
+/// rows of the oracle (Leonida, RX 6800 gfx1030, commit 87d7bf7c43): stride 4
+/// gives data at 0x10 and zero at 0x14; stride 1 gives zero at 0x10; soffset
+/// 0xe with immediate 2 reads dword 0xc when the dynamic extra is zero;
+/// a dynamic extra of 4 moves it past NUM_RECORDS. The wide load at 0xc of
+/// a NUM_RECORDS 21 table reads data, data, zero, zero.
+fn code_table_stride_program() -> Vec<u32> {
+    let mut w = vec![
+        0xBE84_1F00, // s_getpc_b64 s[4:5]
+        0x8008_FF04,
+        0, // s_add_u32 s8, s4, <table start - 4> (patched below)
+        // A: s[8:11] — NUM_RECORDS 5, stride 4.
+        0x8809_FF05,
+        0x0004_0000, // s_or_b32 s9, s5, 4 << 16
+        0xBE8C_0308, // s_mov_b32 s12, s8
+        0x880D_FF05,
+        0x0001_0000, // s_or_b32 s13, s5, 1 << 16 (B: stride 1)
+        0x8010_0008, // s_add_u32 s16, s8, s0 (C: dynamic PC-relative byte offset)
+        0xBE91_0305, // s_mov_b32 s17, s5 (C: stride 0)
+        0xBE94_0308, // s_mov_b32 s20, s8
+        0xBE95_0305, // s_mov_b32 s21, s5 (D: stride 0)
+    ];
+    w.extend(s_mov_literal(10, 5)); // NUM_RECORDS 5
+    w.extend(s_mov_literal(11, 0x3101_6FAC));
+    w.extend(s_mov_literal(14, 17));
+    w.extend(s_mov_literal(15, 0x3101_6FAC));
+    w.extend(s_mov_literal(18, 16));
+    w.extend(s_mov_literal(19, 0x3101_6FAC));
+    w.extend(s_mov_literal(22, 21));
+    w.extend(s_mov_literal(23, 0x3101_6FAC));
+    w.extend(s_mov_literal(40, 0xe)); // unaligned SOFFSET, truncated to 0xc
+    w.extend(s_buffer_load(8, 30, 8, 0x10)); // A@0x10: data
+    w.extend(s_buffer_load(8, 31, 8, 0x14)); // A@0x14: zero
+    w.extend(s_buffer_load(8, 32, 12, 0x10)); // B@0x10: zero
+    w.extend(s_buffer_load(8, 33, 12, 0xc)); // B@0xc: data
+    // C: unaligned soffset 0xe + immediate 2 truncates to 0xc; next load checks extra alone.
+    w.extend([0xF400_0000 | 8 << 18 | 34 << 6 | 8, 40 << 25 | 2]);
+    w.extend(s_buffer_load(8, 35, 16, 0xc)); // C: dynamic extra only
+    w.extend(s_buffer_load(10, 36, 20, 0xc)); // D dwordx4: data, data, zero, zero
+    w.push(0xBE8A_0302); // s_mov_b32 s10, s2 — reuse s10, the UAV table
+    w.push(0xBE8B_0380); // s_mov_b32 s11, 0
+    w.extend([0xF408_0B05, 0xFA00_0000]); // s_load_dwordx4 s[44:47], s[10:11], 0
+    w.push(0xBF8C_C07F); // s_waitcnt lgkmcnt(0)
+    w.push(0x7E00_0280); // v_mov_b32 v0, 0
+    for (v, s) in [
+        (1u32, 30u32),
+        (2, 31),
+        (3, 32),
+        (4, 33),
+        (5, 34),
+        (6, 35),
+        (7, 36),
+        (8, 37),
+        (9, 38),
+        (10, 39),
+    ] {
+        w.push(0x7E00_0200 | (2 * v) << 16 | s); // v_mov_b32 vN, sM
+    }
+    for (data, at) in [
+        (1u32, 0u32),
+        (2, 4),
+        (3, 8),
+        (4, 12),
+        (5, 16),
+        (6, 20),
+        (7, 24),
+        (8, 28),
+        (9, 32),
+        (10, 36),
+    ] {
+        w.extend(buffer_store_at(data as u8, 0, 44, at));
+    }
+    w.push(0xBF81_0000); // s_endpgm
+    let table_start = 4 * w.len() as u32;
+    w[2] = table_start - 4;
+    w.extend([
+        0xC0DE_0000,
+        0xC0DE_0001,
+        0xC0DE_0002,
+        0xC0DE_0003,
+        0xC0DE_0004,
+        0xC0DE_0005,
+    ]);
+    w
+}
+
+#[test]
+fn scalar_buffer_loads_of_a_code_table_keep_num_records_with_stride_and_soffset() {
+    let words = code_table_stride_program();
+    let shader = build(
+        &words,
+        vec![param(RootType::Constants, 0), param(RootType::Table, 2)],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    let views = [View::RawUav(64)];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) if warp => panic!("{label}: required WARP adapter unavailable: {e}"),
+            Err(_) => continue,
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (dynamic_extra, c_value) in [(0u32, 0xC0DE_0003u32), (4, 0), (0xffff_fff8, 0)] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => dynamic_extra,
+                    (RootType::Table, 2) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(
+                out[0][..10],
+                [
+                    0xC0DE_0004,
+                    0,
+                    0,
+                    0xC0DE_0003,
+                    c_value,
+                    c_value,
+                    0xC0DE_0003,
+                    0xC0DE_0004,
+                    0,
+                    0
+                ],
+                "{label}: dynamic extra {dynamic_extra}, stride 4/1, unaligned soffset 0xe + imm 2, dynamic extra-only, overflow, wide load"
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn scalar_buffer_loads_of_a_code_table_read_zero_past_num_records() {
+    let words = code_table_bounds_program();
+    let shader = build(
+        &words,
+        vec![param(RootType::Table, 2)],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    let views = [View::RawUav(32)];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) if warp => panic!("{label}: required WARP adapter unavailable: {e}"),
+            Err(_) => continue,
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Table => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(
+            out[0][..4],
+            [0xC0DE_0000, 0, 0xC0DE_0002, 0],
+            "{label}: in-range dword, out-of-range dword, wide load"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
