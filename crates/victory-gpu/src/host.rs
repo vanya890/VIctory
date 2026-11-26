@@ -1508,7 +1508,7 @@ impl Host {
             let crumbs = match dred.GetAutoBreadcrumbsOutput() {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
-                    text.push_str(&format!("; no breadcrumbs ({e})"));
+                    text.push_str(&no_breadcrumbs(dred_on(), &e));
                     return text;
                 }
             };
@@ -1598,7 +1598,7 @@ impl Host {
         let Some(queue) = &self.messages else {
             return None;
         };
-        let mut first_error = None;
+        let mut seen = Vec::new();
         // SAFETY: each message is read into a buffer of the size the queue
         // reports, then the queue is emptied.
         unsafe {
@@ -1615,14 +1615,14 @@ impl Host {
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
                     tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
-                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
-                        first_error = Some(text.to_owned());
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                        seen.push((m.ID, m.Severity, text.to_owned()));
                     }
                 }
             }
             queue.ClearStoredMessages();
         }
-        first_error
+        removal_cause(&seen)
     }
 
     /// A host render target view of `resource`, valid until it is recorded.
@@ -3853,6 +3853,38 @@ fn removed_during(runs: &[&HostList], list: Option<usize>) -> String {
     String::new()
 }
 
+fn no_breadcrumbs(dred: bool, e: &windows::core::Error) -> String {
+    if !dred && e.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_UNSUPPORTED {
+        "; no breadcrumbs (device-removed data is off: VICTORY_D3D12_DRED=1 in a diagnostics build)"
+            .to_owned()
+    } else {
+        format!("; no breadcrumbs ({e})")
+    }
+}
+
+#[cfg(test)]
+mod removal_report {
+    use super::no_breadcrumbs;
+    use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_INVALID_CALL, DXGI_ERROR_UNSUPPORTED};
+
+    #[test]
+    fn breadcrumbs_off_names_the_switch_not_the_runtime_error() {
+        let e = windows::core::Error::from(DXGI_ERROR_UNSUPPORTED);
+        let off = no_breadcrumbs(false, &e);
+        assert!(off.contains("VICTORY_D3D12_DRED=1"), "{off}");
+        assert!(!off.contains("0x887A0004"), "{off}");
+        let on = no_breadcrumbs(true, &e);
+        assert!(on.contains("0x887A0004"), "{on}");
+    }
+
+    #[test]
+    fn breadcrumbs_off_keeps_other_errors() {
+        let e = windows::core::Error::from(DXGI_ERROR_INVALID_CALL);
+        let off = no_breadcrumbs(false, &e);
+        assert!(off.contains("0x887A0001"), "{off}");
+        assert!(!off.contains("VICTORY_D3D12_DRED"), "{off}");
+    }
+}
 /// For adapters without device-removed data (the software one): the last
 /// commands each list of the failed submission noted (diagnostics, with
 /// `VICTORY_D3D12_DRED`).
@@ -4608,5 +4640,116 @@ mod present_state_sync_tests {
         crate::watch::tests::free(address);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+}
+
+/// The last run of InfoQueue errors from one D3D12 call before the runtime's
+/// device-removal message. This is a heuristic: messages are emitted in queue
+/// order, but calls from different host threads may interleave.
+fn removal_cause(
+    messages: &[(D3D12_MESSAGE_ID, D3D12_MESSAGE_SEVERITY, String)],
+) -> Option<String> {
+    let error = |m: &&(D3D12_MESSAGE_ID, D3D12_MESSAGE_SEVERITY, String)| {
+        m.1.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0
+    };
+    let first = messages.iter().find(error).map(|m| m.2.as_str());
+    let removal = messages.iter().position(|(id, ..)| {
+        *id == D3D12_MESSAGE_ID_DEVICE_REMOVAL_PROCESS_AT_FAULT
+            || *id == D3D12_MESSAGE_ID_DEVICE_REMOVAL_PROCESS_POSSIBLY_AT_FAULT
+    });
+    let Some(at) = removal else {
+        return first.map(str::to_owned);
+    };
+    // D3D12 message text prefixes the API call as `ID3D12Device::Method:`.
+    let call = |text: &str| text.split(':').take(3).collect::<Vec<_>>().join(":");
+    let before: Vec<&str> = messages[..at]
+        .iter()
+        .filter(error)
+        .map(|m| m.2.as_str())
+        .collect();
+    let Some(&last) = before.last() else {
+        return first.map(str::to_owned);
+    };
+    let from = before
+        .iter()
+        .rposition(|t| call(t) != call(last))
+        .map_or(0, |i| i + 1);
+    let mut text = before[from..].join(" / ");
+    if let Some(first) = first
+        && !before[from..].contains(&first)
+    {
+        text.push_str(&format!(" (first error: {first})"));
+    }
+    Some(text)
+}
+
+#[cfg(test)]
+mod removal_cause_tests {
+    use super::*;
+
+    fn m(
+        id: i32,
+        severity: D3D12_MESSAGE_SEVERITY,
+        text: &str,
+    ) -> (D3D12_MESSAGE_ID, D3D12_MESSAGE_SEVERITY, String) {
+        (D3D12_MESSAGE_ID(id), severity, text.to_owned())
+    }
+
+    #[test]
+    fn a_removal_names_the_call_just_before_it_and_keeps_the_first_error() {
+        let e = D3D12_MESSAGE_SEVERITY_ERROR;
+        let messages = [
+            m(599, e, "ID3D12Device::GetResourceAllocationInfo: B5G5R5A1_UNORM unordered"),
+            m(342, e, "ID3D12Device::CreateUnorderedAccessView: B5G5R5A1_UNORM typed"),
+            m(340, e, "ID3D12Device::CreateUnorderedAccessView: no unordered flag"),
+            m(232, e, "ID3D12Device::RemoveDevice: DXGI_ERROR_INVALID_CALL"),
+            m(1, D3D12_MESSAGE_SEVERITY_WARNING, "later"),
+        ];
+        assert_eq!(
+            removal_cause(&messages).as_deref(),
+            Some(
+                "ID3D12Device::CreateUnorderedAccessView: B5G5R5A1_UNORM typed / \
+                 ID3D12Device::CreateUnorderedAccessView: no unordered flag \
+                 (first error: ID3D12Device::GetResourceAllocationInfo: B5G5R5A1_UNORM unordered)"
+            )
+        );
+    }
+
+    #[test]
+    fn the_first_error_is_not_repeated() {
+        let e = D3D12_MESSAGE_SEVERITY_ERROR;
+        let messages = [
+            m(36, e, "ID3D12Device::CreateRenderTargetView: B4G4R4A4_UNORM"),
+            m(232, e, "ID3D12Device::RemoveDevice: DXGI_ERROR_INVALID_CALL"),
+        ];
+        assert_eq!(
+            removal_cause(&messages).as_deref(),
+            Some("ID3D12Device::CreateRenderTargetView: B4G4R4A4_UNORM")
+        );
+    }
+
+    #[test]
+    fn without_a_removal_the_first_error_is_reported() {
+        let messages = [
+            m(1, D3D12_MESSAGE_SEVERITY_WARNING, "a warning"),
+            m(599, D3D12_MESSAGE_SEVERITY_ERROR, "first"),
+            m(36, D3D12_MESSAGE_SEVERITY_CORRUPTION, "second"),
+        ];
+        assert_eq!(removal_cause(&messages).as_deref(), Some("first"));
+        assert_eq!(removal_cause(&[m(1, D3D12_MESSAGE_SEVERITY_INFO, "info")]), None);
+        assert_eq!(removal_cause(&[]), None);
+    }
+
+    #[test]
+    fn a_removal_without_an_earlier_error_reports_the_removal_message() {
+        let messages = [m(
+            233,
+            D3D12_MESSAGE_SEVERITY_ERROR,
+            "ID3D12Device::RemoveDevice: possibly at fault",
+        )];
+        assert_eq!(
+            removal_cause(&messages).as_deref(),
+            Some("ID3D12Device::RemoveDevice: possibly at fault")
+        );
     }
 }
