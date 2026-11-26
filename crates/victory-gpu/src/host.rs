@@ -4790,14 +4790,15 @@ mod present_plane_tests {
         let render_target_state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
         let first_pixel =
             |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+                assert_eq!(footprint.Footprint.Format, DXGI_FORMAT_R16G16B16A16_FLOAT);
                 let mut mapped = std::ptr::null_mut();
-                // SAFETY: the present copy completed and this footprint names a live RGBA pixel.
+                // SAFETY: the present copy completed and the footprint names a live, aligned RGBA16F pixel.
                 let rgba = unsafe {
                     buffer.Map(0, None, Some(&mut mapped)).unwrap();
                     let rgba = mapped
                         .cast::<u8>()
                         .add(footprint.Offset as usize)
-                        .cast::<[u8; 4]>()
+                        .cast::<[u16; 4]>()
                         .read();
                     buffer.Unmap(0, None);
                     rgba
@@ -4872,7 +4873,7 @@ mod present_plane_tests {
             |buffer, footprint| converted_pixel = Some(first_pixel(buffer, footprint)),
         );
         assert!(converted.0.is_some(), "typed UNORM format must enable conversion");
-        assert_eq!(converted_pixel, Some((32, 32, [255, 0, 128, 255])));
+        assert_eq!(converted_pixel, Some((32, 32, [0x3c00, 0, 0x3800, 0x3c00])));
 
         // Use a fresh Host so no other parallel test can have cached a
         // compositor with this format and bypass the injected creation error.
