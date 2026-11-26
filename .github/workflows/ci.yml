@@ -41,7 +41,5 @@ jobs:
         env:
           VICTORY_D3D12_WARP: "1"
         run: |
-          cargo test -p victory-gpu --features diagnostics --locked \
-            descriptor::host::tests::dynamic_slots_are_held_until_released -- --exact --nocapture
-          cargo test -p victory-gpu --features diagnostics --locked \
-            memory::tests::lists_share_a_table_and_copies_keep_their_views -- --exact --nocapture
+          cargo test -p victory-gpu --features diagnostics --locked descriptor::host::tests::dynamic_slots_are_held_until_released -- --exact --nocapture
+          cargo test -p victory-gpu --features diagnostics --locked memory::tests::lists_share_a_table_and_copies_keep_their_views -- --exact --nocapture
