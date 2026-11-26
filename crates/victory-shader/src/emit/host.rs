@@ -167,6 +167,11 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
 static WARP_LOCK: Mutex<()> = Mutex::new(());
 
 impl Host {
+    #[cfg(test)]
+    pub(super) fn is_warp(&self) -> bool {
+        self.warp
+    }
+
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
         self.warp
             .then(|| WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
