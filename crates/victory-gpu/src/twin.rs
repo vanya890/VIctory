@@ -252,6 +252,38 @@ fn once(console: u32, view: u32, plane: u32, what: &str) {
     }
 }
 
+/// Whether a depth-twin UAV names a valid mip and array range on its plane.
+/// The console descriptor words are: [format, dimension, mip, plane] for
+/// TEXTURE2D, and [format, dimension, mip, first slice, slice count, plane]
+/// for TEXTURE2DARRAY. The selected twin plane is an ordinary 2D texture.
+fn valid_uav_range(desc: &D3D12_RESOURCE_DESC, words: &[u32; 10]) -> bool {
+    const TEXTURE_2D: u32 = 4;
+    const TEXTURE_2D_ARRAY: u32 = 5;
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 {
+        return false;
+    }
+    let mip_levels = if desc.MipLevels == 0 {
+        desc.Width.max(u64::from(desc.Height)).ilog2() as u16 + 1
+    } else {
+        desc.MipLevels
+    };
+    if words[2] >= u32::from(mip_levels) {
+        return false;
+    }
+    match words[1] {
+        TEXTURE_2D => desc.DepthOrArraySize == 1,
+        TEXTURE_2D_ARRAY => {
+            let first = words[3];
+            let count = words[4];
+            count != 0
+                && first < u32::from(desc.DepthOrArraySize)
+                && (count == u32::MAX
+                    || first.checked_add(count).is_some_and(|end| end <= u32::from(desc.DepthOrArraySize)))
+        }
+        _ => false,
+    }
+}
+
 /// An unordered access view at `at` of `resource`, a depth texture whose
 /// host copy is `copy`, made on its twin's plane the title's view names
 /// (`words`: the view description), in a format of that plane's family
@@ -284,8 +316,16 @@ pub(crate) fn uav(
         once(console, words[0], plane as u32, "an unordered view of a depth plane the twin does not have: not made");
         return None;
     };
+    // Validate the view against the actual selected twin plane, not merely
+    // the source depth texture. CreateUnorderedAccessView returns void, so an
+    // out-of-range mip/slice can otherwise fault the device without an HRESULT.
     // SAFETY: a live resource.
-    let own = unsafe { texture.texture.GetDesc() }.Format.0 as u32;
+    let texture_desc = unsafe { texture.texture.GetDesc() };
+    if !valid_uav_range(&texture_desc, &words) {
+        once(console, words[0], plane as u32, "an out-of-range unordered view of a depth twin: not made");
+        return None;
+    }
+    let own = texture_desc.Format.0 as u32;
     let view = crate::resource::pc_format(words[0]);
     let format = if crate::resource::family(view) == own {
         view
@@ -567,6 +607,74 @@ fn compile() -> windows::core::Result<Converter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_twin_uav_ranges_are_checked_before_view_creation() {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 32,
+            DepthOrArraySize: 1,
+            MipLevels: 7,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut full_chain_desc = desc;
+        full_chain_desc.MipLevels = 0;
+        let mut full_chain_words = [0u32; 10];
+        full_chain_words[1] = 4; // TEXTURE2D
+        full_chain_words[2] = 6; // 64x32 has seven levels in a full chain
+        assert!(valid_uav_range(&full_chain_desc, &full_chain_words));
+        full_chain_words[2] = 7;
+        assert!(
+            !valid_uav_range(&full_chain_desc, &full_chain_words),
+            "full-chain mip count is derived from dimensions"
+        );
+
+        let mut words = [0u32; 10];
+        words[1] = 4; // TEXTURE2D
+        words[2] = 6; // final valid mip
+        words[3] = 0; // plane
+        assert!(valid_uav_range(&desc, &words));
+        words[2] = 7;
+        assert!(!valid_uav_range(&desc, &words), "mip equal to MipLevels");
+
+        let mut array_desc = desc;
+        array_desc.DepthOrArraySize = 4;
+        words = [0; 10];
+        words[1] = 5; // TEXTURE2DARRAY
+        words[2] = 2;
+        words[3] = 2; // first array slice
+        words[4] = 2; // exactly reaches the end
+        words[5] = 0; // plane
+        assert!(valid_uav_range(&array_desc, &words));
+        words[4] = u32::MAX;
+        assert!(
+            valid_uav_range(&array_desc, &words),
+            "UINT_MAX selects all remaining array slices"
+        );
+        words[4] = 2;
+        words[1] = 4;
+        assert!(!valid_uav_range(&array_desc, &words), "2D view cannot select an array resource");
+        words[1] = 5;
+        words[3] = 3;
+        assert!(!valid_uav_range(&array_desc, &words), "first slice out of range");
+        words[3] = 2;
+        words[4] = 3;
+        assert!(!valid_uav_range(&array_desc, &words), "slice range exceeds array");
+        words[4] = 0;
+        assert!(!valid_uav_range(&array_desc, &words), "empty slice range");
+        words[3] = u32::MAX;
+        words[4] = 2;
+        assert!(!valid_uav_range(&array_desc, &words), "slice addition cannot wrap");
+
+        let mut non_texture = desc;
+        non_texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        assert!(!valid_uav_range(&non_texture, &words));
+        let mut multisampled = desc;
+        multisampled.SampleDesc.Count = 2;
+        assert!(!valid_uav_range(&multisampled, &words));
+    }
 
     /// The material-depth frame of Grand Theft Auto VI: written through
     /// unordered views, read as a shader resource in the same list, written
