@@ -107,6 +107,10 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_with(parts, WaveMode::default())
 }
 
+pub(crate) fn barrier_mode(writes_uavs: bool, relaxed: bool) -> u32 {
+    wave::barrier_mode(writes_uavs, relaxed)
+}
+
 pub(crate) fn lower_with(parts: &Parts, wave: WaveMode) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
