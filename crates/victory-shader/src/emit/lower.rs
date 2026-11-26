@@ -22,6 +22,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
 mod shift;
+mod waterfall;
 
 type Why = &'static str;
 
@@ -3580,6 +3581,16 @@ impl<'a> Lower<'a> {
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+            if let Some(scc) = scc
+                && self.leaves_with_no_lane(inst)
+            {
+                for &(_, v) in &inst.writes {
+                    self.vals.insert(v, Val::Missing(LANE_MASK));
+                }
+                let none = self.s.m.bool(false);
+                self.vals.insert(scc, Val::Bit(none));
+                return Ok(());
+            }
             return Err(LANE_MASK);
         }
         if matches!(
