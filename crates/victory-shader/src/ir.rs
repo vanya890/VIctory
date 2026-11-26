@@ -1335,7 +1335,41 @@ mod tests {
             .find(|i| i.name() == "v_movrels_b32")
             .and_then(|i| i.writes.first().map(|(_, v)| *v))
             .unwrap();
-        assert!(p.restored.contains_key(&restored));
+        let parked = p.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "v_writelane_b32")
+            .and_then(|i| i.read(Reg::S(0)))
+            .unwrap();
+        assert_eq!(p.restored.get(&restored), Some(&parked));
+    }
+
+    #[test]
+    fn m0_relative_restore_rejects_ambiguous_parked_lanes() {
+        let p = build_words(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE80_036A, // s_mov_b32 s0, vcc_lo
+                0xD761_0007,
+                0x0001_0000, // v_writelane_b32 v7, s0, 0
+                0xD761_0007,
+                0x0001_0201, // v_writelane_b32 v7, s1, 1
+                0xBEFC_0383, // s_mov_b32 m0, 3
+                0x7E00_8704, // v_movrels_b32 v0, v4 (source v7)
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let restored = p.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "v_movrels_b32")
+            .and_then(|i| i.writes.first().map(|(_, v)| *v))
+            .unwrap();
+        assert!(
+            !p.restored.contains_key(&restored),
+            "more than one parked lane makes the relative source ambiguous"
+        );
     }
 
     #[test]
