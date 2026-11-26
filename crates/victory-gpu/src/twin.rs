@@ -284,6 +284,19 @@ fn valid_uav_range(desc: &D3D12_RESOURCE_DESC, words: &[u32; 10]) -> bool {
     }
 }
 
+/// Validate a depth-twin UAV and replace the console remaining-slices
+/// sentinel with the concrete count required by a non-null D3D12 descriptor.
+fn normalize_uav_range(desc: &D3D12_RESOURCE_DESC, words: &mut [u32; 10]) -> bool {
+    if !valid_uav_range(desc, words) {
+        return false;
+    }
+    if words[1] == 5 && words[4] == u32::MAX {
+        // valid_uav_range already proved first < DepthOrArraySize.
+        words[4] = u32::from(desc.DepthOrArraySize) - words[3];
+    }
+    true
+}
+
 /// An unordered access view at `at` of `resource`, a depth texture whose
 /// host copy is `copy`, made on its twin's plane the title's view names
 /// (`words`: the view description), in a format of that plane's family
@@ -321,7 +334,7 @@ pub(crate) fn uav(
     // out-of-range mip/slice can otherwise fault the device without an HRESULT.
     // SAFETY: a live resource.
     let texture_desc = unsafe { texture.texture.GetDesc() };
-    if !valid_uav_range(&texture_desc, &words) {
+    if !normalize_uav_range(&texture_desc, &mut words) {
         once(console, words[0], plane as u32, "an out-of-range unordered view of a depth twin: not made");
         return None;
     }
@@ -653,6 +666,17 @@ mod tests {
             valid_uav_range(&array_desc, &words),
             "UINT_MAX selects all remaining array slices"
         );
+        assert!(normalize_uav_range(&array_desc, &mut words));
+        assert_eq!(words[4], 2, "host descriptor gets the explicit remaining slice count");
+        // SAFETY: words encode a TEXTURE2DARRAY UAV; this is the exact
+        // descriptor layout passed to CreateUnorderedAccessView below.
+        let host_desc = unsafe {
+            std::ptr::from_ref(&words)
+                .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
+                .read_unaligned()
+        };
+        // SAFETY: the selected union member matches TEXTURE2DARRAY.
+        assert_eq!(unsafe { host_desc.Anonymous.Texture2DArray.ArraySize }, 2);
         words[4] = 2;
         words[1] = 4;
         assert!(!valid_uav_range(&array_desc, &words), "2D view cannot select an array resource");
