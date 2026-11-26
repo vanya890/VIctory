@@ -640,6 +640,14 @@ impl<'a> Lanes<'a> {
                 l.restored.insert(r, s);
             }
         }
+        // Keep the existing phi-aware spill analysis authoritative. The IR
+        // lookahead only fills restore cases it can prove locally (notably
+        // M0-relative reads) and must not overwrite a stronger existing fact.
+        for (&result, &scalar) in &p.restored {
+            if !l.restored.contains_key(&result) {
+                l.restored.insert(result, scalar);
+            }
+        }
         Ok(l)
     }
 
