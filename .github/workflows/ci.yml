@@ -18,20 +18,83 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  lint:
+    name: Format and lint
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - name: Test coordination triage scripts
         run: python -B -I -m unittest discover -s scripts -p 'test_coordination_triage.py' -v
-      # The version and components pinned in rust-toolchain.toml.
-      - run: rustup toolchain install
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Clippy, diagnostics build
+      - name: Clippy with all features
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      # Includes xtask's repository_passes_policy, the asset-policy check.
-      - name: Tests
-        run: cargo test --workspace --locked
+
+  test:
+    name: Tests (${{ matrix.features }})
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - features: default
+            args: ""
+          - features: all
+            args: "--all-features"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile all workspace targets
+        run: cargo check --workspace --all-targets ${{ matrix.args }} --locked
+      - name: Run workspace tests
+        run: cargo test --workspace ${{ matrix.args }} --locked
+
+  build:
+    name: Release and diagnostics builds
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release executable
+        run: cargo build --release -p victory --locked
+      - name: Build diagnostics executable
+        run: cargo build --profile diag -p victory --features diagnostics --locked
+
+  docs:
+    name: Documentation
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace documentation
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+  security:
+    name: Dependency security audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit Cargo.lock
+        run: cargo audit
