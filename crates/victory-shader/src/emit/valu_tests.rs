@@ -79,6 +79,12 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 }
 
 fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    try_build_valu_cs_lanes(body, 1)
+}
+
+/// [`try_build_valu_cs`] with `lanes` threads in the group (one wave of 32
+/// at most); `v0` holds each thread's index.
+fn try_build_valu_cs_lanes(body: &[u32], lanes: u32) -> Result<HostShader, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -127,7 +133,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads: [lanes, 1, 1],
         }),
         code,
     };
@@ -292,6 +298,50 @@ fn a_branch_to_fallthrough_keeps_both_values_at_a_join() {
     );
 }
 
+#[test]
+fn the_scc_a_waterfall_loop_leaves_is_false() {
+    let shader = build_valu_cs(&[
+        s_mov_b32(20, 126),                     // s20 = exec_lo
+        s_mov_b32(21, 126),                     // s21 = exec_lo
+        vop1(0x002, 22, vgpr(1)),               // loop: v_readfirstlane_b32 s22, v1
+        0x7C00_0000 | 0xD2 << 17 | 1 << 9 | 22, // v_cmpx_eq_u32 s22, v1
+        0xBE95_4715,                            // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFFC,                            // s_cbranch_execnz -> loop
+        s_mov_b32(126, 20),                     // exec_lo = s20
+        sop2(0x0A, 23, 1, 2),                   // s_cselect_b32 s23, s1, s2
+        vop1(0x001, 0, sgpr(23)),               // v0 = s23
+    ]);
+    run_cases(
+        &shader,
+        &[[3, 1, 2, 0], [0, 7, 9, 0]],
+        |backend, _, inputs, actual| {
+            assert_eq!(actual, inputs[2], "{backend}");
+        },
+    );
+}
+
+/// The same loop over 32 lanes keyed `lane & s0` (1, 2, 8 or 32 distinct
+/// keys), so it runs that many passes before the SCC is read.
+#[test]
+fn the_scc_a_waterfall_loop_over_many_keys_leaves_is_false() {
+    let mut body = vop3(0x11B, 5, sgpr(0), vgpr(0), 0).to_vec(); // v_and_b32 v5, s0, v0
+    body.extend([
+        s_mov_b32(20, 126),                     // s20 = exec_lo
+        s_mov_b32(21, 126),                     // s21 = exec_lo
+        vop1(0x002, 22, vgpr(5)),               // loop: v_readfirstlane_b32 s22, v5
+        0x7C00_0000 | 0xD2 << 17 | 5 << 9 | 22, // v_cmpx_eq_u32 s22, v5
+        0xBE95_4715,                            // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFFC,                            // s_cbranch_execnz -> loop
+        s_mov_b32(126, 20),                     // exec_lo = s20
+        sop2(0x0A, 23, 1, 2),                   // s_cselect_b32 s23, s1, s2
+        vop1(0x001, 0, sgpr(23)),               // v0 = s23
+    ]);
+    let shader = try_build_valu_cs_lanes(&body, 32).expect("build");
+    let cases = [0u32, 1, 7, 31].map(|m| [m, 5, 6, 0]);
+    run_cases(&shader, &cases, |backend, i, inputs, actual| {
+        assert_eq!(actual, inputs[2], "{backend}: case {i}");
+    });
+}
 #[test]
 fn v_fma_f16_rounds_once_and_preserves_other_half() {
     use super::host::Stride;
