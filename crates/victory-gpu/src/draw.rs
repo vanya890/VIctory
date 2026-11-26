@@ -2711,6 +2711,10 @@ uint ps() : SV_Target { return 1; }
     #[test]
     fn root_views_reach_their_copy_and_read_zeros_past_it() {
         let Some(host) = crate::host::host() else {
+            assert!(
+                !crate::switch::on("VICTORY_D3D12_WARP"),
+                "WARP validation requested but no D3D12 host was created"
+            );
             return; // no host GPU here
         };
         const MIB: u64 = 1 << 20;
