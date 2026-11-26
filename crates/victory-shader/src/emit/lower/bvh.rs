@@ -138,9 +138,21 @@ impl Lower<'_> {
                 match self.root_address(src) {
                     Some((root_lo, root_hi)) => {
                         self.s.flags |= super::flags::INT64;
+                        // The root descriptor's low byte is already zero (see the shortcut
+                        // above), so its base can be used directly here.
                         let base = wide64(self, root_lo, root_hi);
                         let zero = self.s.m.i32(0);
-                        let at = wide64(self, at, zero);
+                        let ptr = wide64(self, lo, node_hi.unwrap_or(zero));
+                        let k3 = self.s.m.int_const(i64t, 3);
+                        let off = self.s.m.bin(c, Bin::Shl, ptr, k3);
+                        // Widen each 32-bit piece before adding, preserving carries out of
+                        // the low word (including a carry from k + dynamic).
+                        let k = self.s.m.cast(c, Cast::ZExt, k, i64t);
+                        let mut at = self.s.m.bin(c, Bin::Add, off, k);
+                        if let Some(d) = dynamic {
+                            let d = self.s.m.cast(c, Cast::ZExt, d, i64t);
+                            at = self.s.m.bin(c, Bin::Add, at, d);
+                        }
                         Nodes::Raw(self.s.m.bin(c, Bin::Add, base, at))
                     }
                     None => Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at),

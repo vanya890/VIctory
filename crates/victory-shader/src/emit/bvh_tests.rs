@@ -711,7 +711,15 @@ fn case(rng: &mut Rng) -> (Vec<u32>, u32, Ray) {
     (w, ty, ray)
 }
 
-fn run_cases(wide: bool, batches: usize, memory: bool) {
+fn run_cases_at(
+    wide: bool,
+    batches: usize,
+    memory: bool,
+    base: u64,
+    ptr_bias: u32,
+    node_hi: u32,
+    high: bool,
+) {
     let shader = build(wide, memory);
     // A program with the BVH instruction reads its root SRV as title
     // memory too.
@@ -723,6 +731,8 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let target = base + (u64::from(node_hi) << 35) + (u64::from(ptr_bias) << 3);
+    let high_at = if high { HIGH / 4 } else { 0 };
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -736,8 +746,8 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
         for u in &shader.user_data {
             ud[u.index as usize] = match (u.root, u.slot) {
                 (RootType::Table, 1) => 0,
-                (RootType::Constants, 0) if memory => (TITLE >> (32 * u.dword)) as u32,
-                (RootType::Descriptor, 0) if !memory => (TITLE >> (32 * u.dword)) as u32,
+                (RootType::Constants, 0) if memory => (base >> (32 * u.dword)) as u32,
+                (RootType::Descriptor, 0) if !memory => (base >> (32 * u.dword)) as u32,
                 _ => panic!("{u:?}"),
             };
         }
@@ -745,9 +755,9 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
         for cases in &batches {
             // Rays, then the nodes, 128 bytes each.
             let nodes = (LANES * 64) as u32;
-            let mut data = vec![0u32; LANES * 16 + LANES * 32];
+            let mut data = vec![0u32; LANES * 16 + LANES * 32 + high_at as usize];
             for (n, (w, ty, ray)) in cases.iter().enumerate() {
-                let ptr = (nodes + 128 * n as u32) >> 3 | ty;
+                let ptr = (ptr_bias + ((nodes + 128 * n as u32) >> 3)) | ty;
                 let r = &mut data[16 * n..16 * n + 12];
                 r[0] = ptr;
                 r[1] = ray.extent.to_bits();
@@ -756,12 +766,16 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
                     r[5 + k] = ray.dir[k].to_bits();
                     r[8 + k] = ray.inv[k].to_bits();
                 }
-                let at = LANES * 16 + 32 * n;
+                r[11] = node_hi;
+                let at = high_at as usize + LANES * 16 + 32 * n;
                 data[at..at + 28].copy_from_slice(w);
             }
             let roots = vec![
                 (0, Root::Constants(ud.clone())),
-                (1, Root::View { srv: true, data: page_table(1, 3) }),
+                (1, Root::View {
+                    srv: true,
+                    data: if high { page_table_high(1, 3, base, target) } else { page_table(1, 3) },
+                }),
                 (2, Root::Uav(2 * 4096 / 32)),
             ];
             let views = [
@@ -800,6 +814,10 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+fn run_cases(wide: bool, batches: usize, memory: bool) {
+    run_cases_at(wide, batches, memory, TITLE, 0, 0, false);
+}
+
 #[test]
 fn intersections_on_the_gpu_equal_the_reference() {
     run_cases(false, 16, false);
@@ -812,10 +830,10 @@ fn intersections_with_64_bit_pointers_on_the_gpu_equal_the_reference() {
 
 /// The title address of the rays and nodes in the title-memory runs.
 const TITLE: u64 = 0x12_3450_0000;
+const HIGH: u32 = 64 << 10;
 
-/// The page table (`emit` "Title memory") for one copy of title memory at
-/// [`TITLE`] (under 64 KiB) with its views at heap index `view`, the null
-/// pair at `null`.
+/// The page table for one copy of title memory at [`TITLE`], with its
+/// view at heap index `view` and the null pair at `null`.
 fn page_table(view: u32, null: u32) -> Vec<u32> {
     let (hi, lo) = ((TITLE >> 32) as u32, TITLE as u32);
     let mut t = vec![0u32; 4096];
@@ -828,10 +846,46 @@ fn page_table(view: u32, null: u32) -> Vec<u32> {
     t
 }
 
+/// A base page mapped to the zeroed prefix and a high page mapped to a
+/// second copy of the nodes `HIGH` bytes into the same view.
+fn page_table_high(view: u32, null: u32, base: u64, target: u64) -> Vec<u32> {
+    let (base_hi, base_lo) = ((base >> 32) as u32, base as u32);
+    let (target_hi, target_lo) = ((target >> 32) as u32, target as u32);
+    let mut t = vec![0u32; 4096 + 3 * 8192];
+    for page in 0..4096 {
+        t[4096 + 2 * page] = null;
+    }
+    let base_l1 = (base_hi << 4 | base_lo >> 28) as usize;
+    let target_l1 = (target_hi << 4 | target_lo >> 28) as usize;
+    t[base_l1] = 1;
+    t[target_l1] = 2;
+    let page = (base_lo >> 16 & 0xFFF) as usize;
+    let base_entry = 4096 + 2 * (4096 + page);
+    let target_entry = 4096 + 2 * (8192 + page);
+    t[base_entry..base_entry + 2].copy_from_slice(&[view, base_lo]);
+    t[target_entry..target_entry + 2]
+        .copy_from_slice(&[view, target_lo.wrapping_sub(HIGH)]);
+    t
+}
+
 /// The BVH at a pointer the program has in root constants: nodes (and
 /// rays) read through title memory.
 #[test]
 fn intersections_on_nodes_in_title_memory_equal_the_reference() {
     run_cases(false, 4, true);
     run_cases(true, 4, true);
+}
+
+/// A dropped low-word carry must land on a zeroed decoy page, not the node copy.
+#[test]
+fn root_derived_bvh_addresses_preserve_low_word_carries() {
+    // `memory = false` selects the Source::Built root-descriptor path.
+    run_cases_at(false, 4, false, TITLE, 0x2000_0000, 0, true);
+}
+
+/// A non-zero high pointer word must select a separate mapped page.
+#[test]
+fn root_derived_bvh64_addresses_preserve_node_hi() {
+    // `memory = false` selects the Source::Built root-descriptor path.
+    run_cases_at(true, 4, false, TITLE, 0, 1, true);
 }
