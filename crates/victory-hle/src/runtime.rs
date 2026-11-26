@@ -319,6 +319,7 @@ mod tests {
         assert_eq!(keep.Version, PROCESS_POWER_THROTTLING_CURRENT_VERSION);
         assert_eq!(keep.ControlMask, both);
         assert_eq!(keep.StateMask, 0);
+        assert_eq!(power_throttling_state("0").StateMask, 0);
 
         let enabled = power_throttling_state("1");
         assert_eq!(enabled.ControlMask, both);
