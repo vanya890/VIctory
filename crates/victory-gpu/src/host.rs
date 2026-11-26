@@ -4487,6 +4487,142 @@ mod present_plane_tests {
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
+
+    #[test]
+    fn present_conversion_requires_typed_view_and_shader_resource_access() {
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX typed-view test: no D3D12 device");
+            return;
+        };
+        let make = |format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS| -> ID3D12Resource {
+            let mut texture = None;
+            // SAFETY: live device and a valid 2D resource description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 32,
+                            Height: 32,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: format,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Flags: flags,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+            }
+            texture.unwrap()
+        };
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let typeless = make(
+            DXGI_FORMAT_R16G16B16A16_TYPELESS,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        );
+        let list = host.new_list().unwrap();
+        let rtv = host.rtv(
+            &typeless,
+            Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: DXGI_FORMAT_R16G16B16A16_UNORM,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_RTV { MipSlice: 0, PlaneSlice: 0 },
+                },
+            }),
+        );
+        // SAFETY: live typed RTV on an open list.
+        unsafe { list.list.ClearRenderTargetView(rtv, &[1.0, 0.5, 0.0, 1.0], None) };
+        list.close();
+        host.execute(&[&list]);
+
+        let mut pixel = None;
+        let converted = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(
+                &typeless,
+                state,
+                Some(DXGI_FORMAT_R16G16B16A16_UNORM.0 as u32),
+            )],
+            6,
+            Compositor::new,
+            |buffer, footprint| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: completed present copy; footprint points to one RGBA16F texel.
+                pixel = Some(unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u16; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                });
+            },
+        );
+        assert!(converted.0.is_some(), "typed UNORM RTV metadata must enable conversion");
+        let [red, green, blue, alpha] = pixel.expect("converted primary pixel");
+        assert_eq!((red, blue, alpha), (0x3c00, 0x0000, 0x3c00));
+        assert!(matches!(green, 0x37ff | 0x3800), "expected ~0.5 as f16, got {green:#06x}");
+
+        let mut attempted = false;
+        let failed = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(
+                &typeless,
+                state,
+                Some(DXGI_FORMAT_R16G16B16A16_UNORM.0 as u32),
+            )],
+            7,
+            |_, _| {
+                attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |_, _| panic!("conversion-required primary must not be copied raw"),
+        );
+        assert!(attempted);
+        assert!(failed.0.is_none(), "failed compositor must not raw-copy mismatched texels");
+
+        let ambiguous = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(&typeless, state, None)],
+            8,
+            |_, _| panic!("typeless primary without its actual view must be rejected"),
+            |_, _| panic!("ambiguous typeless primary must not be presented"),
+        );
+        assert!(ambiguous.0.is_none());
+
+        let denied = make(
+            DXGI_FORMAT_R16G16B16A16_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+                | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+        );
+        let mut denied_attempted = false;
+        let rejected = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(&denied, state, None)],
+            9,
+            |_, _| {
+                denied_attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |_, _| panic!("DENY_SHADER_RESOURCE primary must not be sampled or copied raw"),
+        );
+        assert!(rejected.0.is_none());
+        assert!(!denied_attempted);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
 }
 
 #[cfg(test)]
