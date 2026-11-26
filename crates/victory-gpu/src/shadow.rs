@@ -258,42 +258,71 @@ impl Snapshot {
     }
 }
 
-/// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-
-/// An empty buffer with room for `required` bytes, preferring capacity
-/// of at least `preferred` and reusing touched memory when possible.
-fn pooled(required: usize, preferred: usize) -> Option<Vec<u8>> {
-    let mut v = {
-        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        let fit = pool
-            .iter()
-            .enumerate()
-            .map(|(i, v)| (i, v.capacity()))
-            .filter(|&(_, capacity)| capacity >= required)
-            .min_by_key(|&(_, capacity)| (capacity < preferred, capacity));
-        fit.map(|(i, _)| pool.swap_remove(i))
-    }?;
-    v.clear();
-    Some(v)
-}
-
-/// Returns a snapshot buffer to the pool, which keeps the largest up to
-/// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
-/// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
-fn give_back(v: Vec<u8>) {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut total = 0;
-    pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
-    });
-}
-
-/// Snapshot memory kept for reuse.
+/// Snapshot memory kept for reuse. The largest buffers are first, so
+/// best-fit checkout and ordered return need only binary search.
 const POOL_BYTES: usize = 512 << 20;
+
+#[derive(Default)]
+struct SnapshotPool {
+    buffers: Vec<Vec<u8>>,
+}
+
+impl SnapshotPool {
+    /// Prefer the smallest buffer at least the preferred size; if none
+    /// exists, fall back to the smallest buffer that can satisfy required.
+    fn take(&mut self, required: usize, preferred: usize) -> Option<Vec<u8>> {
+        let preferred = preferred.max(required);
+        let cut = self
+            .buffers
+            .partition_point(|buffer| buffer.capacity() >= preferred);
+        let fit = cut.checked_sub(1).or_else(|| {
+            self.buffers
+                .partition_point(|buffer| buffer.capacity() >= required)
+                .checked_sub(1)
+        });
+        let mut buffer = self.buffers.remove(fit?);
+        buffer.clear();
+        Some(buffer)
+    }
+
+    fn give_back(&mut self, buffer: Vec<u8>) {
+        let at = self
+            .buffers
+            .partition_point(|kept| kept.capacity() >= buffer.capacity());
+        self.buffers.insert(at, buffer);
+        self.trim(POOL_BYTES);
+    }
+
+    /// Keep the largest buffers within the byte budget. The descending
+    /// order makes this a prefix retention operation.
+    fn trim(&mut self, max_bytes: usize) {
+        let mut total = 0usize;
+        self.buffers.retain(|buffer| {
+            total = total.saturating_add(buffer.capacity());
+            total <= max_bytes
+        });
+    }
+}
+
+static POOL: Mutex<SnapshotPool> = Mutex::new(SnapshotPool {
+    buffers: Vec::new(),
+});
+
+/// An empty buffer with room for required bytes, preferring capacity
+/// of at least preferred and reusing touched memory when possible.
+fn pooled(required: usize, preferred: usize) -> Option<Vec<u8>> {
+    POOL.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take(required, preferred)
+}
+
+/// Returns a snapshot buffer to the pool. Reuse avoids a page fault per
+/// 4 KiB touched (millions per frame in a large world submission).
+fn give_back(buffer: Vec<u8>) {
+    POOL.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .give_back(buffer);
+}
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
@@ -1497,6 +1526,72 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_pool_keeps_best_fit_order_without_global_state() {
+        let mut pool = SnapshotPool::default();
+        for i in 0..2000usize {
+            pool.give_back(Vec::with_capacity(4096 + (i % 64) * 1024));
+        }
+        assert!(pool.buffers.len() > 1000);
+        assert!(pool
+            .buffers
+            .windows(2)
+            .all(|pair| pair[0].capacity() >= pair[1].capacity()));
+
+        let expected = pool
+            .buffers
+            .iter()
+            .filter(|buffer| buffer.capacity() >= 16 * 1024)
+            .map(Vec::capacity)
+            .min()
+            .unwrap();
+        let count = pool.buffers.len();
+        let buffer = pool.take(8 * 1024, 16 * 1024).unwrap();
+        assert_eq!(buffer.capacity(), expected, "smallest preferred fit");
+        assert_eq!(pool.buffers.len(), count - 1);
+        assert!(pool
+            .buffers
+            .windows(2)
+            .all(|pair| pair[0].capacity() >= pair[1].capacity()));
+
+        pool.give_back(buffer);
+        assert_eq!(pool.buffers.len(), count);
+        assert!(pool
+            .buffers
+            .windows(2)
+            .all(|pair| pair[0].capacity() >= pair[1].capacity()));
+    }
+
+    #[test]
+    fn snapshot_pool_falls_back_to_smallest_required_fit() {
+        let mut pool = SnapshotPool::default();
+        pool.give_back(Vec::with_capacity(8 * 1024));
+        pool.give_back(Vec::with_capacity(16 * 1024));
+        let expected = pool
+            .buffers
+            .iter()
+            .filter(|buffer| buffer.capacity() >= 4 * 1024)
+            .map(Vec::capacity)
+            .min()
+            .unwrap();
+
+        let buffer = pool.take(4 * 1024, 32 * 1024).unwrap();
+        assert_eq!(buffer.capacity(), expected, "smallest required fallback");
+        assert!(pool.take(1 << 20, 1 << 20).is_none());
+    }
+
+    #[test]
+    fn snapshot_pool_trims_largest_first_without_global_state() {
+        let mut pool = SnapshotPool::default();
+        for size in [80, 40, 40] {
+            pool.give_back(Vec::with_capacity(size));
+        }
+        let largest = pool.buffers[0].capacity();
+        pool.trim(largest);
+        assert_eq!(pool.buffers.len(), 1);
+        assert_eq!(pool.buffers[0].capacity(), largest);
+    }
 
     #[test]
     fn overlapping_snapshots_keep_old_bytes_until_a_refresh() {
