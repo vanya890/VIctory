@@ -1737,6 +1737,8 @@ impl Host {
         for (_, address, len) in &withheld {
             crate::memory::drop_withheld(*address, *len);
         }
+        // Some bitmap-held pages have no declared range in back, so drop
+        // those separately after every declared copy-back has completed.
         for (_copy, page) in held_pages {
             crate::memory::drop_withheld(page, crate::watch::PAGE);
         }
