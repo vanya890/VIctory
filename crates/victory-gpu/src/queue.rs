@@ -590,7 +590,7 @@ extern "system" fn present(
             let sources: Vec<_> = resources
                 .iter()
                 .map(|(resource, copy)| {
-                    crate::host::PresentPlane::Tracked(copy, crate::resource::view_format(*resource))
+                    crate::host::PresentPlane::Tracked(copy, crate::resource::view_format_of(*resource, copy))
                 })
                 .collect();
             let (shown, state) = host.present_planes(&sources, frame);
