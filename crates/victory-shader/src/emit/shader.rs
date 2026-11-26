@@ -542,7 +542,9 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self
+            .m
+            .i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
@@ -581,7 +583,11 @@ impl Shader {
             (flags::WAVE_OPS, uses.wave),
             (flags::INT64, uses.int64),
         ] {
-            self.flags = if used { self.flags | flag } else { self.flags & !flag };
+            self.flags = if used {
+                self.flags | flag
+            } else {
+                self.flags & !flag
+            };
         }
         // UAVs outside pixel and compute programs (the write and read marks
         // of vertex, geometry and mesh programs), as DXC counts them: UAV
@@ -1059,7 +1065,14 @@ mod tests {
         let (or, zero, one) = (s.m.i32(2), s.m.i32(0), s.m.i32(1));
         let iu = s.m.undef(s.t.i32);
         let i32t = s.t.i32;
-        s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, or, zero, iu, iu, one]);
+        s.op(
+            b,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            78,
+            &[h, or, zero, iu, iu, one],
+        );
         s.m.terminate(b, Term::Ret);
         s.finish()
     }

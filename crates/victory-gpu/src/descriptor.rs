@@ -161,26 +161,34 @@ fn mirror(handle: u64) {
 /// Mirrors a contiguous descriptor copy with one heap lookup and pending lock.
 #[cfg(windows)]
 fn mirror_copy(dst: u64, count: u32, kind: u32, step: u64) {
-    let Some(bytes) = u64::from(count).checked_mul(step) else { return };
-    let Some(end) = dst.checked_add(bytes) else { return };
+    let Some(bytes) = u64::from(count).checked_mul(step) else {
+        return;
+    };
+    let Some(end) = dst.checked_add(bytes) else {
+        return;
+    };
     #[cfg(feature = "diagnostics")]
     let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(feature = "diagnostics")]
     drop(waited);
-    let Some(&(start, limit, at)) = heaps.iter().find(|&&(start, limit, _)| dst < limit && start < end) else {
+    let Some(&(start, limit, at)) = heaps
+        .iter()
+        .find(|&&(start, limit, _)| dst < limit && start < end)
+    else {
         return;
     };
     // SAFETY: registered heaps stay alive while the registry is locked.
     let heap = unsafe { &*(at as *const Heap) };
-    if dst >= start
-        && end <= limit
-        && kind == heap.desc.kind
-        && (dst - start).is_multiple_of(step)
+    if dst >= start && end <= limit && kind == heap.desc.kind && (dst - start).is_multiple_of(step)
     {
         let first = ((dst - start) / step) as u32;
-        let Some(last) = first.checked_add(count) else { return };
-        if last > heap.desc.count { return; }
+        let Some(last) = first.checked_add(count) else {
+            return;
+        };
+        if last > heap.desc.count {
+            return;
+        }
         let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
         match heap.host.get() {
             None => pending.extend(first..last),
@@ -209,7 +217,6 @@ fn mirror_copy(dst: u64, count: u32, kind: u32, step: u64) {
         mirror(dst + u64::from(i) * step);
     }
 }
-
 
 /// Mirrors what the title wrote into its shader-visible heaps without a
 /// call: Grand Theft Auto VI copies descriptors (our records) into its heap
@@ -240,13 +247,21 @@ pub(crate) fn sync_heaps() {
                 if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
                     continue;
                 }
-                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                let (first, last) = (
+                    (page as u64 - start) / step,
+                    (end as u64 - start).div_ceil(step),
+                );
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(
                     crate::copystat::C::SyncSlots,
                     last.min(u64::from(heap.desc.count)).saturating_sub(first),
                 );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+                host.sync_slots(
+                    first as u32,
+                    last.min(u64::from(heap.desc.count)) as u32,
+                    start,
+                    step,
+                );
             }
         }
     }
@@ -271,7 +286,12 @@ pub(crate) fn make_read(slots: &[u32]) {
             .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
             .filter(|heap| heap.desc.kind == VIEWS_KIND)
             .filter_map(|heap| heap.host.get()?.as_ref().map(|host| (heap, host)))
-            .flat_map(|(heap, host)| slots.iter().filter(|&&i| i < heap.desc.count).filter_map(|&i| host.unmade_placed(i)))
+            .flat_map(|(heap, host)| {
+                slots
+                    .iter()
+                    .filter(|&&i| i < heap.desc.count)
+                    .filter_map(|&i| host.unmade_placed(i))
+            })
             .collect()
     };
     #[cfg(test)]
@@ -679,7 +699,11 @@ fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
     records
         .iter()
         .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+            tag == VIEW_TAG
+                && views
+                    .list
+                    .get(i as usize)
+                    .is_some_and(|(_, current)| *current == generation)
         })
         .collect()
 }
@@ -804,7 +828,9 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     if count == 0 || dst == 0 || src == 0 {
         return;
     }
-    let Some(len) = u64::from(count).checked_mul(step) else { return };
+    let Some(len) = u64::from(count).checked_mul(step) else {
+        return;
+    };
     if dst != src {
         // SAFETY: both ranges are descriptor slots the title owns and may overlap.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
@@ -979,7 +1005,8 @@ static FUNCTIONS: Table<24> = {
 pub(crate) mod tests {
     /// Work to run while `make_read` makes the textures of a read slot (the
     /// slot), outside the heaps' lock.
-    pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> = std::sync::Mutex::new(None);
+    pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> =
+        std::sync::Mutex::new(None);
 
     /// The work [`WHILE_MAKING`] runs.
     pub(crate) type Work = Box<dyn FnOnce() + Send>;
@@ -1139,13 +1166,44 @@ pub(crate) mod tests {
     fn contiguous_copy_crossing_heap_boundary_mirrors_both_heaps() {
         let mut memory = vec![0u8; 8 * 16];
         let base = memory.as_mut_ptr() as u64;
-        let desc = HeapDesc { kind: SAMPLERS, count: 4, flags: SHADER_VISIBLE, nodes: 1 };
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 4,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
         let mut first = std::ptr::null();
         let mut second = std::ptr::null();
-        assert_eq!(create(desc, Placement { address: base, size: 4 * 16 }, &mut first), S_OK);
-        assert_eq!(create(desc, Placement { address: base + 4 * 16, size: 4 * 16 }, &mut second), S_OK);
+        assert_eq!(
+            create(
+                desc,
+                Placement {
+                    address: base,
+                    size: 4 * 16
+                },
+                &mut first
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create(
+                desc,
+                Placement {
+                    address: base + 4 * 16,
+                    size: 4 * 16
+                },
+                &mut second
+            ),
+            S_OK
+        );
         let source = [0u8; 2 * 16];
-        copy_simple(std::ptr::null(), 2, base + 3 * 16, source.as_ptr() as u64, SAMPLERS);
+        copy_simple(
+            std::ptr::null(),
+            2,
+            base + 3 * 16,
+            source.as_ptr() as u64,
+            SAMPLERS,
+        );
         let a = heap(first).pending.lock().unwrap().clone();
         let b = heap(second).pending.lock().unwrap().clone();
         assert_eq!(a, [3]);
@@ -1167,12 +1225,26 @@ pub(crate) mod tests {
             nodes: 0,
         };
         let mut h = null;
-        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut h), S_OK);
+        assert_eq!(
+            create(
+                desc,
+                Placement {
+                    address: 0,
+                    size: 0
+                },
+                &mut h
+            ),
+            S_OK
+        );
         let dst = heap(h).start;
         let mut source = [[0u64; 2]; 261];
         let src = source.as_mut_ptr() as u64;
         for i in [0, 255, 256, 260] {
-            create_sampler(null, &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], src + i * 16);
+            create_sampler(
+                null,
+                &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0],
+                src + i * 16,
+            );
         }
         copy_simple(null, 261, dst, src, SAMPLERS);
         assert_eq!(heap(h).pending.lock().unwrap().len(), 261);
@@ -1206,9 +1278,15 @@ pub(crate) mod tests {
         }
         let base = memory.as_mut_ptr() as u64;
         copy_simple(std::ptr::null(), 4, base + 32, base, VIEWS_KIND);
-        assert_eq!((0..5).map(|i| memory[i * 32]).collect::<Vec<_>>(), [1, 1, 2, 3, 4]);
+        assert_eq!(
+            (0..5).map(|i| memory[i * 32]).collect::<Vec<_>>(),
+            [1, 1, 2, 3, 4]
+        );
         copy_simple(std::ptr::null(), 4, base, base + 32, VIEWS_KIND);
-        assert_eq!((0..5).map(|i| memory[i * 32]).collect::<Vec<_>>(), [1, 2, 3, 4, 4]);
+        assert_eq!(
+            (0..5).map(|i| memory[i * 32]).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 4]
+        );
         let before = memory.clone();
         copy_simple(std::ptr::null(), 5, base, base, VIEWS_KIND);
         assert_eq!(memory, before);
@@ -1236,7 +1314,11 @@ pub(crate) mod tests {
             // Our record, written where no heap sees it, then copied in.
             let mut elsewhere = [0u64; 2];
             let at = elsewhere.as_mut_ptr() as u64;
-            create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], at);
+            create_sampler(
+                std::ptr::null(),
+                &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0],
+                at,
+            );
             let slot = memory as u64 + 5 * 16;
             // SAFETY: 16 bytes of each, ours; the heap's page is guarded
             // (our handler opens it).
@@ -1262,7 +1344,10 @@ pub(crate) mod tests {
             nodes: 1,
         };
         let mut h = std::ptr::null();
-        let placement = Placement { address, size: 64 * 32 };
+        let placement = Placement {
+            address,
+            size: 64 * 32,
+        };
         assert_eq!(create(desc, placement, &mut h), S_OK);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), address);
@@ -1279,11 +1364,19 @@ pub(crate) mod tests {
             // Reuse the address without relying on the allocator to give it
             // to another test. The descriptor write must reach the new heap.
             assert_eq!(create(desc, placement, &mut h), S_OK);
-            create_srv(std::ptr::null(), std::ptr::null(), std::ptr::null(), address);
+            create_srv(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                address,
+            );
             let reused = heap(h);
             let queued = reused.pending.lock().unwrap().as_slice() == [0];
             release(h);
-            assert!(queued, "the descriptor write reached the heap at the reused address");
+            assert!(
+                queued,
+                "the descriptor write reached the heap at the reused address"
+            );
         }
     }
 }

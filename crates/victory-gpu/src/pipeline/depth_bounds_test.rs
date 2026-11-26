@@ -27,7 +27,10 @@ fn depth_bounds_flag_changes_the_stream_state() {
     let disabled = g.describe();
     depth.1.DepthBoundsTestEnable = true.into();
     read(&mut g, &depth);
-    assert!(g.describe() != disabled, "enabled bounds must have a different pipeline key");
+    assert!(
+        g.describe() != disabled,
+        "enabled bounds must have a different pipeline key"
+    );
     depth.1.DepthBoundsTestEnable = false.into();
     read(&mut g, &depth);
     assert_eq!(g.describe(), disabled);
@@ -41,9 +44,19 @@ fn fullscreen_vertex_shader() -> Arc<Shader> {
     // SAFETY: the arguments are live and code is the output pointer.
     unsafe {
         D3DCompile(
-            source.as_ptr().cast(), source.len(), PCSTR::null(), None, None,
-            s!("main"), s!("vs_5_1"), 0, 0, &mut code, None,
-        ).unwrap();
+            source.as_ptr().cast(),
+            source.len(),
+            PCSTR::null(),
+            None,
+            None,
+            s!("main"),
+            s!("vs_5_1"),
+            0,
+            0,
+            &mut code,
+            None,
+        )
+        .unwrap();
     }
     let code = code.unwrap();
     // SAFETY: the blob owns these bytes.
@@ -53,27 +66,33 @@ fn fullscreen_vertex_shader() -> Arc<Shader> {
     host_shader("vertex", victory_shader::HwStage::Vs, bytes)
 }
 
-fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[u8]) -> Arc<Shader> {
+fn host_shader(
+    stage: &'static str,
+    hw_stage: victory_shader::HwStage,
+    bytes: &[u8],
+) -> Arc<Shader> {
     let shader = shader(stage, bytes);
-    shader.translated.get_or_init(|| Some(Translated {
-        host: victory_shader::emit::HostShader {
-            stage: hw_stage,
-            dxil: bytes.to_vec(),
-            user_data: Vec::new(),
-            samplers: Vec::new(),
-            static_samplers: Vec::new(),
-            root_cbvs: Vec::new(),
-            root_srvs: Vec::new(),
-            root_uavs: Vec::new(),
-            memory: false,
-            memory_writes: false,
-            view_addresses: false,
-            heap: false,
-            heap_writes: false,
-            view_marks: false,
-        },
-        used: Vec::new(),
-    }));
+    shader.translated.get_or_init(|| {
+        Some(Translated {
+            host: victory_shader::emit::HostShader {
+                stage: hw_stage,
+                dxil: bytes.to_vec(),
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                memory: false,
+                memory_writes: false,
+                view_addresses: false,
+                heap: false,
+                heap_writes: false,
+                view_marks: false,
+            },
+            used: Vec::new(),
+        })
+    });
     shader
 }
 
@@ -102,7 +121,11 @@ fn depth_bounds_control_a_title_draw() {
     render_with_depth_bounds(host, fullscreen_vertex_shader(), None);
 }
 
-fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: Option<Arc<Shader>>) {
+fn render_with_depth_bounds(
+    host: &crate::host::Host,
+    shader: Arc<Shader>,
+    ps: Option<Arc<Shader>>,
+) {
     let device = &host.device;
     // SAFETY: plain adapter queries on a live device.
     let adapter = unsafe {
@@ -113,7 +136,11 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     let name = String::from_utf16_lossy(&adapter.Description);
     let supported = host.depth_bounds_supported;
     let mesh = shader.stage == "mesh";
-    eprintln!("{} depth bounds on {}: {supported}", shader.stage, name.trim_end_matches('\0'));
+    eprintln!(
+        "{} depth bounds on {}: {supported}",
+        shader.stage,
+        name.trim_end_matches('\0')
+    );
 
     #[repr(C)]
     struct Stream {
@@ -127,26 +154,44 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     }
     let stream = Stream {
         shader_kind: if mesh { 24 } else { 1 },
-        shader: Bytecode { code: shader.container.as_ptr(), size: shader.container.len() },
+        shader: Bytecode {
+            code: shader.container.as_ptr(),
+            size: shader.container.len(),
+        },
         ps_kind: 2,
         ps: ps.as_ref().map_or(
-            Bytecode { code: std::ptr::null(), size: 0 },
-            |ps| Bytecode { code: ps.container.as_ptr(), size: ps.container.len() },
+            Bytecode {
+                code: std::ptr::null(),
+                size: 0,
+            },
+            |ps| Bytecode {
+                code: ps.container.as_ptr(),
+                size: ps.container.len(),
+            },
         ),
-        depth: Depth1(21, D3D12_DEPTH_STENCIL_DESC1 {
-            DepthEnable: true.into(),
-            DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
-            DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
-            DepthBoundsTestEnable: true.into(),
-            ..Default::default()
-        }),
+        depth: Depth1(
+            21,
+            D3D12_DEPTH_STENCIL_DESC1 {
+                DepthEnable: true.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+                DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                DepthBoundsTestEnable: true.into(),
+                ..Default::default()
+            },
+        ),
         topology: [14, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 as u32],
         dsv: [16, DXGI_FORMAT_D32_FLOAT.0 as u32],
     };
-    let desc = StreamDesc { size: size_of_val(&stream), stream: (&raw const stream).cast() };
+    let desc = StreamDesc {
+        size: size_of_val(&stream),
+        stream: (&raw const stream).cast(),
+    };
     let null = std::ptr::null();
     let mut pso = null;
-    assert_eq!(create_stream(null, &desc, &PIPELINE_IIDS[0], &mut pso), S_OK);
+    assert_eq!(
+        create_stream(null, &desc, &PIPELINE_IIDS[0], &mut pso),
+        S_OK
+    );
     assert_eq!(made(pso).mesh, mesh);
 
     let mut allocator = null;
@@ -157,20 +202,39 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
         S_OK
     );
     assert_eq!(
-        crate::list::create_list(null, 0, 0, allocator, null, &iid(ID3D12GraphicsCommandList::IID), &mut list),
+        crate::list::create_list(
+            null,
+            0,
+            0,
+            allocator,
+            null,
+            &iid(ID3D12GraphicsCommandList::IID),
+            &mut list
+        ),
         S_OK
     );
     let commands = crate::list::host_list(list).unwrap();
     let l = &commands.list;
     let newer = crate::list::has_newer_table(list);
-    let bounds = slot::<extern "system" fn(This, f32, f32)>(list, if newer { 0x230 } else { 0x220 });
+    let bounds =
+        slot::<extern "system" fn(This, f32, f32)>(list, if newer { 0x230 } else { 0x220 });
     let scissors = slot::<extern "system" fn(This, u32, *const RECT)>(list, 0xb0);
     let draw = slot::<extern "system" fn(This, u32, u32, u32, u32)>(list, 0x60);
     let draw_pixel = |x| {
-        scissors(list, 1, &RECT { left: x, top: 0, right: x + 1, bottom: 1 });
+        scissors(
+            list,
+            1,
+            &RECT {
+                left: x,
+                top: 0,
+                right: x + 1,
+                bottom: 1,
+            },
+        );
         if mesh {
             let dispatch = slot::<extern "system" fn(This, u32, u32, u32)>(
-                list, if newer { 0x408 } else { 0x3f8 },
+                list,
+                if newer { 0x408 } else { 0x3f8 },
             );
             dispatch(list, 1, 1, 1);
         } else {
@@ -184,7 +248,10 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
         DepthOrArraySize: 1,
         MipLevels: 1,
         Format: DXGI_FORMAT_D32_FLOAT,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
         ..Default::default()
     };
@@ -199,17 +266,36 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
         ..Default::default()
     };
     let resource = |desc: &D3D12_RESOURCE_DESC, kind, state| {
-        let heap = D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: kind,
+            ..Default::default()
+        };
         let mut result: Option<ID3D12Resource> = None;
         // SAFETY: valid resource descriptions and output pointer.
         unsafe {
-            device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, desc, state, None, &mut result)
+            device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    desc,
+                    state,
+                    None,
+                    &mut result,
+                )
                 .unwrap();
         }
         result.unwrap()
     };
-    let depth = resource(&depth_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-    let readback = resource(&buffer_desc, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    let depth = resource(
+        &depth_desc,
+        D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+    );
+    let readback = resource(
+        &buffer_desc,
+        D3D12_HEAP_TYPE_READBACK,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
     let dsv = host.dsv(&depth, None);
     let bind = || {
         // SAFETY: an open list and the live depth buffer's descriptor.
@@ -219,11 +305,21 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
             slot::<extern "system" fn(This, u32)>(list, 0xa0)(list, 4); // triangle list
         }
         slot::<extern "system" fn(This, u32, *const D3D12_VIEWPORT)>(list, 0xa8)(
-            list, 1, &D3D12_VIEWPORT { Width: 4.0, Height: 1.0, MaxDepth: 1.0, ..Default::default() },
+            list,
+            1,
+            &D3D12_VIEWPORT {
+                Width: 4.0,
+                Height: 1.0,
+                MaxDepth: 1.0,
+                ..Default::default()
+            },
         );
     };
     let submit = || {
-        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
         host.execute(&[commands]);
     };
     // SAFETY: the list is open; the depth buffer is in DEPTH_WRITE.
@@ -237,7 +333,10 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     bounds(list, 0.0, 0.25);
     submit();
 
-    assert_eq!(slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(list, allocator, null), S_OK);
+    assert_eq!(
+        slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(list, allocator, null),
+        S_OK
+    );
     bind();
     draw_pixel(3); // Reset restores the default bounds.
     let mut from = D3D12_TEXTURE_COPY_LOCATION {
@@ -264,22 +363,38 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     unsafe {
         from.pResource = std::mem::transmute_copy(&depth);
         to.pResource = std::mem::transmute_copy(&readback);
-        l.ResourceBarrier(&[crate::host::transition(&depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        l.ResourceBarrier(&[crate::host::transition(
+            &depth,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
         l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
     }
     submit();
     let mut mapped = std::ptr::null_mut();
     // SAFETY: the GPU copy finished and the readback buffer holds at least four floats.
     let actual = unsafe {
-        readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut mapped)).unwrap();
+        readback
+            .Map(
+                0,
+                Some(&D3D12_RANGE { Begin: 0, End: 16 }),
+                Some(&mut mapped),
+            )
+            .unwrap();
         let values = mapped.cast::<[f32; 4]>().read();
         readback.Unmap(0, Some(&D3D12_RANGE::default()));
         values
     };
     eprintln!("depth readback (fresh, excluded, included, reset): {actual:?}");
-    assert_eq!(actual, [0.25, if supported { 0.5 } else { 0.25 }, 0.25, 0.25]);
+    assert_eq!(
+        actual,
+        [0.25, if supported { 0.5 } else { 0.25 }, 0.25, 0.25]
+    );
 
     for object in [list, allocator, pso] {
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(object, 0x10)(object), 0);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object),
+            0
+        );
     }
 }

@@ -60,7 +60,14 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
             let mut comps = Vec::new();
             for col in 0..e.cols {
                 let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), s.m.i32(k)];
-                comps.push(s.op(b, &format!("loadInput{suffix}"), Attr::ReadNone, ty, 4, &args));
+                comps.push(s.op(
+                    b,
+                    &format!("loadInput{suffix}"),
+                    Attr::ReadNone,
+                    ty,
+                    4,
+                    &args,
+                ));
             }
             values.push(comps);
         }
@@ -70,10 +77,16 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
     let position = elements
         .iter()
         .position(|e| e.kind == 3 && e.cols >= 2 && e.comp == 9)
-        .ok_or(ShaderError::Malformed("a rectangle list without a position"))?;
+        .ok_or(ShaderError::Malformed(
+            "a rectangle list without a position",
+        ))?;
     let side = |s: &mut Shader, i: usize, j: usize| {
         let mut sum = None;
-        for (&p, &q) in corners[i][position].iter().zip(&corners[j][position]).take(2) {
+        for (&p, &q) in corners[i][position]
+            .iter()
+            .zip(&corners[j][position])
+            .take(2)
+        {
             let d = s.m.bin(b, Bin::Sub, p, q);
             let sq = s.m.bin(b, Bin::Mul, d, d);
             sum = Some(match sum {
@@ -88,7 +101,10 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
         let [x, y] = others.map(|o| s.m.cmp(b, pred::OGT, d, o));
         s.m.bin(b, Bin::And, x, y)
     };
-    let (at0, at2) = (longest(&mut s, d12, [d20, d01]), longest(&mut s, d01, [d12, d20]));
+    let (at0, at2) = (
+        longest(&mut s, d12, [d20, d01]),
+        longest(&mut s, d01, [d12, d20]),
+    );
     // `x0` if the right angle is at v0, `x2` if at v2, else `x1`.
     let pick = |s: &mut Shader, [x0, x1, x2]: [V; 3]| {
         let x = s.m.select(b, at2, x2, x1);
@@ -125,7 +141,14 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
                 for col in 0..e.cols {
                     let v = corners[k][id][usize::from(col)];
                     let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), v];
-                    s.op(b, &format!("storeOutput{suffix}"), Attr::NoUnwind, s.t.void, 5, &args);
+                    s.op(
+                        b,
+                        &format!("storeOutput{suffix}"),
+                        Attr::NoUnwind,
+                        s.t.void,
+                        5,
+                        &args,
+                    );
                 }
             }
             let stream = [s.m.i8(0)];
@@ -153,7 +176,11 @@ mod rule_tests {
         assert_eq!(right_angle([tl, bl, br]), 1);
         assert_eq!(right_angle([tl, bl, tr]), 0);
         assert_eq!(right_angle([bl, tr, tl]), 2);
-        assert_eq!(right_angle([[0.0, 0.0], [3.0, 1.0], [1.0, 0.0]]), 2, "obtuse at v2");
+        assert_eq!(
+            right_angle([[0.0, 0.0], [3.0, 1.0], [1.0, 0.0]]),
+            2,
+            "obtuse at v2"
+        );
         assert_eq!(right_angle([tl, tl, tl]), 1, "a point");
         assert_eq!(right_angle([tl, [f32::NAN, 0.0], br]), 1);
     }
@@ -188,13 +215,22 @@ mod tests {
         let b = s.entry;
         let (inputs, outputs) = if pixel {
             (
-                vec![element("SV_Position", 3, 4, 0, 4), element("TEXCOORD", 0, 2, 1, 2)],
+                vec![
+                    element("SV_Position", 3, 4, 0, 4),
+                    element("TEXCOORD", 0, 2, 1, 2),
+                ],
                 vec![element("SV_Target", 16, 0, 0, 4)],
             )
         } else {
             (
-                vec![element("POSITION", 0, 0, 0, 4), element("TEXCOORD", 0, 0, 1, 2)],
-                vec![element("SV_Position", 3, 0, 0, 4), element("TEXCOORD", 0, 0, 1, 2)],
+                vec![
+                    element("POSITION", 0, 0, 0, 4),
+                    element("TEXCOORD", 0, 0, 1, 2),
+                ],
+                vec![
+                    element("SV_Position", 3, 0, 0, 4),
+                    element("TEXCOORD", 0, 0, 1, 2),
+                ],
             )
         };
         let load = |s: &mut Shader, id: u32, col: u8| {
@@ -234,16 +270,26 @@ mod tests {
     fn rectangles_get_their_fourth_corner() {
         let (vs, ps) = (shader(false), shader(true));
         let gs = super::rectangle_gs(&vs).unwrap();
-        if let Ok(mut v) =
-            super::super::validator::Validator::load(super::super::validator::Validator::default_path().as_deref())
-        {
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
             for c in [&vs, &gs, &ps] {
                 v.validate(&mut c.clone()).unwrap();
             }
         }
         let corner = |x: f32, y: f32| [x, y, 0.5, 1.0, x, y];
-        let (tl, bl, br, tr) = (corner(-0.5, 0.5), corner(-0.5, -0.5), corner(0.5, -0.5), corner(0.5, 0.5));
-        let orders = [[tl, bl, br], [tl, bl, tr], [bl, tr, tl], [tl, corner(0.0, 0.0), br]];
+        let (tl, bl, br, tr) = (
+            corner(-0.5, 0.5),
+            corner(-0.5, -0.5),
+            corner(0.5, -0.5),
+            corner(0.5, 0.5),
+        );
+        let orders = [
+            [tl, bl, br],
+            [tl, bl, tr],
+            [bl, tr, tl],
+            [tl, corner(0.0, 0.0), br],
+        ];
         for warp in [false, true] {
             let Ok(host) = Host::new(warp) else { continue };
             let root = host.root_signature_for(&[]).unwrap();
@@ -266,7 +312,10 @@ mod tests {
                     let inside = n < 3 && u.abs() < 0.5 && v.abs() < 0.5;
                     let want = if inside { [u, v, 1.0, 1.0] } else { [0.0; 4] };
                     let near = t.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4);
-                    assert!(near, "warp {warp} order {n} pixel ({x}, {y}): {t:?}, want {want:?}");
+                    assert!(
+                        near,
+                        "warp {warp} order {n} pixel ({x}, {y}): {t:?}, want {want:?}"
+                    );
                 }
             }
         }

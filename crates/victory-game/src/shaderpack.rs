@@ -186,7 +186,11 @@ impl<'a> Pack<'a> {
         if !file.starts_with(MAGIC) {
             return Err("not a shader pack");
         }
-        let n = |o| u32_at(file, o).map(|v| v as usize).ok_or("truncated header");
+        let n = |o| {
+            u32_at(file, o)
+                .map(|v| v as usize)
+                .ok_or("truncated header")
+        };
         let (ng, nc, nb, np, blob_bytes, prog_bytes) =
             (n(0x50)?, n(0x54)?, n(0x58)?, n(0x5c)?, n(0x60)?, n(0x64)?);
         let mut at = HEADER;
@@ -307,12 +311,17 @@ pub fn find(file: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
     let mut chunk = vec![0u8; 0x20000];
     // One zlib stream at `at`: its output and the bytes it took.
     let mut inflate = |at: usize| {
-        use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
         use miniz_oxide::inflate::TINFLStatus;
+        use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
         let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
             | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
-        let (status, used, out) =
-            decompress(&mut DecompressorOxide::new(), file.get(at..)?, &mut chunk, 0, flags);
+        let (status, used, out) = decompress(
+            &mut DecompressorOxide::new(),
+            file.get(at..)?,
+            &mut chunk,
+            0,
+            flags,
+        );
         (status == TINFLStatus::Done).then(|| (chunk[..out].to_vec(), used))
     };
     let zlib = |at: usize| {
@@ -321,7 +330,11 @@ pub fn find(file: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
     let start = (0..file.len().saturating_sub(1))
         .step_by(16)
         .filter(|&at| zlib(at))
-        .find_map(|at| inflate(at).filter(|(out, _)| out.starts_with(MAGIC)).map(|o| (at, o)))?;
+        .find_map(|at| {
+            inflate(at)
+                .filter(|(out, _)| out.starts_with(MAGIC))
+                .map(|o| (at, o))
+        })?;
     let (mut at, (mut pack, used)) = start;
     at += used;
     let size = |p: &[u8]| -> Option<usize> {
@@ -369,7 +382,10 @@ mod tests {
         m[0x28] = 1;
         let mut layout = Vec::new();
         le(&mut layout, &[2]);
-        for (name, words) in [("POSITION", [0, 6, 0, 0, 0, 0]), ("COLOR", [1, 28, 1, 12, 1, 1])] {
+        for (name, words) in [
+            ("POSITION", [0, 6, 0, 0, 0, 0]),
+            ("COLOR", [1, 28, 1, 12, 1, 1]),
+        ] {
             le(&mut layout, &[name.len() as u32 + 1]);
             layout.extend_from_slice(name.as_bytes());
             layout.push(0);
@@ -389,13 +405,29 @@ mod tests {
         le(&mut code0, &nop(0x5678));
         le(&mut code0, &[0xBF81_0000]);
         let programs = [code0, vec![1; 8], vec![2; 12]];
-        let blobs = [b"packet".to_vec(), metadata(), b"ps meta".to_vec(), vec![3; 28], vec![4; 20]];
+        let blobs = [
+            b"packet".to_vec(),
+            metadata(),
+            b"ps meta".to_vec(),
+            vec![3; 28],
+            vec![4; 20],
+        ];
         let mut out = MAGIC.to_vec();
         out.extend(b"0x00000001".iter().chain(&[0; 22]));
         out.extend(b"1.2.3".iter().chain(&[0; 31]));
         out.extend(0xABCD_u64.to_le_bytes());
         let blob_bytes: usize = blobs.iter().map(Vec::len).sum();
-        le(&mut out, &[1, 1, blobs.len() as u32, programs.len() as u32, blob_bytes as u32, 0x300]);
+        le(
+            &mut out,
+            &[
+                1,
+                1,
+                blobs.len() as u32,
+                programs.len() as u32,
+                blob_bytes as u32,
+                0x300,
+            ],
+        );
         out.resize(HEADER, 0);
         // Graphics: key, packet 0, metadata 1, five hashes, PS and VS.
         out.extend(0x1111_u64.to_le_bytes());
@@ -440,12 +472,20 @@ mod tests {
         assert_eq!(g.len(), 1);
         let g = g[0];
         assert_eq!(g.key, 0x1111);
-        let hashes = [g.shader_hash, g.pipeline_hash, g.depth_stencil_hash, g.rasterizer_hash];
+        let hashes = [
+            g.shader_hash,
+            g.pipeline_hash,
+            g.depth_stencil_hash,
+            g.rasterizer_hash,
+        ];
         assert_eq!((hashes, g.blend_hash), ([1, 2, 3, 4], 5));
         assert_eq!(g.packet, b"packet");
         let ps = g.stages[0].unwrap();
         assert_eq!(ps.metadata, Some(&b"ps meta"[..]));
-        assert_eq!(program_id(ps.program).unwrap()[..4], [0x34, 0x12, 0x80, 0xD5]);
+        assert_eq!(
+            program_id(ps.program).unwrap()[..4],
+            [0x34, 0x12, 0x80, 0xD5]
+        );
         let vs = g.stages[1].unwrap();
         assert_eq!((vs.program, vs.metadata), (&[1; 8][..], None));
         assert!(g.stages[2..].iter().all(Option::is_none));
@@ -458,14 +498,20 @@ mod tests {
         assert_eq!(layout.len(), 2);
         assert_eq!((layout[0].semantic, layout[0].format), ("POSITION", 6));
         let color = &layout[1];
-        assert_eq!((color.semantic, color.index, color.slot, color.offset), ("COLOR", 1, 1, 12));
+        assert_eq!(
+            (color.semantic, color.index, color.slot, color.offset),
+            ("COLOR", 1, 1, 12)
+        );
         assert_eq!((color.class, color.step_rate), (1, 1));
 
         let c: Vec<_> = pack.compute().collect();
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].shader_hash, 0x2222);
         assert_eq!((c[0].packet.len(), c[0].metadata.len()), (28, 20));
-        assert_eq!((c[0].stage.program, c[0].stage.metadata), (&[2; 12][..], None));
+        assert_eq!(
+            (c[0].stage.program, c[0].stage.metadata),
+            (&[2; 12][..], None)
+        );
     }
 
     #[test]

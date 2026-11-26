@@ -22,7 +22,8 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// first, whose number depends on how fast the title loaded).
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| numbers("VICTORY_CAPTURE_FRAMES")).contains(&n)
+    LIST.get_or_init(|| numbers("VICTORY_CAPTURE_FRAMES"))
+        .contains(&n)
         || WORLD
             .get()
             .is_some_and(|&w| world_offsets().iter().any(|&k| w + k == n))
@@ -51,7 +52,11 @@ pub(crate) fn presented(n: u64) {
     let draws = drawn - LAST.swap(drawn, Relaxed).min(drawn);
     if draws >= 500 && WORLD.get().is_none() && !world_offsets().is_empty() {
         let _ = WORLD.set(n);
-        tracing::info!(frame = n, draws, "the world's first frame (VICTORY_CAPTURE_WORLD counts from it)");
+        tracing::info!(
+            frame = n,
+            draws,
+            "the world's first frame (VICTORY_CAPTURE_WORLD counts from it)"
+        );
     }
 }
 
@@ -280,7 +285,10 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
         let mut writers = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
         let writers = writers.get_or_insert_with(|| {
             let list = std::env::var("VICTORY_DUMP_WRITERS").unwrap_or_default();
-            list.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect()
+            list.split(',')
+                .map(|h| h.trim().to_owned())
+                .filter(|h| !h.is_empty())
+                .collect()
         });
         if by.is_empty() || !writers.iter().any(|h| by.contains(h.as_str())) {
             return;
@@ -328,7 +336,9 @@ pub(crate) fn dump_targets(frame: u64) {
             continue;
         }
         let dwords = |b: &[u8]| -> Vec<u32> {
-            b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap_or_default())).collect()
+            b.chunks(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap_or_default()))
+                .collect()
         };
         let (old, new) = (dwords(before), dwords(&after));
         let changed = old.iter().zip(&new).filter(|(a, b)| a != b).count();
@@ -343,7 +353,9 @@ pub(crate) fn dump_targets(frame: u64) {
             "a buffer the named pipeline writes, at the present"
         );
     }
-    let Some(host) = crate::host::host() else { return };
+    let Some(host) = crate::host::host() else {
+        return;
+    };
     for (i, (resource, copy, by)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
@@ -363,7 +375,9 @@ pub(crate) fn dump_targets(frame: u64) {
 /// then, to follow a frame pass by pass).
 pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
     use std::sync::atomic::Ordering::Relaxed;
-    let Some(host) = crate::host::host() else { return };
+    let Some(host) = crate::host::host() else {
+        return;
+    };
     let frame = crate::queue::presented() + 1;
     peek(&format!("frame-{frame}-s{sub:04}"));
     for (i, (resource, by)) in targets.iter().enumerate() {
@@ -378,15 +392,35 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
         }
         let state = copy.state.load(Relaxed);
         let target = (i, *resource as crate::object::This, by.as_str());
-        dump_one(host, texture, state, &format!("frame-{frame}-s{sub:04}"), target, &d);
+        dump_one(
+            host,
+            texture,
+            state,
+            &format!("frame-{frame}-s{sub:04}"),
+            target,
+            &d,
+        );
         // A depth texture's writable twin (`crate::twin`): what unordered
         // views wrote, which reaches the depth texture at its next use.
-        for (p, plane) in copy.twin.get().and_then(Option::as_ref).iter().flat_map(|t| t.planes.iter().enumerate()) {
+        for (p, plane) in copy
+            .twin
+            .get()
+            .and_then(Option::as_ref)
+            .iter()
+            .flat_map(|t| t.planes.iter().enumerate())
+        {
             // SAFETY: a live resource.
             let pd = unsafe { plane.texture.GetDesc() };
             let by = format!("{by}-twin{p}");
             let target = (i, *resource as crate::object::This, by.as_str());
-            dump_one(host, &plane.texture, plane.state.load(Relaxed), &format!("frame-{frame}-s{sub:04}"), target, &pd);
+            dump_one(
+                host,
+                &plane.texture,
+                plane.state.load(Relaxed),
+                &format!("frame-{frame}-s{sub:04}"),
+                target,
+                &pd,
+            );
         }
     }
 }
@@ -441,7 +475,9 @@ pub(crate) fn read_indirect(
     unsafe impl Send for Readback {}
     // SAFETY: as above.
     unsafe impl Sync for Readback {}
-    let Some(host) = crate::host::host() else { return };
+    let Some(host) = crate::host::host() else {
+        return;
+    };
     let len = u64::from(stride) * u64::from(max.max(1));
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -449,21 +485,37 @@ pub(crate) fn read_indirect(
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         ..Default::default()
     };
-    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_READBACK,
+        ..Default::default()
+    };
     let mut buffer: Option<ID3D12Resource> = None;
     let l = &list.list;
     use crate::host::transition;
-    let (arg_state, copy) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    let (arg_state, copy) = (
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+    );
     // SAFETY: plain creation; an open list and live buffers in the states
     // named, put back after the copies.
     unsafe {
         if host
             .device
-            .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer)
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
             .is_err()
         {
             return;
@@ -540,7 +592,9 @@ fn dump_one(
     };
     list.close();
     host.execute(&[&list]);
-    let Some((buffer, footprint)) = read else { return };
+    let Some((buffer, footprint)) = read else {
+        return;
+    };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished; the mapping spans the footprint's rows.
@@ -560,12 +614,27 @@ fn dump_one(
                     format!("{w:#x}={}", f32::from_bits(w))
                 })
                 .collect();
-            tracing::info!(?resource, format = f.Format.0, "tiny target {prefix}-{i:02}: {}", words.join(" "));
+            tracing::info!(
+                ?resource,
+                format = f.Format.0,
+                "tiny target {prefix}-{i:02}: {}",
+                words.join(" ")
+            );
         }
         // A 24-bit depth plane copies out as 32-bit words (`R32_TYPELESS`):
         // decode it as depth, not as floats (all denormals, shown black).
-        let format = if matches!(d.Format.0, 44..=47) { d.Format.0 } else { f.Format.0 };
-        if let Some(rgba) = to_rgba(format as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        let format = if matches!(d.Format.0, 44..=47) {
+            d.Format.0
+        } else {
+            f.Format.0
+        };
+        if let Some(rgba) = to_rgba(
+            format as u32,
+            f.Width as usize,
+            f.Height as usize,
+            pitch,
+            rows,
+        ) {
             let mut name = format!(
                 "{prefix}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
@@ -589,7 +658,11 @@ fn dump_one(
 }
 
 fn half(h: u16) -> f32 {
-    let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
+    let (sign, exp, man) = (
+        (h >> 15) as u32,
+        ((h >> 10) & 0x1f) as i32,
+        (h & 0x3ff) as f32,
+    );
     let v = match exp {
         0 => man * 2f32.powi(-24),
         31 if man != 0.0 => f32::NAN,
@@ -618,7 +691,8 @@ fn small_float(bits: u32, man: u32) -> f32 {
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
-    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
+    let u32_at =
+        |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
     if matches!(format, 42 | 43) {
         let words = (0..h)
             .flat_map(|y| (0..w).map(move |x| (x, y)))
@@ -643,7 +717,14 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
                     out.extend([p[0], p[1], p[2], 255]);
                 }
             }
-            tracing::info!(format, ?low, ?high, ?zero, texels = w * h, "target values (8-bit, RGBA)");
+            tracing::info!(
+                format,
+                ?low,
+                ?high,
+                ?zero,
+                texels = w * h,
+                "target values (8-bit, RGBA)"
+            );
             return Some(out);
         }
         // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
@@ -656,23 +737,62 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             }
             return Some(out);
         }
-        23..=25 | 89 => (4, Box::new(move |b| {
-            let v = u32_at(b, 0);
-            [(v & 0x3ff) as f32, (v >> 10 & 0x3ff) as f32, (v >> 20 & 0x3ff) as f32]
-        })),
-        26 => (4, Box::new(move |b| {
-            let v = u32_at(b, 0);
-            [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
-        })),
-        9..=10 => (8, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))])),
-        11..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),
-        33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0])),
-        1..=2 => (16, Box::new(move |b| {
-            [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
-        })),
-        15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
-        35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
-        48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        23..=25 | 89 => (
+            4,
+            Box::new(move |b| {
+                let v = u32_at(b, 0);
+                [
+                    (v & 0x3ff) as f32,
+                    (v >> 10 & 0x3ff) as f32,
+                    (v >> 20 & 0x3ff) as f32,
+                ]
+            }),
+        ),
+        26 => (
+            4,
+            Box::new(move |b| {
+                let v = u32_at(b, 0);
+                [
+                    small_float(v & 0x7ff, 6),
+                    small_float(v >> 11 & 0x7ff, 6),
+                    small_float(v >> 22, 5),
+                ]
+            }),
+        ),
+        9..=10 => (
+            8,
+            Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))]),
+        ),
+        11..=14 => (
+            8,
+            Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i)))),
+        ),
+        33..=34 => (
+            4,
+            Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0]),
+        ),
+        1..=2 => (
+            16,
+            Box::new(move |b| [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))),
+        ),
+        15..=16 => (
+            8,
+            Box::new(move |b| {
+                [
+                    f32::from_bits(u32_at(b, 0)),
+                    f32::from_bits(u32_at(b, 1)),
+                    0.0,
+                ]
+            }),
+        ),
+        35..=38 => (
+            4,
+            Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0]),
+        ),
+        48..=52 => (
+            2,
+            Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0]),
+        ),
         // Single channels (and depth planes): shown as grey.
         39..=41 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
@@ -714,7 +834,16 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let not_finite = values.iter().flatten().filter(|v| !v.is_finite()).count();
     let high = if grey || p99 == 0.0 { max } else { p99 };
     let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high = max, p50, p99, nonzero, not_finite, "target values");
+    tracing::info!(
+        format,
+        low,
+        high = max,
+        p50,
+        p99,
+        nonzero,
+        not_finite,
+        "target values"
+    );
     for v in values {
         let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
         out.extend([c[0], c[1], c[2], 255]);
@@ -725,12 +854,21 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
 fn r32_integer_to_rgba(format: u32, words: impl Iterator<Item = u32>) -> Vec<u8> {
     let signed = format == 43;
     let mut values: Vec<i64> = words
-        .map(|word| if signed { i64::from(word as i32) } else { i64::from(word) })
+        .map(|word| {
+            if signed {
+                i64::from(word as i32)
+            } else {
+                i64::from(word)
+            }
+        })
         .collect();
     let first = values.first().copied().unwrap_or(0);
-    let (low, high) = values.iter().copied().fold((first, first), |(low, high), value| {
-        (low.min(value), high.max(value))
-    });
+    let (low, high) = values
+        .iter()
+        .copied()
+        .fold((first, first), |(low, high), value| {
+            (low.min(value), high.max(value))
+        });
     // The full 32-bit span scaled by 255 fits in i64, without float rounding.
     let range = (high - low).max(1);
     let flat_nonzero = high == low && low != 0;
@@ -758,7 +896,16 @@ fn r32_integer_to_rgba(format: u32, words: impl Iterator<Item = u32>) -> Vec<u8>
         *values.select_nth_unstable(k).1
     };
     let (p50, p99) = (at(0.5), at(0.99));
-    tracing::info!(format, low, high, p50, p99, nonzero, not_finite = 0, "target values");
+    tracing::info!(
+        format,
+        low,
+        high,
+        p50,
+        p99,
+        nonzero,
+        not_finite = 0,
+        "target values"
+    );
     out
 }
 
@@ -923,7 +1070,10 @@ mod tests {
             assert!(small_float(special | (1 << (mantissa_bits - 1)), mantissa_bits).is_nan());
             assert_eq!(small_float(special, mantissa_bits), f32::INFINITY);
             assert_eq!(small_float(0, mantissa_bits).to_bits(), 0.0f32.to_bits());
-            assert_eq!(small_float(1, mantissa_bits), 2f32.powi(-14 - mantissa_bits as i32));
+            assert_eq!(
+                small_float(1, mantissa_bits),
+                2f32.powi(-14 - mantissa_bits as i32)
+            );
             assert_eq!(small_float(15 << mantissa_bits, mantissa_bits), 1.0);
         }
     }
@@ -960,12 +1110,21 @@ mod tests {
     fn unorm16_and_xr_bias_targets_decode_as_their_formats() {
         // Red 0x8000 (a half-float -0), green 0x4000, blue 0.
         let unorm16 = [0x00, 0x80, 0x00, 0x40, 0, 0, 0xff, 0xff];
-        assert_eq!(super::to_rgba(11, 1, 1, 8, &unorm16), Some(vec![255, 127, 0, 255]));
+        assert_eq!(
+            super::to_rgba(11, 1, 1, 8, &unorm16),
+            Some(vec![255, 127, 0, 255])
+        );
         // Red 0x3ff, green 0x1ff, blue 0, alpha 3.
         let xr = (0x3ffu32 | 0x1ff << 10 | 3 << 30).to_le_bytes();
-        assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
+        assert_eq!(
+            super::to_rgba(89, 1, 1, 4, &xr),
+            Some(vec![255, 127, 0, 255])
+        );
         // B8G8R8A8 still swaps to RGBA.
-        assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+        assert_eq!(
+            super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]),
+            Some(vec![3, 2, 1, 255])
+        );
     }
 }
 
@@ -993,8 +1152,12 @@ mod r32_tests {
 
     #[test]
     fn r32_integer_captures_handle_full_range_and_row_pitch() {
-        let signed = [i32::MIN, -1, i32::MIN, 0, i32::MAX].map(i32::to_le_bytes).concat();
-        let expected = Some(vec![0, 0, 0, 255, 127, 127, 127, 255, 127, 127, 127, 255, 255, 255, 255, 255]);
+        let signed = [i32::MIN, -1, i32::MIN, 0, i32::MAX]
+            .map(i32::to_le_bytes)
+            .concat();
+        let expected = Some(vec![
+            0, 0, 0, 255, 127, 127, 127, 255, 127, 127, 127, 255, 255, 255, 255, 255,
+        ]);
 
         assert_eq!(super::to_rgba(43, 2, 2, 12, &signed), expected);
     }

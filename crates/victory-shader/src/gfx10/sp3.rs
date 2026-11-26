@@ -959,7 +959,10 @@ mod tests {
                     dwords: 2
                 })
             );
-            assert_eq!(one(&vop3_cmpx, false), "v_cmpx_lt_f32 exec_lo, abs(v1), 1.0");
+            assert_eq!(
+                one(&vop3_cmpx, false),
+                "v_cmpx_lt_f32 exec_lo, abs(v1), 1.0"
+            );
             assert_eq!(one(&vop3_cmpx, true), "v_cmpx_lt_f32 exec, abs(v1), 1.0");
         }
 

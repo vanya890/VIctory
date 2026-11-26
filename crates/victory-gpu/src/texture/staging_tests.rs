@@ -53,7 +53,11 @@ fn staging_tries_the_request_size_after_smaller_growth_and_recovers() {
 fn staging_keeps_full_sized_chunks_after_allocations_recover() {
     let mut chunks = Chunks::new();
     for _ in 0..CHUNKS_KEPT {
-        let (buffer, ..) = chunks.take(MIN_CHUNK, |bytes| (bytes == MIN_CHUNK).then_some((bytes, 0))).unwrap();
+        let (buffer, ..) = chunks
+            .take(MIN_CHUNK, |bytes| {
+                (bytes == MIN_CHUNK).then_some((bytes, 0))
+            })
+            .unwrap();
         assert_eq!(buffer, MIN_CHUNK);
     }
 
@@ -66,7 +70,9 @@ fn staging_keeps_full_sized_chunks_after_allocations_recover() {
     chunks.recycle();
     assert_eq!(chunks.all.len(), CHUNKS_KEPT);
     for _ in 0..CHUNKS_KEPT {
-        let (buffer, offset, _) = chunks.take(CHUNK, |_| panic!("a full-size chunk should be reused")).unwrap();
+        let (buffer, offset, _) = chunks
+            .take(CHUNK, |_| panic!("a full-size chunk should be reused"))
+            .unwrap();
         assert_eq!((buffer, offset), (CHUNK, 0));
     }
 }
@@ -110,17 +116,25 @@ fn staging_reuses_small_chunks_after_large_requests() {
 
     // Force a smaller chunk first, then a larger chunk in the same submission.
     chunks
-        .take(small, |bytes| (bytes == small).then_some((bytes as usize, 0x1000)))
+        .take(small, |bytes| {
+            (bytes == small).then_some((bytes as usize, 0x1000))
+        })
         .unwrap();
     chunks
-        .take(large, |bytes| (bytes == large).then_some((bytes as usize, 0x2000)))
+        .take(large, |bytes| {
+            (bytes == large).then_some((bytes as usize, 0x2000))
+        })
         .unwrap();
     chunks.recycle();
 
     // Reuse the large chunk first. The next, smaller request must then find
     // the retained small chunk instead of trying another driver allocation.
-    let (buffer, _, _) = chunks.take(large, |_| panic!("large chunk should be reused")).unwrap();
+    let (buffer, _, _) = chunks
+        .take(large, |_| panic!("large chunk should be reused"))
+        .unwrap();
     assert_eq!(buffer, large as usize);
-    let (buffer, _, _) = chunks.take(1 << 20, |_| panic!("small chunk should be reused")).unwrap();
+    let (buffer, _, _) = chunks
+        .take(1 << 20, |_| panic!("small chunk should be reused"))
+        .unwrap();
     assert_eq!(buffer, small as usize);
 }

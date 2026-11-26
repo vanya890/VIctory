@@ -235,12 +235,7 @@ fn window_limit() -> Option<(i32, i32)> {
     })
 }
 
-fn fit_with_limit(
-    area: &RECT,
-    width: i32,
-    height: i32,
-    limit: Option<(i32, i32)>,
-) -> (i32, i32) {
+fn fit_with_limit(area: &RECT, width: i32, height: i32, limit: Option<(i32, i32)>) -> (i32, i32) {
     let Some((max_width, max_height)) = limit else {
         return fit_into(area, width, height);
     };
@@ -689,8 +684,14 @@ mod tests {
             right: 2660,
             bottom: 1490,
         };
-        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((1920, 1080))), (1920, 1080));
-        assert_eq!(fit_with_limit(&area, 640, 480, Some((1920, 1080))), (640, 480));
+        assert_eq!(
+            fit_with_limit(&area, 3840, 2160, Some((1920, 1080))),
+            (1920, 1080)
+        );
+        assert_eq!(
+            fit_with_limit(&area, 640, 480, Some((1920, 1080))),
+            (640, 480)
+        );
         assert_eq!(fit_with_limit(&area, 3840, 2160, None), (2560, 1440));
     }
 
@@ -702,7 +703,10 @@ mod tests {
             right: 1920,
             bottom: 1040,
         };
-        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((2560, 1440))), (1848, 1040));
+        assert_eq!(
+            fit_with_limit(&area, 3840, 2160, Some((2560, 1440))),
+            (1848, 1040)
+        );
         assert_eq!(
             fit_with_limit(&area, wm::CW_USEDEFAULT, 0, Some((1920, 1080))),
             (wm::CW_USEDEFAULT, 0)
@@ -717,7 +721,10 @@ mod tests {
             right: 2560,
             bottom: 1440,
         };
-        assert_eq!(fit_with_limit(&area, 1600, 1200, Some((1920, 1080))), (1440, 1080));
+        assert_eq!(
+            fit_with_limit(&area, 1600, 1200, Some((1920, 1080))),
+            (1440, 1080)
+        );
     }
 
     #[test]

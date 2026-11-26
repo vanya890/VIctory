@@ -769,7 +769,10 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let (mut out, mut n) = ([0u8; 10], 0);
         let handle = file.as_raw_handle().cast();
-        assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
+        assert_ne!(
+            ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()),
+            0
+        );
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
