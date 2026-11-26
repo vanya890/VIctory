@@ -431,9 +431,9 @@ mod tests {
                 0
             }
         };
-        let mut ran = Vec::new();
+        let ran = RefCell::new(Vec::new());
         let mut run = |queue: usize, segments: Vec<&'static str>| {
-            ran.push((queue, segments));
+            ran.borrow_mut().push((queue, segments));
         };
         let mut signal = |_: usize, _: u64| {};
         let mut held = Held::default();
@@ -449,9 +449,7 @@ mod tests {
             run: &mut run,
             signal: &mut signal,
         });
-        drop(run);
-
-        assert_eq!(ran, vec![(2, vec!["after-fence"]), (1, vec!["queue-a"])]);
+        assert_eq!(*ran.borrow(), vec![(2, vec!["after-fence"]), (1, vec!["queue-a"])]);
         assert_eq!(reads.get(), 3, "the post-fence read must not reuse X=0");
         assert!(!pumped.blocked);
         assert!(held.is_empty());
