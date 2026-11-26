@@ -64,6 +64,10 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// Pinned host copies whose identity participates in the ensure cache.
+    target_copies: Vec<std::sync::Arc<crate::resource::HostTexture>>,
+    depth_copy: Option<std::sync::Arc<crate::resource::HostTexture>>,
+    ensured: Option<(Vec<usize>, usize, u64)>,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
     /// The title's primitive topology (the host's may differ).
@@ -94,6 +98,42 @@ pub(crate) struct State {
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
+}
+
+/// Whether the pinned host copies still match the last target-state ensure.
+/// This checks the existing vectors in place: a cache hit must not allocate.
+fn target_ensure_matches<T>(
+    ensured: &Option<(Vec<usize>, usize, u64)>,
+    targets: &[std::sync::Arc<T>],
+    depth: Option<&std::sync::Arc<T>>,
+    generation: u64,
+) -> bool {
+    let Some((old_targets, old_depth, old_generation)) = ensured else {
+        return false;
+    };
+    *old_generation == generation
+        && *old_depth == depth.map_or(0, |copy| std::sync::Arc::as_ptr(copy) as usize)
+        && old_targets.len() == targets.len()
+        && old_targets
+            .iter()
+            .zip(targets)
+            .all(|(old, copy)| *old == std::sync::Arc::as_ptr(copy) as usize)
+}
+
+/// The identity key retained after a target-state ensure.
+fn target_ensure_key<T>(
+    targets: &[std::sync::Arc<T>],
+    depth: Option<&std::sync::Arc<T>>,
+    generation: u64,
+) -> (Vec<usize>, usize, u64) {
+    (
+        targets
+            .iter()
+            .map(|copy| std::sync::Arc::as_ptr(copy) as usize)
+            .collect(),
+        depth.map_or(0, |copy| std::sync::Arc::as_ptr(copy) as usize),
+        generation,
+    )
 }
 
 /// A render target or depth view snapshotted at `OMSetRenderTargets` time,
@@ -328,6 +368,8 @@ impl State {
     /// own, made from the real states at its submission). Clears and copies
     /// are commands, recorded once in the segment they belong to.
     pub(crate) fn cut(&mut self, list: &HostList) {
+        // A fresh list may have the same generation but a different state map.
+        self.ensured = None;
         self.host_state_lost();
         self.fresh_tables.clear();
         self.root_slots.clear();
@@ -353,11 +395,11 @@ impl State {
                 .rtvs
                 .iter()
                 .filter_map(|&t| {
-                    crate::resource::host_resource(t.resource as This).map(|tex| (t, tex))
+                    crate::resource::host_copy(t.resource as This).map(|copy| (t, copy))
                 })
                 .collect();
             let resolved_depth = targets.dsv.and_then(|t| {
-                crate::resource::host_resource(t.resource as This).map(|tex| (t, tex))
+                crate::resource::host_copy(t.resource as This).map(|copy| (t, copy))
             });
             self.fixed.targets = Some(targets);
             self.bind_targets(list, resolved, resolved_depth);
@@ -443,7 +485,7 @@ impl State {
                 );
                 continue;
             };
-            let Some(texture) = crate::resource::host_resource(record.resource) else {
+            let Some(copy) = crate::resource::host_copy(record.resource) else {
                 continue;
             };
             let target = Target {
@@ -455,16 +497,16 @@ impl State {
                 target.desc.as_ref().map(|desc| desc.Format.0 as u32),
             );
             snapshot.push(target);
-            resolved.push((target, texture));
+            resolved.push((target, copy));
         }
         let depth = crate::descriptor::dsv_record(depth).and_then(|record| {
-            let texture = crate::resource::host_resource(record.resource)?;
+            let copy = crate::resource::host_copy(record.resource)?;
             Some((
                 Target {
                     resource: record.resource as usize,
                     desc: record.depth_desc(),
                 },
-                texture,
+                copy,
             ))
         });
         self.fixed.targets = Some(Targets {
@@ -477,26 +519,37 @@ impl State {
     fn bind_targets(
         &mut self,
         list: &HostList,
-        targets: impl IntoIterator<Item = (Target<D3D12_RENDER_TARGET_VIEW_DESC>, ID3D12Resource)>,
-        depth: Option<(Target<D3D12_DEPTH_STENCIL_VIEW_DESC>, ID3D12Resource)>,
+        targets: impl IntoIterator<
+            Item = (
+                Target<D3D12_RENDER_TARGET_VIEW_DESC>,
+                std::sync::Arc<crate::resource::HostTexture>,
+            ),
+        >,
+        depth: Option<(
+            Target<D3D12_DEPTH_STENCIL_VIEW_DESC>,
+            std::sync::Arc<crate::resource::HostTexture>,
+        )>,
     ) {
         let Some(host) = crate::host::host() else {
             return;
         };
         self.targets.clear();
+        self.target_copies.clear();
         let mut rtvs = Vec::new();
-        for (t, texture) in targets {
+        for (t, copy) in targets {
             self.targets.push(t.resource);
+            self.target_copies.push(copy.clone());
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, t.resource as This);
-            rtvs.push(host.rtv(&texture, t.desc.as_ref()));
+            rtvs.push(host.rtv(&copy.texture, t.desc.as_ref()));
         }
         self.depth = 0;
-        let dsv = depth.map(|(t, texture)| {
+        self.depth_copy = depth.as_ref().map(|(_, copy)| copy.clone());
+        let dsv = depth.map(|(t, copy)| {
             self.depth = t.resource;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, t.resource as This);
-            host.dsv(&texture, t.desc.as_ref())
+            host.dsv(&copy.texture, t.desc.as_ref())
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -652,11 +705,23 @@ impl State {
         }
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
-        }
-        if self.depth != 0 {
-            crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+        if !target_ensure_matches(
+            &self.ensured,
+            &self.target_copies,
+            self.depth_copy.as_ref(),
+            list.states_generation(),
+        ) {
+            for copy in &self.target_copies {
+                crate::list::ensure_copy_state(list, copy, RENDER_TARGET);
+            }
+            if let Some(copy) = &self.depth_copy {
+                crate::list::ensure_copy_state(list, copy, DEPTH_WRITE);
+            }
+            self.ensured = Some(target_ensure_key(
+                &self.target_copies,
+                self.depth_copy.as_ref(),
+                list.states_generation(),
+            ));
         }
         // A depth copy of ours (`crate::twin`) ran a compute pipeline.
         if list.take_rebind() {
@@ -4744,6 +4809,41 @@ void main(uint3 id : SV_DispatchThreadID) {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_cut_to_a_fresh_list_forgets_ensured_targets() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let first = host.new_list().unwrap();
+        let second = host.new_list().unwrap();
+        assert_eq!(
+            first.states_generation(),
+            second.states_generation(),
+            "two fresh lists may read the same generation"
+        );
+        let mut state = State::default();
+        state.ensured = Some((vec![1], 0, first.states_generation()));
+        state.cut(&second);
+        assert!(
+            state.ensured.is_none(),
+            "the memo names the old list's state map"
+        );
+    }
+
+    #[test]
+    fn target_ensure_key_tracks_host_copy_identity_and_generation() {
+        let first = std::sync::Arc::new(());
+        let replacement = std::sync::Arc::new(());
+        let first_depth = std::sync::Arc::new(());
+        let replacement_depth = std::sync::Arc::new(());
+        let targets = [first.clone()];
+        let key = Some(target_ensure_key(&targets, Some(&first_depth), 7));
+        assert!(target_ensure_matches(&key, &targets, Some(&first_depth), 7));
+        assert!(!target_ensure_matches(&key, &[replacement], Some(&first_depth), 7));
+        assert!(!target_ensure_matches(&key, &targets, Some(&replacement_depth), 7));
+        assert!(!target_ensure_matches(&key, &targets, Some(&first_depth), 8));
     }
 
     /// A draw read must use the same pinned host copy for upload and state.
