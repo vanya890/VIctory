@@ -244,6 +244,19 @@ mod tests {
     }
 
     #[test]
+    fn python_scripts_do_not_bypass_embedded_data_checks() {
+        let payload = format!("const DATA = \"{}\";\\n", "A1".repeat(400));
+        assert!(
+            !check("scripts/payload.py", payload.as_bytes()).is_empty(),
+            "Python under scripts/ must still reject encoded payloads"
+        );
+        assert!(
+            !check("scripts/large.py", &vec![b'a'; 600 * 1024]).is_empty(),
+            "Python under scripts/ must still obey the file-size limit"
+        );
+    }
+
+    #[test]
     fn rejects_game_like_files() {
         assert!(!check("assets/tex.dds", b"DDS \x7c\0\0\0").is_empty());
         assert!(
