@@ -670,6 +670,12 @@ impl Layout {
             runs.list().iter().map(|r| r.0).min()?,
             runs.list().iter().map(|r| r.0 + r.2).max()?,
         );
+        // Runs::copy addresses the row from its base; if this layout's
+        // first run does not start there, fall back to whole-subresource
+        // refresh rather than reading an incomplete scratch span.
+        if lo != 0 {
+            return None;
+        }
         let start = |z: u32, y: u32| {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
@@ -1306,7 +1312,7 @@ mod tests {
                         assert!(back[start + active..start + row].iter().all(|&b| b == 0xcc));
                     }
                 }
-                l.walk(tiled.len(), mip, 0, len, row, len, |runs, _, _| {
+                l.walk(tiled.len(), mip, 0, len, row, len, None, |runs, _, _| {
                     let list = runs.list();
                     let last = list.last().unwrap().2;
                     partial |= list.len() > 1 && last < list[0].2;
