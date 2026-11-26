@@ -221,8 +221,39 @@ impl Holding {
 #[cfg(windows)]
 static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(Holding::new());
 
+#[cfg(all(test, windows))]
+struct HeldLockTestHook {
+    thread: std::thread::ThreadId,
+    contended: std::sync::mpsc::Sender<bool>,
+}
+
+#[cfg(all(test, windows))]
+static HELD_LOCK_TEST_HOOK: std::sync::Mutex<Option<HeldLockTestHook>> =
+    std::sync::Mutex::new(None);
+
 #[cfg(windows)]
 fn held() -> std::sync::MutexGuard<'static, Holding> {
+    #[cfg(all(test, windows))]
+    {
+        let thread = std::thread::current().id();
+        let hook = {
+            let mut hook = HELD_LOCK_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook.as_ref().is_some_and(|hook| hook.thread == thread) {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
+            let contended = matches!(
+                HELD.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            let _sent = hook.contended.send(contended);
+        }
+    }
     HELD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -351,6 +382,40 @@ fn account() -> std::sync::MutexGuard<'static, Account> {
 
 /// The frame line of held work: what waited, how long and what released it,
 /// and what is still held at the present, with the waits that do not hold.
+#[cfg(all(test, windows))]
+struct AccountFrameTestHook {
+    queue: usize,
+    thread: std::thread::ThreadId,
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(all(test, windows))]
+static ACCOUNT_FRAME_TEST_HOOK: std::sync::Mutex<Option<AccountFrameTestHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, windows))]
+fn pause_account_frame_for_queue(queue: usize) {
+    let thread = std::thread::current().id();
+    let hook = {
+        let mut hook = ACCOUNT_FRAME_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if hook
+            .as_ref()
+            .is_some_and(|hook| hook.queue == queue && hook.thread == thread)
+        {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        let _ = hook.entered.send(());
+        let _ = hook.resume.recv_timeout(std::time::Duration::from_secs(5));
+    }
+}
+
 #[cfg(windows)]
 fn account_frame(frame: u64) {
     let (cuts, early) = crate::list::take_cuts();
@@ -358,7 +423,15 @@ fn account_frame(frame: u64) {
     let a = std::mem::take(&mut *account());
     let blocked: Vec<_> = {
         let guard = held();
-        guard.held.blocked(&read_value).into_iter()
+        let blocked = guard.held.blocked(&read_value);
+        #[cfg(all(test, windows))]
+        for (queue, _, _, _) in &blocked {
+            // The test pauses immediately before kind(queue), after wait-word
+            // reads, while HELD still pins the queue and excludes a concurrent pump.
+            pause_account_frame_for_queue(*queue);
+        }
+        blocked
+            .into_iter()
             .map(|(queue, items, waited, unmet)| (kind(queue), items, waited, unmet))
             .collect()
     };
@@ -1358,7 +1431,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn released_queue_holding_work_stays_alive_and_does_not_alias_new_queues() {
+    fn released_queue_stays_alive_until_held_work_drains() {
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -1436,26 +1509,22 @@ mod tests {
         // Title legally releases `q1` while its held work is still pending.
         let q1_addr = q1 as usize;
         let refs_left = slot::<Release>(q1, 0x10)(q1);
+        assert_eq!(
+            refs_left, 1,
+            "HELD must retain exactly one COM reference until q1 drains"
+        );
 
-        // Create replacement queues; without pinning, one reuses `q1_addr` and
-        // its unblocked submission gets queued behind dead `q1`'s blocked wait.
-        let mut replacements = Vec::new();
+        // The extra COM reference keeps q1 allocated, so a replacement queue
+        // cannot reuse its address before the held work drains.
         let mut q2 = null;
-        for _ in 0..1024 {
-            let mut candidate = null;
-            assert_eq!(
-                create(null, &graphics_desc, &QUEUE_IIDS[0], &mut candidate),
-                S_OK
-            );
-            replacements.push(candidate);
-            if candidate as usize == q1_addr {
-                q2 = candidate;
-                break;
-            }
-        }
-        if q2.is_null() {
-            q2 = replacements[0];
-        }
+        assert_eq!(
+            create(null, &graphics_desc, &QUEUE_IIDS[0], &mut q2),
+            S_OK
+        );
+        assert_ne!(
+            q2 as usize, q1_addr,
+            "a queue with pending HELD work must remain allocated"
+        );
 
         // `q2` writes `gate = 1` with no waits — must run immediately and unblock `q1`.
         crate::list::write64(l2, gate_ptr, 1, 0, 0);
@@ -1473,9 +1542,7 @@ mod tests {
         );
         assert_eq!(host.log_messages(), None);
 
-        for q in replacements {
-            assert_eq!(slot::<Release>(q, 0x10)(q), 0);
-        }
+        assert_eq!(slot::<Release>(q2, 0x10)(q2), 0);
         for obj in [l1, l2, allocator] {
             assert_eq!(slot::<Release>(obj, 0x10)(obj), 0);
         }
@@ -1488,8 +1555,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn held_queue_pinning_handles_multiple_items_signals_waits_and_concurrent_accounting() {
-        use std::sync::Barrier;
-
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -1566,21 +1631,74 @@ mod tests {
         );
         assert!(held().pinned.contains(&q_addr));
 
-        // Snapshot `account_frame` while the released queue is still blocked,
-        // then race `account_frame` against unblocking and draining `q`.
-        account_frame(900);
-        let start = Barrier::new(2);
-        std::thread::scope(|s| {
-            let unblocker = s.spawn(|| {
-                start.wait();
-                // SAFETY: `words` outlives the thread scope.
-                unsafe { (gate_ptr as *mut u64).write_volatile(1) };
-                pump_held(Why::Fence);
-            });
-            start.wait();
-            account_frame(901);
-            unblocker.join().unwrap();
+        // Pause account_frame after its blocked-wait snapshot, while it still
+        // owns HELD. The pump must not drain/release q until that snapshot has
+        // copied the queue kind and released the guard.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let account_queue = q_addr;
+        let account_thread = std::thread::spawn(move || {
+            *ACCOUNT_FRAME_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(AccountFrameTestHook {
+                    queue: account_queue,
+                    thread: std::thread::current().id(),
+                    entered: entered_tx,
+                    resume: resume_rx,
+                });
+            account_frame(900);
         });
+        let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let held_locked = matches!(
+            HELD.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+
+        let (pump_contended_tx, pump_contended_rx) = std::sync::mpsc::channel();
+        let pump_thread = std::thread::spawn(move || {
+            *HELD_LOCK_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(HeldLockTestHook {
+                    thread: std::thread::current().id(),
+                    contended: pump_contended_tx,
+                });
+            pump_held(Why::Fence);
+        });
+        // The signal is sent only after pump_held's actual HELD.try_lock sees
+        // WouldBlock, not merely after the worker thread has been scheduled.
+        let pump_contended = pump_contended_rx.recv_timeout(std::time::Duration::from_secs(2));
+
+        // SAFETY: account_frame has finished reading gate_ptr and still holds
+        // HELD; the pump thread has confirmed its own HELD.try_lock was blocked,
+        // so no reader can access the word during this write.
+        unsafe { (gate_ptr as *mut u64).write_volatile(1) };
+        let resumed = resume_tx.send(());
+        let account_result = account_thread.join();
+        let pump_result = pump_thread.join();
+        // Drain even on a failed assertion so the global HELD state is clean.
+        pump_held(Why::Fence);
+        let leftover_hook = ACCOUNT_FRAME_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let leftover_pump_hook = HELD_LOCK_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+
+        assert!(entered.is_ok(), "account_frame did not reach the blocked snapshot");
+        assert!(held_locked, "account_frame did not hold HELD at the snapshot hook");
+        assert!(
+            pump_contended.expect("pump thread never reached HELD lookup"),
+            "pump thread did not observe HELD contention"
+        );
+        assert!(resumed.is_ok(), "account_frame pause hook was not waiting");
+        assert!(account_result.is_ok(), "account_frame thread panicked");
+        assert!(pump_result.is_ok(), "pump thread panicked");
+        assert!(leftover_hook.is_none(), "account_frame test hook was not consumed");
+        assert!(leftover_pump_hook.is_none(), "HELD lock test hook was not consumed");
 
         // SAFETY: `words` is live and `q` has drained.
         assert_eq!(unsafe { (out1_ptr as *const u64).read_volatile() }, 11);
