@@ -1982,7 +1982,7 @@ impl HostList {
                 unsafe {
                     let allocator: ID3D12CommandAllocator =
                         device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-                    let list = device.CreateCommandList(
+                    let list: ID3D12GraphicsCommandList = device.CreateCommandList(
                         0,
                         D3D12_COMMAND_LIST_TYPE_DIRECT,
                         &allocator,
