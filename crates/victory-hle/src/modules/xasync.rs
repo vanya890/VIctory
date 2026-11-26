@@ -1705,7 +1705,7 @@ mod tests {
             XAsyncBegin(
                 block_ptr,
                 (&*gate as *const Gate).cast_mut().cast(),
-                std::ptr::null(),
+                (&OBJECT as *const _).cast(),
                 std::ptr::null(),
                 Some(gated),
             ),
