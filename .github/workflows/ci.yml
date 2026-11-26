@@ -41,3 +41,4 @@ jobs:
         run: cargo test -p victory-gpu --features diagnostics --lib --locked host::withholding -- --nocapture
         env:
           VICTORY_D3D12_WARP: "1"
+          VICTORY_D3D12_DEBUG: "1"
