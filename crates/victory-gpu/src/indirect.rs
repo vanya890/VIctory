@@ -433,6 +433,7 @@ mod tests {
             }
             // SAFETY: as above.
             assert_eq!(
+                // SAFETY: data points into the still-mapped readback buffer.
                 unsafe { data.cast::<[u32; 3]>().read_volatile() },
                 [70_000, 1, 1],
                 "the title's copy as written"
