@@ -1638,8 +1638,9 @@ mod tests {
             .recv_timeout(std::time::Duration::from_millis(50))
             .is_ok();
 
-        // account_frame has already read gate_ptr, and pump cannot read it
-        // until HELD is released, so this write is not concurrent with either.
+        // SAFETY: account_frame has finished reading gate_ptr and still holds
+        // HELD; every pump must acquire HELD before reading it, so no concurrent
+        // access occurs during this write.
         unsafe { (gate_ptr as *mut u64).write_volatile(1) };
         let resumed = resume_tx.send(());
         let account_result = account_thread.join();
