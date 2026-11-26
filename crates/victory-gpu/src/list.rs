@@ -609,7 +609,7 @@ pub(crate) fn ensure_copy_state(
 ) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition_copy(copy, state) {
-        let state = crate::host::legal_state(&texture, state);
+        let state = copy.legal(state);
         let barrier = crate::host::transition(&texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
