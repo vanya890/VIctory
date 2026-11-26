@@ -1737,8 +1737,8 @@ impl Host {
         for (_, address, len) in &withheld {
             crate::memory::drop_withheld(*address, *len);
         }
-        // Some bitmap-held pages have no declared range in back, so drop
-        // those separately after every declared copy-back has completed.
+        // Drop bitmap-held pages not already covered by a declared withheld
+        // range; otherwise the same physical page would be retaken twice.
         for (_copy, page) in held_pages {
             if !withheld
                 .iter()
@@ -4844,6 +4844,16 @@ fn page_overlaps_range(page: usize, address: usize, len: usize) -> bool {
 
 #[cfg(test)]
 mod withholding {
+    fn host_or_skip() -> Option<&'static super::Host> {
+        let host = super::host();
+        if std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+            eprintln!("Using forced D3D12 WARP adapter (VICTORY_D3D12_WARP=1)");
+            Some(host.expect("forced WARP host must initialize"))
+        } else {
+            host
+        }
+    }
+
     /// A list in which a program using title memory missed memory: what
     /// that program wrote is withheld from title memory and leaves the
     /// copies at once; what an ordinary program wrote in the same list goes
@@ -4854,7 +4864,7 @@ mod withholding {
     #[test]
     fn only_programs_using_title_memory_are_withheld() {
         use crate::watch::PAGE;
-        let Some(host) = super::host() else {
+        let Some(host) = host_or_skip() else {
             return; // no host GPU here
         };
         let pools = [crate::watch::tests::pool(1), crate::watch::tests::pool(1)];
@@ -4899,7 +4909,7 @@ mod withholding {
     #[test]
     fn withheld_marked_drop_runs_after_other_copy_marked_copy_back() {
         use crate::watch::PAGE;
-        let Some(host) = super::host() else {
+        let Some(host) = host_or_skip() else {
             return; // no host GPU here
         };
         let p = crate::watch::tests::pool(1);
@@ -4979,7 +4989,7 @@ mod withholding {
     #[test]
     fn withheld_range_drop_runs_after_ordinary_copy_back() {
         use crate::watch::PAGE;
-        let Some(host) = super::host() else {
+        let Some(host) = host_or_skip() else {
             return; // no host GPU here
         };
         let p = crate::watch::tests::pool(1);
@@ -5043,7 +5053,7 @@ mod withholding {
     #[test]
     fn held_page_is_not_copied_back_from_the_same_shadow() {
         use crate::watch::PAGE;
-        let Some(host) = super::host() else {
+        let Some(host) = host_or_skip() else {
             return; // no host GPU here
         };
         let p = crate::watch::tests::pool(2);
