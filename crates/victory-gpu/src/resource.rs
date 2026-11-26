@@ -800,6 +800,8 @@ struct Resource {
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    /// Immutable D3D12 resource flags, cached at construction.
+    pub(crate) flags: u32,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// Formats views may take besides the texture's own family: the host
     /// took them as castable formats when it made the texture.
@@ -836,14 +838,17 @@ impl HostTexture {
         state: u32,
         castable: Vec<u32>,
     ) -> Self {
+        // SAFETY: a plain query on a live resource.
+        let desc = unsafe { texture.GetDesc() };
         let bytes = crate::host::host().map_or(0, |h| {
-            // SAFETY: plain queries on a live resource.
-            unsafe { h.device.GetResourceAllocationInfo(0, &[texture.GetDesc()]) }.SizeInBytes
+            // SAFETY: a plain query.
+            unsafe { h.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes
         });
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
             texture,
+            flags: desc.Flags.0 as u32,
             state: state.into(),
             castable,
             host_written: false.into(),
@@ -856,6 +861,16 @@ impl HostTexture {
             placement: None,
             last: [crate::queue::presented().into(), now_ms().into()],
         }
+    }
+
+    /// Legal host states for this texture, using its immutable resource flags.
+    pub(crate) fn legal(&self, state: u32) -> u32 {
+        crate::host::legal_for(self.flags, state)
+    }
+
+    /// Whether this texture's contents are sourced from title memory.
+    pub(crate) fn title_written(&self) -> bool {
+        crate::texture::title_written_flags(self.flags)
     }
 
     /// The title used it now: a list of the title's names it, or a shader
