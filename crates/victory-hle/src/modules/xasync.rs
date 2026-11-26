@@ -190,11 +190,135 @@ impl Pool {
     }
 }
 
+/// One registered monitor callback and its live invocations.
+struct Monitor {
+    token: u64,
+    context: usize,
+    callback: usize,
+    /// Unregistered: no new invocation may start; the entry stays until
+    /// every in-flight invocation returns so `XTaskQueueUnregisterMonitor`
+    /// can wait for them.
+    removed: bool,
+    /// Threads currently executing this monitor callback (one entry per
+    /// active frame, supporting recursive delivery on the same thread).
+    running: Vec<std::thread::ThreadId>,
+}
+
+#[derive(Default)]
+struct Monitors {
+    entries: Mutex<Vec<Monitor>>,
+    done: Condvar,
+}
+
+impl Monitors {
+    fn register(&self, token: u64, context: usize, callback: usize) {
+        lock(&self.entries).push(Monitor {
+            token,
+            context,
+            callback,
+            removed: false,
+            running: Vec::new(),
+        });
+    }
+
+    fn notify(&self, queue: *const Queue, port: u32) {
+        // Snapshot currently registered tokens so monitors added mid-callback
+        // are not invoked for an earlier submission, while re-checking each
+        // entry right before calling it so a monitor unregistered meanwhile
+        // never starts.
+        let tokens: Vec<u64> = {
+            let entries = lock(&self.entries);
+            if entries.is_empty() {
+                return;
+            }
+            entries
+                .iter()
+                .filter(|m| !m.removed)
+                .map(|m| m.token)
+                .collect()
+        };
+        let me = std::thread::current().id();
+        for token in tokens {
+            let invocation = {
+                let mut entries = lock(&self.entries);
+                entries
+                    .iter_mut()
+                    .find(|m| m.token == token && !m.removed)
+                    .map(|m| {
+                        m.running.push(me);
+                        (m.context, m.callback)
+                    })
+            };
+            let Some((context, callback)) = invocation else {
+                continue;
+            };
+            struct Active<'a> {
+                monitors: &'a Monitors,
+                token: u64,
+                thread: std::thread::ThreadId,
+            }
+            impl Drop for Active<'_> {
+                fn drop(&mut self) {
+                    let mut entries = lock(&self.monitors.entries);
+                    if let Some(pos) = entries.iter().position(|m| m.token == self.token) {
+                        let entry = &mut entries[pos];
+                        if let Some(i) = entry.running.iter().position(|&t| t == self.thread) {
+                            entry.running.swap_remove(i);
+                        }
+                        if entry.removed && entry.running.is_empty() {
+                            entries.remove(pos);
+                            self.monitors.done.notify_all();
+                        }
+                    }
+                }
+            }
+            let _active = Active {
+                monitors: self,
+                token,
+                thread: me,
+            };
+            // SAFETY: stored from a `MonitorCallback` in `XTaskQueueRegisterMonitor`.
+            let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
+            callback(context as *mut c_void, queue, port);
+        }
+    }
+
+    fn unregister(&self, token: u64) {
+        let me = std::thread::current().id();
+        let mut entries = lock(&self.entries);
+        let Some(pos) = entries.iter().position(|m| m.token == token) else {
+            return;
+        };
+        entries[pos].removed = true;
+        if entries[pos].running.is_empty() {
+            entries.remove(pos);
+            return;
+        }
+        // A thread already inside this monitor callback cannot wait for itself
+        // (or another thread simultaneously self-unregistering) without
+        // deadlocking; external callers wait until every active invocation
+        // returns and removes the entry.
+        // A callback cannot wait for itself, or two concurrent callbacks
+        // self-unregistering together could deadlock. In this reentrant case
+        // unregister only prevents future starts; other invocations may still
+        // be running when it returns. The caller must keep the shared context
+        // alive until those already-entered callbacks have returned.
+        if entries[pos].running.contains(&me) {
+            return;
+        }
+        drop(
+            self.done
+                .wait_while(entries, |entries| entries.iter().any(|m| m.token == token))
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+    }
+}
+
 /// A queue handle is `Arc::into_raw` of this; duplicating and closing a
 /// handle add and drop a reference.
 pub struct Queue {
     ports: [Arc<Port>; 2],
-    monitors: Mutex<Vec<(u64, usize, usize)>>,
+    monitors: Monitors,
     terminated: AtomicBool,
     /// Delayed callbacks still waiting out their delay, in submission
     /// order: terminating the queue cancels them with the queued ones.
@@ -205,7 +329,7 @@ impl Queue {
     fn new(ports: [Arc<Port>; 2]) -> Arc<Queue> {
         Arc::new(Queue {
             ports,
-            monitors: Mutex::default(),
+            monitors: Monitors::default(),
             terminated: AtomicBool::new(false),
             delayed: Mutex::default(),
         })
@@ -247,13 +371,7 @@ impl Queue {
 
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
         self.ports[port as usize].submit(task);
-        // Copied out: a monitor may unregister itself.
-        let monitors = lock(&self.monitors).clone();
-        for (_, context, callback) in monitors {
-            // SAFETY: stored from a `MonitorCallback` in `register_monitor`.
-            let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
-            callback(context as *mut c_void, Arc::as_ptr(self), port);
-        }
+        self.monitors.notify(Arc::as_ptr(self), port);
     }
 }
 
@@ -435,15 +553,16 @@ pub fn XTaskQueueRegisterMonitor(
         return E_INVALIDARG;
     }
     let id = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-    lock(&queue.monitors).push((id, context as usize, callback as usize));
+    // Publish the token before the monitor can be observed by another thread.
     // SAFETY: checked non-null.
     unsafe { token.write(id) };
+    queue.monitors.register(id, context as usize, callback as usize);
     S_OK
 }
 
 pub fn XTaskQueueUnregisterMonitor(handle: *const Queue, token: u64) {
     if let Some(queue) = queue(handle) {
-        lock(&queue.monitors).retain(|m| m.0 != token);
+        queue.monitors.unregister(token);
     }
 }
 
@@ -1701,5 +1820,300 @@ mod tests {
         assert_eq!(SEEN.load(Ordering::SeqCst), 1, "cleanup ran under the lock");
         assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
         *CLEANED.lock().unwrap() = None;
+    }
+
+
+    /// `XTaskQueueUnregisterMonitor` must wait for any in-flight invocation of
+    /// that monitor to return before returning itself, so the title can safely
+    /// free the monitor's context immediately afterwards.
+    #[test]
+    fn unregister_monitor_waits_for_in_flight_callbacks() {
+        struct State {
+            entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            proceed: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+            destroyed: AtomicBool,
+            saw_destroyed: AtomicBool,
+            calls: AtomicU32,
+        }
+        extern "system" fn monitor(context: *mut c_void, _: *const Queue, _: u32) {
+            // SAFETY: the test keeps `State` alive until all threads join.
+            let state = unsafe { &*context.cast::<State>() };
+            state.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(tx) = lock(&state.entered).take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = lock(&state.proceed).take() {
+                let _ = rx.recv();
+            }
+            if state.destroyed.load(Ordering::SeqCst) {
+                state.saw_destroyed.store(true, Ordering::SeqCst);
+            }
+        }
+        extern "system" fn noop(_: *mut c_void, _: bool) {}
+
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let (tx_entered, rx_entered) = std::sync::mpsc::channel();
+        let (tx_proceed, rx_proceed) = std::sync::mpsc::channel();
+        let state = Box::new(State {
+            entered: Mutex::new(Some(tx_entered)),
+            proceed: Mutex::new(Some(rx_proceed)),
+            destroyed: AtomicBool::new(false),
+            saw_destroyed: AtomicBool::new(false),
+            calls: AtomicU32::new(0),
+        });
+        let ctx = std::ptr::from_ref(state.as_ref()).cast_mut().cast();
+        let mut token = 0u64;
+        assert_eq!(
+            XTaskQueueRegisterMonitor(q, ctx, Some(monitor), &mut token),
+            S_OK
+        );
+        assert_ne!(token, 0);
+
+        let q_addr = q as usize;
+        let submitter = std::thread::spawn(move || {
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(
+                    q_addr as *const Queue,
+                    WORK,
+                    0,
+                    std::ptr::null_mut(),
+                    Some(noop)
+                ),
+                S_OK
+            );
+        });
+        rx_entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("monitor must enter");
+
+        let (tx_unreg, rx_unreg) = std::sync::mpsc::channel();
+        let state_addr = ctx as usize;
+        let unreg = std::thread::spawn(move || {
+            XTaskQueueUnregisterMonitor(q_addr as *const Queue, token);
+            // SAFETY: `state` outlives all threads in this test.
+            unsafe { &*(state_addr as *const State) }
+                .destroyed
+                .store(true, Ordering::SeqCst);
+            let _ = tx_unreg.send(());
+        });
+
+        // While `monitor` is still running, `XTaskQueueUnregisterMonitor` must
+        // stay blocked instead of returning and letting the caller free `ctx`.
+        let returned_early = rx_unreg.recv_timeout(Duration::from_millis(50)).is_ok();
+        let _ = tx_proceed.send(());
+        submitter.join().unwrap();
+        if !returned_early {
+            rx_unreg
+                .recv_timeout(Duration::from_secs(5))
+                .expect("unregister must return once the in-flight callback finishes");
+        }
+        unreg.join().unwrap();
+
+        assert!(
+            !returned_early && !state.saw_destroyed.load(Ordering::SeqCst),
+            "XTaskQueueUnregisterMonitor returned before the in-flight monitor callback finished \
+             (returned_early={returned_early}, saw_destroyed={})",
+            state.saw_destroyed.load(Ordering::SeqCst)
+        );
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+
+        // Subsequent submissions must not invoke the unregistered monitor.
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 0, std::ptr::null_mut(), Some(noop)),
+            S_OK
+        );
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// Unregistering a sibling monitor while an earlier monitor is running must
+    /// prevent the sibling from ever being invoked; reentrant self-unregister
+    /// (including concurrent dual-thread self-unregister and external waiters)
+    /// must neither deadlock nor release external waiters early.
+    #[test]
+    fn unregister_monitor_skips_unstarted_siblings_and_handles_reentrant_self_unregister() {
+        use std::sync::Barrier;
+
+        extern "system" fn noop(_: *mut c_void, _: bool) {}
+
+        // Part 1: M1 unregisters sibling M2 before M2 starts (zero-sleep).
+        struct SiblingState {
+            m2_token: AtomicU64,
+            m2_destroyed: AtomicBool,
+            m2_calls: AtomicU32,
+            m1_calls: AtomicU32,
+            m1_token: AtomicU64,
+        }
+        extern "system" fn m1_cb(context: *mut c_void, queue: *const Queue, _: u32) {
+            // SAFETY: `SiblingState` lives on the stack for the duration of Part 1.
+            let state = unsafe { &*context.cast::<SiblingState>() };
+            if state.m1_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                // Unregister M2 and mark its context freed before M1 returns.
+                XTaskQueueUnregisterMonitor(queue, state.m2_token.load(Ordering::SeqCst));
+                state.m2_destroyed.store(true, Ordering::SeqCst);
+                // Reentrant self-unregister of M1 (via COM vtable slot 0xc0) must
+                // not deadlock, and a nested submit must not re-enter M1.
+                type Unreg = extern "system" fn(This, *const Queue, u64);
+                slot::<Unreg>(0xc0)(&OBJECT, queue, state.m1_token.load(Ordering::SeqCst));
+                assert_eq!(
+                    XTaskQueueSubmitDelayedCallback(
+                        queue,
+                        WORK,
+                        0,
+                        std::ptr::null_mut(),
+                        Some(noop)
+                    ),
+                    S_OK
+                );
+            }
+        }
+        extern "system" fn m2_cb(context: *mut c_void, _: *const Queue, _: u32) {
+            // SAFETY: `SiblingState` lives on the stack for the duration of Part 1.
+            let state = unsafe { &*context.cast::<SiblingState>() };
+            state.m2_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let state = SiblingState {
+            m2_token: AtomicU64::new(0),
+            m2_destroyed: AtomicBool::new(false),
+            m2_calls: AtomicU32::new(0),
+            m1_calls: AtomicU32::new(0),
+            m1_token: AtomicU64::new(0),
+        };
+        let ctx = std::ptr::from_ref(&state).cast_mut().cast();
+        let (mut tok1, mut tok2) = (0u64, 0u64);
+        assert_eq!(
+            XTaskQueueRegisterMonitor(q, ctx, Some(m1_cb), &mut tok1),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueRegisterMonitor(q, ctx, Some(m2_cb), &mut tok2),
+            S_OK
+        );
+        state.m1_token.store(tok1, Ordering::SeqCst);
+        state.m2_token.store(tok2, Ordering::SeqCst);
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 0, std::ptr::null_mut(), Some(noop)),
+            S_OK
+        );
+        assert_eq!(state.m1_calls.load(Ordering::SeqCst), 1);
+        assert!(state.m2_destroyed.load(Ordering::SeqCst));
+        assert_eq!(
+            state.m2_calls.load(Ordering::SeqCst),
+            0,
+            "unregistered sibling monitor must not run from a stale snapshot"
+        );
+        // Further submissions must not call M1 or M2.
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 0, std::ptr::null_mut(), Some(noop)),
+            S_OK
+        );
+        assert_eq!(state.m1_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.m2_calls.load(Ordering::SeqCst), 0);
+        XTaskQueueCloseHandle(q);
+
+        // Part 2: Two threads concurrently inside the SAME monitor both
+        // self-unregister while an external thread also calls unregister.
+        // Neither callback thread may deadlock, and the external thread must
+        // wait until BOTH callbacks return.
+        struct DualState {
+            token: AtomicU64,
+            both_in: Barrier,
+            allow_exit: Barrier,
+            finished: AtomicU32,
+            ext_saw_finished: AtomicU32,
+        }
+        extern "system" fn dual_cb(context: *mut c_void, queue: *const Queue, _: u32) {
+            // SAFETY: `DualState` lives until all spawned threads join.
+            let s = unsafe { &*context.cast::<DualState>() };
+            s.both_in.wait();
+            // Both concurrent invocations self-unregister simultaneously.
+            XTaskQueueUnregisterMonitor(queue, s.token.load(Ordering::SeqCst));
+            s.allow_exit.wait();
+            s.finished.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut q2 = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q2), S_OK);
+        let dual = DualState {
+            token: AtomicU64::new(0),
+            both_in: Barrier::new(3),
+            allow_exit: Barrier::new(3),
+            finished: AtomicU32::new(0),
+            ext_saw_finished: AtomicU32::new(0),
+        };
+        let dual_ctx = std::ptr::from_ref(&dual).cast_mut().cast();
+        let mut tok = 0u64;
+        assert_eq!(
+            XTaskQueueRegisterMonitor(q2, dual_ctx, Some(dual_cb), &mut tok),
+            S_OK
+        );
+        dual.token.store(tok, Ordering::SeqCst);
+
+        let q2_addr = q2 as usize;
+        let dual_addr = dual_ctx as usize;
+        let t1 = std::thread::spawn(move || {
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(
+                    q2_addr as *const Queue,
+                    WORK,
+                    0,
+                    std::ptr::null_mut(),
+                    Some(noop)
+                ),
+                S_OK
+            );
+        });
+        let t2 = std::thread::spawn(move || {
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(
+                    q2_addr as *const Queue,
+                    WORK,
+                    0,
+                    std::ptr::null_mut(),
+                    Some(noop)
+                ),
+                S_OK
+            );
+        });
+
+        // Wait until both t1 and t2 are actively inside `dual_cb`.
+        dual.both_in.wait();
+        let (tx_ext, rx_ext) = std::sync::mpsc::channel();
+        let ext = std::thread::spawn(move || {
+            XTaskQueueUnregisterMonitor(q2_addr as *const Queue, tok);
+            // SAFETY: `dual` outlives all threads in Part 2.
+            let s = unsafe { &*(dual_addr as *const DualState) };
+            s.ext_saw_finished
+                .store(s.finished.load(Ordering::SeqCst), Ordering::SeqCst);
+            let _ = tx_ext.send(());
+        });
+        // External unregister must still be blocked while t1/t2 are paused at
+        // `allow_exit` even after both t1 and t2 called self-unregister.
+        let ext_early = rx_ext.recv_timeout(Duration::from_millis(50)).is_ok();
+        dual.allow_exit.wait();
+        t1.join().unwrap();
+        t2.join().unwrap();
+        if !ext_early {
+            rx_ext
+                .recv_timeout(Duration::from_secs(5))
+                .expect("external unregister must unblock after both callbacks return");
+        }
+        ext.join().unwrap();
+
+        assert!(
+            !ext_early,
+            "external unregister returned while callbacks were still active"
+        );
+        assert_eq!(
+            dual.ext_saw_finished.load(Ordering::SeqCst),
+            2,
+            "external unregister must observe both concurrent callbacks finished"
+        );
+        XTaskQueueCloseHandle(q2);
     }
 }
