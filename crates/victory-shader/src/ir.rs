@@ -1285,6 +1285,34 @@ mod tests {
     }
 
     #[test]
+    fn destination_relative_move_is_not_a_source_relative_restore() {
+        let p = build_words(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE80_036A, // s_mov_b32 s0, vcc_lo
+                0xD761_000A,
+                0x0001_0000, // v_writelane_b32 v10, s0, 0
+                0xBEFC_0383, // s_mov_b32 m0, 3
+                0x7E08_8507, // v_movreld_b32 v4, v7 (destination v7)
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let relative = p.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "v_movreld_b32")
+            .unwrap();
+        assert!(
+            relative
+                .writes
+                .iter()
+                .all(|(_, result)| !p.restored.contains_key(result)),
+            "destination-relative indexing must not use the source-relative restore rule"
+        );
+    }
+
+    #[test]
     fn m0_relative_restore_finds_a_unique_parked_scalar() {
         let p = build_words(
             &[
