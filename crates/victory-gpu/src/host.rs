@@ -4620,6 +4620,64 @@ mod present_plane_tests {
         );
         assert!(rejected.0.is_none());
         assert!(!denied_attempted);
+
+        let direct_primary = make(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        );
+        let denied_overlay = make(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+                | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+        );
+        let setup = host.new_list().unwrap();
+        // SAFETY: live render-target views on an open list.
+        unsafe {
+            setup.list.ClearRenderTargetView(
+                host.rtv(&direct_primary, None),
+                &[1.0, 0.0, 0.0, 1.0],
+                None,
+            );
+            setup.list.ClearRenderTargetView(
+                host.rtv(&denied_overlay, None),
+                &[0.0, 1.0, 0.0, 1.0],
+                None,
+            );
+        }
+        setup.close();
+        host.execute(&[&setup]);
+        let mut direct_pixel = None;
+        let mut overlay_compositor_attempted = false;
+        let direct = host.present_planes_with_compositor(
+            &[
+                PresentPlane::Raw(&direct_primary, state, None),
+                PresentPlane::Raw(&denied_overlay, state, None),
+            ],
+            10,
+            |_, _| {
+                overlay_compositor_attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |buffer, footprint| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: the present copy completed; footprint names a live RGBA pixel.
+                direct_pixel = Some(unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u8; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                });
+            },
+        );
+        assert!(direct.0.is_some(), "the legal primary plane remains presentable");
+        assert!(!overlay_compositor_attempted, "a DENY_SHADER_RESOURCE overlay is not sampled");
+        assert_eq!(direct_pixel, Some([255, 0, 0, 255]));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
