@@ -1244,7 +1244,11 @@ mod tests {
                     assert!(lease_active.load(Ordering::SeqCst), "lease dropped during staged read");
                     reads += 1;
                     match reads {
-                        1 => Err(std::io::Error::from_raw_os_error(
+                        1 => {
+                            staging[..3].copy_from_slice(&expected[..3]);
+                            Ok(3)
+                        }
+                        2 => Err(std::io::Error::from_raw_os_error(
                             ERROR_INVALID_USER_BUFFER as i32,
                         )),
                         _ => {
