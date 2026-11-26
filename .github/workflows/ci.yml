@@ -35,3 +35,9 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      # Host-backed GPU tests must run on WARP in headless CI; the default
+      # adapter path intentionally skips them when no D3D12 device is present.
+      - name: D3D12 WARP copy-back regressions
+        run: cargo test -p victory-gpu --features diagnostics --lib host::withholding -- --nocapture
+        env:
+          VICTORY_D3D12_WARP: "1"
