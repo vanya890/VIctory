@@ -222,7 +222,38 @@ impl Holding {
 static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(Holding::new());
 
 #[cfg(windows)]
+#[cfg(all(test, windows))]
+struct HeldLockTestHook {
+    thread: std::thread::ThreadId,
+    contended: std::sync::mpsc::Sender<bool>,
+}
+
+#[cfg(all(test, windows))]
+static HELD_LOCK_TEST_HOOK: std::sync::Mutex<Option<HeldLockTestHook>> =
+    std::sync::Mutex::new(None);
+
 fn held() -> std::sync::MutexGuard<'static, Holding> {
+    #[cfg(all(test, windows))]
+    {
+        let thread = std::thread::current().id();
+        let hook = {
+            let mut hook = HELD_LOCK_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook.as_ref().is_some_and(|hook| hook.thread == thread) {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
+            let contended = matches!(
+                HELD.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            let _sent = hook.contended.send(contended);
+        }
+    }
     HELD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -1624,23 +1655,24 @@ mod tests {
             Err(std::sync::TryLockError::WouldBlock)
         );
 
-        let (pump_started_tx, pump_started_rx) = std::sync::mpsc::channel();
-        let (pump_done_tx, pump_done_rx) = std::sync::mpsc::channel();
+        let (pump_contended_tx, pump_contended_rx) = std::sync::mpsc::channel();
         let pump_thread = std::thread::spawn(move || {
-            pump_started_tx.send(()).unwrap();
+            *HELD_LOCK_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(HeldLockTestHook {
+                    thread: std::thread::current().id(),
+                    contended: pump_contended_tx,
+                });
             pump_held(Why::Fence);
-            pump_done_tx.send(()).unwrap();
         });
-        let pump_started = pump_started_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .is_ok();
-        let pump_finished_while_locked = pump_done_rx
-            .recv_timeout(std::time::Duration::from_millis(50))
-            .is_ok();
+        // The signal is sent only after pump_held's actual HELD.try_lock sees
+        // WouldBlock, not merely after the worker thread has been scheduled.
+        let pump_contended = pump_contended_rx.recv_timeout(std::time::Duration::from_secs(2));
 
         // SAFETY: account_frame has finished reading gate_ptr and still holds
-        // HELD; every pump must acquire HELD before reading it, so no concurrent
-        // access occurs during this write.
+        // HELD; the pump thread has confirmed its own HELD.try_lock was blocked,
+        // so no reader can access the word during this write.
         unsafe { (gate_ptr as *mut u64).write_volatile(1) };
         let resumed = resume_tx.send(());
         let account_result = account_thread.join();
@@ -1651,15 +1683,22 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        let leftover_pump_hook = HELD_LOCK_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
 
         assert!(entered.is_ok(), "account_frame did not reach the blocked snapshot");
         assert!(held_locked, "account_frame did not hold HELD at the snapshot hook");
-        assert!(pump_started, "pump thread did not start");
-        assert!(!pump_finished_while_locked, "pump completed while account_frame held HELD");
+        assert!(
+            pump_contended.expect("pump thread never reached HELD lookup"),
+            "pump thread did not observe HELD contention"
+        );
         assert!(resumed.is_ok(), "account_frame pause hook was not waiting");
         assert!(account_result.is_ok(), "account_frame thread panicked");
         assert!(pump_result.is_ok(), "pump thread panicked");
         assert!(leftover_hook.is_none(), "account_frame test hook was not consumed");
+        assert!(leftover_pump_hook.is_none(), "HELD lock test hook was not consumed");
 
         // SAFETY: `words` is live and `q` has drained.
         assert_eq!(unsafe { (out1_ptr as *const u64).read_volatile() }, 11);
