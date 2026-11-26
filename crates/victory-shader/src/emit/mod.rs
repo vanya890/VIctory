@@ -774,6 +774,41 @@ mod tests {
         lower_wave_mode_with_rsrc2(words, wave, wave64, threads, 1 << 15 | 2 << 1)
     }
 
+    fn lower_wave_mode_default(
+        words: &[u32],
+        threads: u32,
+    ) -> Result<lower::Lowered, ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads: [threads, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+        })
+    }
+
     fn lower_wave_mode_with_rsrc2(
         words: &[u32],
         wave: WaveMode,
@@ -950,7 +985,7 @@ mod tests {
             0xBF8A_0000,
             S_ENDPGM,
         ];
-        let lowered = lower_wave_mode(&words, WaveMode::default(), false, 64).unwrap();
+        let lowered = lower_wave_mode_default(&words, 64).unwrap();
         assert_eq!(WaveMode::default().min_lanes, 0);
         assert_eq!(WaveMode::default().group_sync, GroupSync::Strict);
         assert_eq!(lowered.barrier_modes, [1 | 8]);
