@@ -330,6 +330,8 @@ struct Tracer<'a> {
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
+    /// Values recovered from lane-relative reads by the IR lookahead.
+    restored: std::collections::HashMap<Value, Value>,
     /// Values loaded from the root signature's memory ([`USER_DATA`]): the
     /// root parameter and dword each one is.
     spilled: std::collections::HashMap<Value, (usize, u32)>,
@@ -435,6 +437,7 @@ impl<'a> Tracer<'a> {
             origin: Vec::new(),
             lanes,
             rpo,
+            restored: p.restored.clone(),
             spilled: Default::default(),
             first_spilled: Default::default(),
             spill_at: Default::default(),
@@ -2083,10 +2086,19 @@ impl Tracer<'_> {
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
     /// lane, found by following the VGPR's `v_writelane_b32` writes.
     fn restored(&self, inst: &Inst) -> Option<Moved> {
+        let name = inst.name();
+        if matches!(
+            name,
+            "v_readlane_b32" | "v_movrels_b32" | "v_movreld_b32" | "v_swaprel_b32"
+        ) && let Some((_, result)) = inst.writes.first()
+            && let Some(&scalar) = self.restored.get(result)
+        {
+            return Some(Moved::Value(scalar));
+        }
         let Fields::Valu(v) = &inst.fields else {
             return None;
         };
-        if inst.name() != "v_readlane_b32" {
+        if name != "v_readlane_b32" {
             return None;
         }
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
