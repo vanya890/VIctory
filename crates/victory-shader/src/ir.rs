@@ -388,10 +388,11 @@ fn restores(blocks: &[Block], vgprs: u16) -> HashMap<Value, Value> {
                 {
                     out.insert(*result, scalar);
                 }
-            } else if matches!(
-                name,
-                "v_movrels_b32" | "v_movreld_b32" | "v_swaprel_b32"
-            ) {
+            } else if name == "v_movrels_b32" {
+                // Only source-relative indexing has one unambiguous source
+                // base plus a full-width M0 offset. Destination-relative and
+                // swap-relative forms use different M0 fields and may write
+                // multiple VGPRs, so do not guess their SSA result here.
                 let base = match v.src.first() {
                     Some(Operand::Vector { reg, .. }) => Some(*reg),
                     _ => None,
