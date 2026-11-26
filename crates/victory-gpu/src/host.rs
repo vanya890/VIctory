@@ -813,6 +813,8 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Changes whenever the list's tracked texture-state map changes.
+    states_generation: std::sync::atomic::AtomicU64,
     /// Depth textures with a writable twin the list uses (`crate::twin`),
     /// by host copy: the side its first use needs and the side it leaves
     /// newer.
@@ -1147,6 +1149,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                states_generation: std::sync::atomic::AtomicU64::new(0),
                 twins: Mutex::default(),
                 rebind: false.into(),
                 ours: false.into(),
@@ -1800,6 +1803,7 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.states_generation.fetch_add(1, Ordering::Relaxed);
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -1845,14 +1849,19 @@ impl HostList {
         copy: &std::sync::Arc<crate::resource::HostTexture>,
         wanted: u32,
     ) -> Option<(ID3D12Resource, u32)> {
-        let texture = copy.texture.clone();
         if let Some(Some(twin)) = copy.twin.get()
             && crate::twin::route(self, copy, twin, wanted)
         {
+            self.states_generation.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         let wanted = copy.legal(wanted);
-        self.track(copy, wanted).map(|before| (texture, before))
+        self.track(copy, wanted).map(|before| (copy.texture.clone(), before))
+    }
+
+    /// Current generation of the list's tracked host-texture states.
+    pub(crate) fn states_generation(&self) -> u64 {
+        self.states_generation.load(Ordering::Relaxed)
     }
 
     /// The list's state for host texture `copy` becomes `wanted` (a legal
@@ -1862,6 +1871,7 @@ impl HostList {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
+                self.states_generation.fetch_add(1, Ordering::Relaxed);
                 copy.note_used();
                 if !self.ours.load(Ordering::Relaxed) {
                     copy.stamp();
@@ -1871,7 +1881,12 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some(before)
+                if before != wanted {
+                    self.states_generation.fetch_add(1, Ordering::Relaxed);
+                    Some(before)
+                } else {
+                    None
+                }
             }
         }
     }
