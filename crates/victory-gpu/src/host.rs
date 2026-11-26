@@ -1487,7 +1487,10 @@ impl Host {
             // SAFETY: a plain query.
             if groups.len() > 1
                 && removed_in.is_none()
-                && unsafe { self.device.GetDeviceRemovedReason() }.is_err()
+                && {
+                    // SAFETY: the host retains this live device while executing the submission.
+                    unsafe { self.device.GetDeviceRemovedReason() }.is_err()
+                }
             {
                 removed_in = Some(i);
             }
@@ -2531,7 +2534,10 @@ impl HostList {
         // SAFETY: a plain query on a live buffer.
         if let Some(b) = arguments
             .as_ref()
-            .filter(|b| unsafe { b.GetDesc() }.Width >= bytes)
+            .filter(|b| {
+                // SAFETY: the Option owns a live COM reference to this buffer.
+                unsafe { b.GetDesc() }.Width >= bytes
+            })
         {
             return Some(b.clone());
         }
