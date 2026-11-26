@@ -842,9 +842,13 @@ mod tests {
                 .unwrap();
         assert_eq!(min32.barrier_modes, [8]);
 
-        let strict =
-            lower_wave_mode(&words, WaveMode::with_range(32, 64, false, GroupSync::Strict), false, 32)
-                .unwrap();
+        let strict = lower_wave_mode(
+            &words,
+            WaveMode::with_range(32, 64, false, GroupSync::Strict),
+            false,
+            32,
+        )
+        .unwrap();
         assert_eq!(strict.barrier_modes, [1 | 8]);
 
         let wide =
