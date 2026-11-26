@@ -1430,6 +1430,19 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
             || t.castable.iter().any(|&c| family(c) == family(d.format)))
 }
 
+/// A compatible host texture already published for this title-memory key.
+/// This is intentionally a short MEMORY lookup: the caller must release the
+/// map lock before taking its per-Resource host mutex, matching the lock order
+/// used by `current()` and eviction.
+#[cfg(windows)]
+fn shared_host_texture(address: u64, desc: &ResourceDesc) -> Option<std::sync::Arc<HostTexture>> {
+    let host_desc = host_desc(desc)?;
+    let key = memory_key(address, desc)?;
+    let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let live = map.as_ref()?.get(&key)?.upgrade()?;
+    takes(&live, &host_desc).then_some(live)
+}
+
 /// Whether `this`'s host texture is still its memory's (not replaced by one
 /// with more uses).
 #[cfg(windows)]
@@ -1689,6 +1702,26 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
 }
 
 impl Resource {
+    /// Reuse a compatible texture another Resource has already published
+    /// for the same MemoryKey. The global map lock is released before this
+    /// Resource's cache is locked, avoiding the inverse lock order in
+    /// `current()`.
+    #[cfg(windows)]
+    fn reuse_shared_host(&self) -> Option<std::sync::Arc<HostTexture>> {
+        let shared = shared_host_texture(self.data() as u64, &self.desc)?;
+        let made = self
+            .host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(Some(shared))
+            .clone()
+            .flatten()?;
+        use std::sync::atomic::Ordering::Relaxed;
+        self.out_of_memory.store(0, Relaxed);
+        self.refused_until.store(0, Relaxed);
+        Some(made)
+    }
+
     /// Its host texture, made the first time it is asked for: a list uses
     /// the texture, a heap slot views it, a copy or upload reaches it. Most
     /// of the title's textures are never used (decision 0007, "Host
@@ -1700,6 +1733,12 @@ impl Resource {
             return made;
         }
         if now_ms() < self.refused_until.load(Relaxed) {
+            // A different Resource at the same MemoryKey may have succeeded
+            // during this Resource's cooldown. Reuse it before returning a
+            // null view for a texture that is already available.
+            if let Some(made) = self.reuse_shared_host() {
+                return Some(made);
+            }
             REFUSED_FOR_MEMORY.set(true);
             return None;
         }
@@ -1727,9 +1766,13 @@ impl Resource {
         // once the host may have room (evictions, other textures let go);
         // noted, it had no host texture for the rest of the run.
         if made.is_none() && OUT_OF_MEMORY.take() {
-            // Another caller may have made this shared texture while this
-            // call was waiting for the global memory map. Do not return a
-            // stale null view if that success is already cached.
+            // A distinct Resource with this MemoryKey may have published a
+            // compatible host texture after our allocation failed.
+            if let Some(made) = self.reuse_shared_host() {
+                return Some(made);
+            }
+            // Also cover a same-Resource success published by a caller that
+            // completed immediately before the cache check above.
             if let Some(made) = self.host.lock().unwrap_or_else(|e| e.into_inner()).clone() {
                 if made.is_some() {
                     self.out_of_memory.store(0, Relaxed);
@@ -2846,6 +2889,62 @@ mod tests {
         wait(RETRY_MS + margin);
         assert_eq!(ask(out, E_INVALIDARG), (false, false), "refused for good");
         assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+    }
+
+    /// A distinct Resource at the same MemoryKey can publish a compatible
+    /// host texture while this Resource is in OOM backoff. The first Resource
+    /// must reuse that live texture immediately instead of waiting for retry.
+    #[cfg(windows)]
+    #[test]
+    fn an_oom_resource_reuses_a_shared_memory_texture_from_another_resource() {
+        use windows::Win32::Foundation::E_OUTOFMEMORY;
+
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let memory = Memory::zeroed(64 * 1024, 64 * 1024).unwrap();
+        let address = memory.address();
+        const D32_FLOAT: u32 = 40;
+        let clear = [D32_FLOAT, 1.0f32.to_bits(), 0, 0, 0];
+        let desc = ResourceDesc { flags: DEPTH, ..texture(64, 64, D32_FLOAT, 1) };
+        let make = || {
+            let mut out = std::ptr::null_mut();
+            assert_eq!(
+                create_at_address(
+                    std::ptr::null_mut(),
+                    address,
+                    &desc,
+                    0,
+                    clear.as_ptr().cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut out,
+                ),
+                S_OK
+            );
+            out
+        };
+
+        let first = make();
+        let second = make();
+        FAIL_NEXT.set(Some(E_OUTOFMEMORY));
+        assert!(host_copy(first).is_none(), "first Resource is refused for OOM");
+        assert_eq!(FAIL_NEXT.get(), None, "the failure was injected");
+        assert!(take_refused_for_memory(), "the failed lookup is marked transient");
+
+        let second_host = host_copy(second).expect("second Resource creates the shared texture");
+        let first_host = host_copy(first)
+            .expect("first Resource reuses the already-published shared texture");
+        assert!(std::sync::Arc::ptr_eq(&first_host, &second_host));
+        assert!(
+            !take_refused_for_memory(),
+            "a successful shared-cache lookup must not leave a transient refusal marker"
+        );
+
+        drop(first_host);
+        drop(second_host);
+        assert_eq!(slot::<Release>(second, 0x10)(second), 0);
+        assert_eq!(slot::<Release>(first, 0x10)(first), 0);
+        drop(memory);
     }
 
     /// A heap slot left null because the host had no memory for its texture
