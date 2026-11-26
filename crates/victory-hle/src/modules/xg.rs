@@ -330,12 +330,14 @@ extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
     S_OK
 }
 
-/// The plane, its mip and array slice for a subresource index, and the
-/// tiled bytes and the linear bytes the copy touches.
+/// The plane, its mip and array slice for a subresource index, the
+/// plane's byte offset, and the tiled and linear spans the copy touches.
+#[derive(Debug)]
 struct CopyArgs<'a> {
     layout: &'a Layout,
     mip: u32,
     slice: u32,
+    offset: usize,
     tiled: usize,
     linear: usize,
 }
@@ -346,21 +348,47 @@ fn copy_args(
     subresource: u32,
     row: u32,
     depth: u32,
-) -> Option<CopyArgs<'_>> {
-    let p = c.texture.planes.get(plane as usize)?;
+) -> Result<CopyArgs<'_>, Error> {
+    let p = c.texture.planes.get(plane as usize).ok_or(Error::Invalid)?;
     let l = &p.layout;
+    if c.mips == 0 {
+        return Err(Error::Invalid);
+    }
     let (mip, slice) = (subresource % c.mips, subresource / c.mips);
-    let m = l.mips.get(mip as usize)?;
-    let bytes = m.width as usize * l.desc.element_bytes as usize;
+    let m = l.mips.get(mip as usize).ok_or(Error::Invalid)?;
+    let valid_slice = if l.desc.dimension == Dimension::Tex3d { slice == 0 } else { slice < l.slices };
+    if !valid_slice {
+        return Err(Error::Invalid);
+    }
+    if !l.addressable() {
+        return Err(Error::Unsupported);
+    }
+    let bytes = (m.width as usize).checked_mul(l.desc.element_bytes as usize).ok_or(Error::TooSmall)?;
+    let row_pitch = row as usize;
+    if row_pitch < bytes {
+        return Err(Error::TooSmall);
+    }
+    let slice_bytes = (m.height as usize).checked_sub(1)
+        .and_then(|rows| rows.checked_mul(row_pitch))
+        .and_then(|offset| offset.checked_add(bytes))
+        .ok_or(Error::TooSmall)?;
     let depths = l.subresource_depth(mip) as usize;
-    let linear = (depths - 1) * depth as usize + (m.height as usize - 1) * row as usize + bytes;
-    Some(CopyArgs {
-        layout: l,
-        mip,
-        slice,
-        tiled: (p.offset + l.size) as usize,
-        linear,
-    })
+    let depth_pitch = depth as usize;
+    if depths > 1 && depth_pitch < slice_bytes {
+        return Err(Error::TooSmall);
+    }
+    let linear = depths.checked_sub(1)
+        .and_then(|slices| slices.checked_mul(depth_pitch))
+        .and_then(|offset| offset.checked_add(slice_bytes))
+        .ok_or(Error::TooSmall)?;
+    let offset = usize::try_from(p.offset).map_err(|_| Error::TooSmall)?;
+    let tiled = usize::try_from(l.size).map_err(|_| Error::TooSmall)?;
+    let tiled_end = offset.checked_add(tiled).ok_or(Error::TooSmall)?;
+    let max_slice = isize::MAX as usize;
+    if linear > max_slice || tiled_end > max_slice {
+        return Err(Error::TooSmall);
+    }
+    Ok(CopyArgs { layout: l, mip, slice, offset, tiled, linear })
 }
 
 fn result(r: Result<(), Error>) -> HRESULT {
@@ -369,6 +397,13 @@ fn result(r: Result<(), Error>) -> HRESULT {
         Err(Error::Unsupported) => E_NOTIMPL,
         Err(_) => E_INVALIDARG,
     }
+}
+
+fn finish_copy(c: &Computer, subresource: u32, r: Result<(), Error>, message: &str) -> HRESULT {
+    if r.is_err() {
+        tracing::warn!(?r, desc = ?c.desc, subresource, "{message}");
+    }
+    result(r)
 }
 
 /// `(tiled base, plane, subresource, linear, row pitch, depth pitch)`.
@@ -381,28 +416,23 @@ extern "system" fn copy_into(
     row: u32,
     depth: u32,
 ) -> HRESULT {
-    let c = computer(this);
-    let Some(a) = copy_args(c, plane, subresource, row, depth) else {
-        return E_INVALIDARG;
-    };
     if tiled.is_null() || linear.is_null() {
         return E_INVALIDARG;
     }
-    let offset = c.texture.planes[plane as usize].offset as usize;
-    // SAFETY: the title's memory holds the whole texture and its rows.
+    let c = computer(this);
+    let a = match copy_args(c, plane, subresource, row, depth) {
+        Ok(a) => a,
+        Err(e) => return finish_copy(c, subresource, Err(e), "copy into a texture failed"),
+    };
+    // SAFETY: copy_args checked the plane, slice, addressability and byte spans.
     let (tiled, linear) = unsafe {
         (
-            std::slice::from_raw_parts_mut(tiled.add(offset), a.tiled - offset),
+            std::slice::from_raw_parts_mut(tiled.add(a.offset), a.tiled),
             std::slice::from_raw_parts(linear, a.linear),
         )
     };
-    let r = a
-        .layout
-        .tile(tiled, a.mip, a.slice, linear, row as usize, depth as usize);
-    if r.is_err() {
-        tracing::warn!(?r, desc = ?c.desc, subresource, "copy into a texture failed");
-    }
-    result(r)
+    let r = a.layout.tile(tiled, a.mip, a.slice, linear, row as usize, depth as usize);
+    finish_copy(c, subresource, r, "copy into a texture failed")
 }
 
 /// `(linear, plane, subresource, sample, tiled base, row pitch, depth
@@ -418,28 +448,23 @@ extern "system" fn copy_from(
     row: u32,
     depth: u32,
 ) -> HRESULT {
-    let c = computer(this);
-    let Some(a) = copy_args(c, plane, subresource, row, depth) else {
-        return E_INVALIDARG;
-    };
     if tiled.is_null() || linear.is_null() {
         return E_INVALIDARG;
     }
-    let offset = c.texture.planes[plane as usize].offset as usize;
-    // SAFETY: the title's memory holds the whole texture and its rows.
+    let c = computer(this);
+    let a = match copy_args(c, plane, subresource, row, depth) {
+        Ok(a) => a,
+        Err(e) => return finish_copy(c, subresource, Err(e), "copy out of a texture failed"),
+    };
+    // SAFETY: copy_args checked the plane, slice, addressability and byte spans.
     let (tiled, linear) = unsafe {
         (
-            std::slice::from_raw_parts(tiled.add(offset), a.tiled - offset),
+            std::slice::from_raw_parts(tiled.add(a.offset), a.tiled),
             std::slice::from_raw_parts_mut(linear, a.linear),
         )
     };
-    let r = a
-        .layout
-        .detile(tiled, a.mip, a.slice, linear, row as usize, depth as usize);
-    if r.is_err() {
-        tracing::warn!(?r, desc = ?c.desc, subresource, "copy out of a texture failed");
-    }
-    result(r)
+    let r = a.layout.detile(tiled, a.mip, a.slice, linear, row as usize, depth as usize);
+    finish_copy(c, subresource, r, "copy out of a texture failed")
 }
 
 #[repr(C)]
@@ -780,5 +805,58 @@ mod tests {
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
+    }
+
+    
+    #[test]
+    fn copy_args_rejects_invalid_slices_pitches_and_unaddressable_layouts() {
+        let mut d = desc(8, 8, 1, 28, 0x105);
+        d.depth_or_array = 2;
+        let c = create(&d);
+        let comp = computer(c);
+        assert_eq!(copy_args(comp, 1, 0, 32, 0).unwrap_err(), Error::Invalid);
+        assert_eq!(copy_args(comp, 0, 2, 32, 0).unwrap_err(), Error::Invalid);
+        assert_eq!(copy_args(comp, 0, 0, 31, 0).unwrap_err(), Error::TooSmall);
+        let valid = copy_args(comp, 0, 1, 32, 0).unwrap();
+        assert_eq!((valid.mip, valid.slice, valid.linear), (0, 1, 256));
+        assert_eq!(release(c), 0);
+
+        let d3 = ResourceDesc { dimension: TEXTURE_3D, depth_or_array: 4, ..desc(4, 4, 1, 28, 0x105) };
+        let c3 = create(&d3);
+        let comp3 = computer(c3);
+        assert_eq!(copy_args(comp3, 0, 1, 16, 64).unwrap_err(), Error::Invalid);
+        assert_eq!(copy_args(comp3, 0, 0, 16, 63).unwrap_err(), Error::TooSmall);
+        assert_eq!(copy_args(comp3, 0, 0, 16, 64).unwrap().linear, 256);
+        assert_eq!(release(c3), 0);
+
+        let xor = create(&desc(64, 64, 1, 87, 0x11b));
+        assert_eq!(copy_args(computer(xor), 0, 0, 256, 0).unwrap_err(), Error::Unsupported);
+        assert_eq!(release(xor), 0);
+
+        // Multi-plane depth-stencil (D24_UNORM_S8_UINT): exercise the
+        // plane-local tiled slice offset with a real copy round-trip.
+        type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        type From =
+            extern "system" fn(This, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT;
+
+        let ds = create(&desc(8, 8, 1, 45, 0x105));
+        let comp_ds = computer(ds);
+        let stencil = copy_args(comp_ds, 1, 0, 8, 0).unwrap();
+        assert!(stencil.offset > 0);
+
+        let (into_ds, from_ds): (Into, From) = (slot(ds, 8), slot(ds, 9));
+        let mut tiled_ds = vec![0u8; comp_ds.texture.size as usize];
+        let src_stencil: Vec<u8> = (0..64u8).map(|i| i ^ 0x5A).collect();
+        let mut dst_stencil = vec![0u8; 64];
+        assert_eq!(
+            into_ds(ds, tiled_ds.as_mut_ptr(), 1, 0, src_stencil.as_ptr(), 8, 0),
+            S_OK
+        );
+        assert_eq!(
+            from_ds(ds, dst_stencil.as_mut_ptr(), 1, 0, 0, tiled_ds.as_ptr(), 8, 0),
+            S_OK
+        );
+        assert_eq!(dst_stencil, src_stencil);
+        assert_eq!(release(ds), 0);
     }
 }
