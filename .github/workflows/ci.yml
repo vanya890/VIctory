@@ -28,6 +28,11 @@ jobs:
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: WARP fence early-wake regression
+        env:
+          VICTORY_D3D12_WARP: "1"
+          VICTORY_D3D12_DEBUG: "1"
+        run: cargo test --locked -p victory-gpu --features diagnostics host::submission_completion_tests::submission_wait_confirms_fence_after_an_early_event -- --exact --test-threads=1
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
