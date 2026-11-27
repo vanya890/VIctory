@@ -9,7 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
-    E_FAIL, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+    E_FAIL, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
@@ -28,46 +28,35 @@ fn next_submission_value(current: u64) -> Option<u64> {
     current.checked_add(1).filter(|value| *value != u64::MAX)
 }
 
-/// Confirms that a submitted command list has actually completed before any
-/// GPU-written data is read back or resources are retired.
-fn confirm_submission_completion(
-    signal: windows::core::Result<()>,
-    set_event: impl FnOnce() -> windows::core::Result<()>,
-    wait: impl FnOnce() -> WAIT_EVENT,
-    submitted: u64,
-    completed_value: impl FnOnce() -> u64,
-) -> windows::core::Result<()> {
-    signal?;
-    set_event()?;
-
-    // Preserve GetLastError from WAIT_FAILED: no other Win32 call may run
-    // between WaitForSingleObject and Error::from_thread().
-    let result = wait();
-    if result == WAIT_FAILED {
-        return Err(windows::core::Error::from_thread());
+/// Waits for the submitted value even if the event wait fails or wakes
+/// for an older signal. The caller handles the device-removed sentinel.
+fn wait_for_fence_value(fence: &ID3D12Fence, value: u64, event: HANDLE) -> u64 {
+    // SAFETY: the caller owns the live fence and Win32 event.
+    let mut wait_on_event = match unsafe { fence.SetEventOnCompletion(value, event) } {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, value, "registering a host fence event failed");
+            false
+        }
+    };
+    loop {
+        if wait_on_event {
+            // SAFETY: the event is live, and only this waiter consumes it.
+            let status = unsafe { WaitForSingleObject(event, INFINITE) };
+            if status != WAIT_OBJECT_0 {
+                tracing::warn!(?status, value, "host fence event wait failed");
+                wait_on_event = false;
+            }
+        }
+        // SAFETY: a plain query of the live fence.
+        let completed = unsafe { fence.GetCompletedValue() };
+        if completed >= value {
+            return completed;
+        }
+        if !wait_on_event {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
-    if result != WAIT_OBJECT_0 {
-        return Err(windows::core::Error::new(
-            E_FAIL,
-            format!("host submission event wait returned {:#x}", result.0),
-        ));
-    }
-
-    let completed = completed_value();
-    // D3D12 reserves UINT64_MAX as the device-removed fence value. Check it
-    // before the monotonic comparison, where it would otherwise look complete.
-    if completed == u64::MAX {
-        return Err(windows::core::Error::from_hresult(
-            DXGI_ERROR_DEVICE_REMOVED,
-        ));
-    }
-    if completed < submitted {
-        return Err(windows::core::Error::new(
-            E_FAIL,
-            format!("host submission fence completed {completed}, expected at least {submitted}"),
-        ));
-    }
-    Ok(())
 }
 
 /// A completion API can fail because the device was removed even when the
@@ -102,143 +91,103 @@ fn submission_failure_report(
 
 #[cfg(test)]
 mod submission_completion_tests {
-    use std::cell::Cell;
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
-
-    use windows::Win32::Foundation::{
-        E_FAIL, ERROR_INVALID_HANDLE, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
-    };
+    use windows::Win32::Foundation::E_FAIL;
+    use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
-    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-    use windows::core::{Error, HRESULT};
+    use windows::Win32::System::Threading::CreateEventW;
+    use windows::core::Error;
 
     use super::{
-        confirm_submission_completion, submission_failure_is_device_removed,
-        submission_failure_report,
+        host, next_submission_value, submission_failure_is_device_removed,
+        submission_failure_report, wait_for_fence_value,
     };
 
     const SUBMITTED: u64 = 7;
 
     #[test]
     fn submission_counter_never_uses_the_device_removed_sentinel() {
-        use super::next_submission_value;
-
         assert_eq!(next_submission_value(0), Some(1));
         assert_eq!(next_submission_value(u64::MAX - 2), Some(u64::MAX - 1));
         assert_eq!(next_submission_value(u64::MAX - 1), None);
         assert_eq!(next_submission_value(u64::MAX), None);
     }
 
+    /// A pending queue signal and a native event that was already signalled
+    /// can coexist. The wait must report the D3D12 value that actually ran.
     #[test]
-    fn signaled_wait_at_or_past_target_confirms_completion() {
-        for completed in [SUBMITTED, SUBMITTED + 1] {
-            // SAFETY: create a private, initially signaled auto-reset event.
-            let event = unsafe { CreateEventW(None, false, true, None) }.unwrap();
-            // SAFETY: this test owns the newly created handle.
-            let _owned = unsafe { OwnedHandle::from_raw_handle(event.0) };
-            let result = confirm_submission_completion(
-                Ok(()),
-                || Ok(()),
-                // SAFETY: the owned event remains live throughout the wait.
-                || unsafe { WaitForSingleObject(event, 0) },
-                SUBMITTED,
-                || completed,
+    fn submission_wait_confirms_fence_after_an_early_event() {
+        use std::sync::mpsc;
+
+        let forced_warp = std::env::var_os("VICTORY_D3D12_WARP").is_some();
+        let Some(host) = host() else {
+            assert!(
+                !forced_warp,
+                "VICTORY_D3D12_WARP=1 but host() could not create the required WARP device"
             );
-            result.unwrap();
+            return;
+        };
+        if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+            assert!(
+                host.messages.is_some(),
+                "VICTORY_D3D12_DEBUG=1 but the D3D12 debug layer was not created"
+            );
         }
-    }
 
-    #[test]
-    fn signal_failure_stops_before_event_registration_or_wait() {
-        let set_event_called = Cell::new(false);
-        let wait_called = Cell::new(false);
-        let result = confirm_submission_completion(
-            Err(Error::new(E_FAIL, "signal failed")),
-            || {
-                set_event_called.set(true);
-                Ok(())
-            },
-            || {
-                wait_called.set(true);
-                WAIT_OBJECT_0
-            },
-            SUBMITTED,
-            || panic!("failed signal queried the fence"),
-        );
-        assert!(result.is_err());
-        assert!(!set_event_called.get());
-        assert!(!wait_called.get());
-    }
+        // SAFETY: plain creation of a private queue and its fences.
+        let (queue, gate, completed): (ID3D12CommandQueue, ID3D12Fence, ID3D12Fence) = unsafe {
+            (
+                host.device
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                host.device
+                    .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                    .unwrap(),
+                host.device
+                    .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                    .unwrap(),
+            )
+        };
+        // SAFETY: live private queue and fences.
+        unsafe {
+            queue.Wait(&gate, 1).unwrap();
+            queue.Signal(&completed, 1).unwrap();
+        }
 
-    #[test]
-    fn event_registration_failure_stops_before_wait() {
-        let wait_called = Cell::new(false);
-        let result = confirm_submission_completion(
-            Ok(()),
-            || Err(Error::new(E_FAIL, "SetEventOnCompletion failed")),
-            || {
-                wait_called.set(true);
-                WAIT_OBJECT_0
-            },
-            SUBMITTED,
-            || panic!("failed event registration queried the fence"),
-        );
-        assert!(result.is_err());
-        assert!(!wait_called.get());
-    }
+        std::thread::scope(|scope| {
+            let (starting, started) = mpsc::channel();
+            let (returning, returned) = mpsc::channel();
+            let fence = &completed;
+            scope.spawn(move || {
+                // SAFETY: a private auto-reset event, initially signalled.
+                let event = unsafe { CreateEventW(None, false, true, None) }.unwrap();
+                // SAFETY: this thread owns the newly created event.
+                let _owned = unsafe { OwnedHandle::from_raw_handle(event.0) };
+                starting.send(()).unwrap();
+                let value = wait_for_fence_value(fence, 1, event);
+                returning.send(value).unwrap();
+            });
 
-    #[test]
-    fn failed_wait_preserves_the_win32_error() {
-        // SAFETY: Win32 rejects a null handle without dereferencing it.
-        let wait = unsafe { WaitForSingleObject(HANDLE::default(), 0) };
-        assert_eq!(wait, WAIT_FAILED);
-        let result = confirm_submission_completion(
-            Ok(()),
-            || Ok(()),
-            || wait,
-            SUBMITTED,
-            || panic!("failed wait queried the fence"),
-        );
-        assert_eq!(
-            result.unwrap_err().code(),
-            HRESULT::from_win32(ERROR_INVALID_HANDLE.0)
-        );
-    }
-
-    #[test]
-    fn unexpected_wait_result_is_rejected_without_querying_fence() {
-        let result = confirm_submission_completion(
-            Ok(()),
-            || Ok(()),
-            || WAIT_TIMEOUT,
-            SUBMITTED,
-            || panic!("unexpected wait queried the fence"),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn incomplete_fence_is_rejected() {
-        let result = confirm_submission_completion(
-            Ok(()),
-            || Ok(()),
-            || WAIT_OBJECT_0,
-            SUBMITTED,
-            || SUBMITTED - 1,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn device_removed_sentinel_is_not_treated_as_completion() {
-        let result = confirm_submission_completion(
-            Ok(()),
-            || Ok(()),
-            || WAIT_OBJECT_0,
-            SUBMITTED,
-            || u64::MAX,
-        );
-        assert_eq!(result.unwrap_err().code(), DXGI_ERROR_DEVICE_REMOVED);
+            started
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            let early = returned.recv_timeout(std::time::Duration::from_millis(100));
+            // SAFETY: release the private queue's gated signal.
+            unsafe { gate.Signal(1) }.unwrap();
+            assert!(
+                matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+                "fence wait returned before GPU completion: {early:?}"
+            );
+            assert_eq!(
+                returned
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap(),
+                1
+            );
+        });
     }
 
     #[test]
@@ -277,7 +226,10 @@ mod submission_completion_tests {
     fn ordinary_submission_failure_does_not_claim_device_removal() {
         let error = Error::new(E_FAIL, "event wait failed");
         let removal_reason: windows::core::Result<()> = Ok(());
-        assert!(!submission_failure_is_device_removed(&error, &removal_reason));
+        assert!(!submission_failure_is_device_removed(
+            &error,
+            &removal_reason
+        ));
 
         let report = submission_failure_report(
             SUBMITTED,
@@ -1559,6 +1511,7 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        let mut removed = false;
         let mut removed_in = None;
         // Clear marks forgotten while preparing this submission before its
         // shaders can write fresh marks to the same bitmap slots.
@@ -1573,17 +1526,11 @@ impl Host {
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
             // SAFETY: lists are closed; this queue, fence and event belong
             // to the host, and the submission mutex serializes their use.
-            let completion = unsafe {
+            let signaled = unsafe {
                 self.queue.ExecuteCommandLists(group);
-                confirm_submission_completion(
-                    self.queue.Signal(&self.fence, *submitted),
-                    || self.fence.SetEventOnCompletion(*submitted, self.event),
-                    || WaitForSingleObject(self.event, INFINITE),
-                    *submitted,
-                    || self.fence.GetCompletedValue(),
-                )
+                self.queue.Signal(&self.fence, *submitted)
             };
-            if let Err(error) = completion {
+            if let Err(error) = signaled {
                 // SAFETY: a plain query. On removal, keep the same DRED,
                 // command-note and per-list context as the post-loop path.
                 let removal_reason = unsafe { self.device.GetDeviceRemovedReason() };
@@ -1611,6 +1558,12 @@ impl Host {
                     &during,
                 );
                 fail(format_args!("{report}"));
+            }
+            // SAFETY: the live fence and event are serialized by submitted.
+            if unsafe { wait_for_fence_value(&self.fence, *submitted, self.event) } == u64::MAX {
+                removed = true;
+                removed_in = removed_in.or((groups.len() > 1).then_some(i));
+                break;
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
@@ -1649,7 +1602,7 @@ impl Host {
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
         }
         // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+        if removed || unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}{}",
                 runs.len(),
