@@ -113,12 +113,17 @@ pub(crate) fn plan(
                 if inst.name() != "s_barrier" {
                     continue;
                 }
+                // None means the instruction has no per-lane guard: it runs
+                // for every lane reaching the block. Only an explicit non-TRUE
+                // guard makes this barrier divergent.
+                let guard = st
+                    .guards
+                    .get(b)
+                    .and_then(|g| g.get(i))
+                    .copied()
+                    .flatten();
                 let divergent = st.reach.get(b).is_some_and(|r| *r != Bool::TRUE)
-                    || st
-                        .guards
-                        .get(b)
-                        .and_then(|g| g.get(i))
-                        .is_some_and(|g| *g != Some(Bool::TRUE));
+                    || guard.is_some_and(|g| g != Bool::TRUE);
                 if divergent {
                     relaxed_barriers.insert((b, i));
                 }
