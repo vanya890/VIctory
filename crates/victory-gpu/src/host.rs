@@ -59,6 +59,15 @@ fn wait_for_fence_value(fence: &ID3D12Fence, value: u64, event: HANDLE) -> u64 {
     }
 }
 
+/// Do not enter the fence wait unless the queue accepted the signal.
+fn signal_then_wait(
+    signal: windows::core::Result<()>,
+    wait: impl FnOnce() -> u64,
+) -> windows::core::Result<u64> {
+    signal?;
+    Ok(wait())
+}
+
 /// A completion API can fail because the device was removed even when the
 /// individual call's HRESULT is not DXGI_ERROR_DEVICE_REMOVED. The device's
 /// own removal reason is authoritative for that case.
@@ -91,6 +100,7 @@ fn submission_failure_report(
 
 #[cfg(test)]
 mod submission_completion_tests {
+    use std::cell::Cell;
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
     use windows::Win32::Foundation::E_FAIL;
     use windows::Win32::Graphics::Direct3D12::*;
@@ -99,7 +109,7 @@ mod submission_completion_tests {
     use windows::core::Error;
 
     use super::{
-        host, next_submission_value, submission_failure_is_device_removed,
+        host, next_submission_value, signal_then_wait, submission_failure_is_device_removed,
         submission_failure_report, wait_for_fence_value,
     };
 
@@ -188,6 +198,20 @@ mod submission_completion_tests {
                 1
             );
         });
+    }
+
+    #[test]
+    fn failed_queue_signal_stops_before_fence_wait() {
+        let wait_called = Cell::new(false);
+        let result = signal_then_wait(
+            Err(Error::new(E_FAIL, "signal failed")),
+            || {
+                wait_called.set(true);
+                7
+            },
+        );
+        assert!(result.is_err());
+        assert!(!wait_called.get());
     }
 
     #[test]
@@ -1526,41 +1550,46 @@ impl Host {
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
             // SAFETY: lists are closed; this queue, fence and event belong
             // to the host, and the submission mutex serializes their use.
-            let signaled = unsafe {
+            let completion = unsafe {
                 self.queue.ExecuteCommandLists(group);
-                self.queue.Signal(&self.fence, *submitted)
+                signal_then_wait(
+                    self.queue.Signal(&self.fence, *submitted),
+                    || wait_for_fence_value(&self.fence, *submitted, self.event),
+                )
             };
-            if let Err(error) = signaled {
-                // SAFETY: a plain query. On removal, keep the same DRED,
-                // command-note and per-list context as the post-loop path.
-                let removal_reason = unsafe { self.device.GetDeviceRemovedReason() };
-                let device_removed =
-                    submission_failure_is_device_removed(&error, &removal_reason);
-                if device_removed && groups.len() > 1 {
-                    removed_in = Some(i);
+            let completed = match completion {
+                Ok(completed) => completed,
+                Err(error) => {
+                    // SAFETY: a plain query. On removal, keep the same DRED,
+                    // command-note and per-list context as the post-loop path.
+                    let removal_reason = unsafe { self.device.GetDeviceRemovedReason() };
+                    let device_removed =
+                        submission_failure_is_device_removed(&error, &removal_reason);
+                    if device_removed && groups.len() > 1 {
+                        removed_in = Some(i);
+                    }
+                    let (removal_data, notes, during) = if device_removed {
+                        (
+                            self.removal_data(runs),
+                            last_notes(runs),
+                            removed_during(runs, removed_in),
+                        )
+                    } else {
+                        (String::new(), String::new(), String::new())
+                    };
+                    let report = submission_failure_report(
+                        *submitted,
+                        runs.len(),
+                        &error,
+                        device_removed,
+                        &removal_data,
+                        &notes,
+                        &during,
+                    );
+                    fail(format_args!("{report}"));
                 }
-                let (removal_data, notes, during) = if device_removed {
-                    (
-                        self.removal_data(runs),
-                        last_notes(runs),
-                        removed_during(runs, removed_in),
-                    )
-                } else {
-                    (String::new(), String::new(), String::new())
-                };
-                let report = submission_failure_report(
-                    *submitted,
-                    runs.len(),
-                    &error,
-                    device_removed,
-                    &removal_data,
-                    &notes,
-                    &during,
-                );
-                fail(format_args!("{report}"));
-            }
-            // SAFETY: the live fence and event are serialized by submitted.
-            if unsafe { wait_for_fence_value(&self.fence, *submitted, self.event) } == u64::MAX {
+            };
+            if completed == u64::MAX {
                 removed = true;
                 removed_in = removed_in.or((groups.len() > 1).then_some(i));
                 break;
