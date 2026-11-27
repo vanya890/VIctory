@@ -645,7 +645,26 @@ fn for_dirty_copy_indices(
     for &index in untracked {
         visit(index);
     }
-    for_dirty_indices(by_bit, first_word, last_word, dirty, visit);
+    if by_bit.is_empty() {
+        return;
+    }
+
+    // The word scan is best when the tracker span is denser than the copy
+    // list. For sparse layouts, reading every word between two distant bits
+    // can be much more expensive than the former per-copy loads. Choose the
+    // selector with the smaller upper bound on atomic reads, without a
+    // workload-specific magic threshold.
+    let span_words = last_word.saturating_sub(first_word).saturating_add(1);
+    if span_words > by_bit.len() {
+        for &(bit, index) in by_bit {
+            let word = bit as usize / 64;
+            if dirty(word) & (1u64 << (bit % 64)) != 0 {
+                visit(index);
+            }
+        }
+    } else {
+        for_dirty_indices(by_bit, first_word, last_word, dirty, visit);
+    }
 }
 
 /// At submission, for a list using title memory with view heap `key`
@@ -1060,6 +1079,98 @@ mod tests {
             actual.sort_unstable();
             expected.sort_unstable();
             assert_eq!(actual, expected, "tracked mask {mask:#07b}");
+        }
+    }
+
+    #[test]
+    fn dirty_selector_uses_per_copy_loads_for_sparse_spans() {
+        use std::cell::Cell;
+
+        let by_bit = [(3u32, 4u32), (1_000_070, 0u32), (2_000_200, 2u32)];
+        let last_word = by_bit.last().unwrap().0 as usize / 64;
+        let calls = Cell::new(0usize);
+        let selected = collect_dirty_copy_indices(
+            &by_bit,
+            &[9],
+            0,
+            last_word,
+            |word| {
+                calls.set(calls.get() + 1);
+                match word {
+                    0 => 1 << 3,
+                    1_000_070usize / 64 => 1 << (1_000_070u32 % 64),
+                    2_000_200usize / 64 => 1 << (2_000_200u32 % 64),
+                    _ => 0,
+                }
+            },
+        );
+        assert_eq!(selected, [9, 4, 0, 2]);
+        assert_eq!(calls.get(), by_bit.len(), "sparse selection must not scan the gaps");
+    }
+
+    #[test]
+    fn dirty_selector_keeps_word_scanning_for_dense_spans() {
+        use std::cell::Cell;
+
+        let by_bit: Vec<(u32, u32)> = (0..192).map(|bit| (bit, bit)).collect();
+        let calls = Cell::new(0usize);
+        let selected = collect_dirty_copy_indices(
+            &by_bit,
+            &[],
+            0,
+            2,
+            |word| {
+                calls.set(calls.get() + 1);
+                u64::MAX
+            },
+        );
+        assert_eq!(selected.len(), by_bit.len());
+        assert_eq!(calls.get(), 3, "dense selection should load each tracker word once");
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn dirty_selector_dense_medium_sparse_benchmark() {
+        let rounds = 2_000;
+        for (name, count, stride) in [
+            ("dense", 4_700usize, 1usize),
+            ("medium", 256, 64),
+            ("sparse", 32, 4_096),
+        ] {
+            let by_bit: Vec<(u32, u32)> = (0..count)
+                .map(|i| ((i * stride) as u32, i as u32))
+                .collect();
+            let first = by_bit.first().unwrap().0 as usize / 64;
+            let last = by_bit.last().unwrap().0 as usize / 64;
+            let words = vec![u64::MAX; last + 1];
+            let mut checksum = 0u64;
+
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                for_dirty_indices(&by_bit, first, last, |word| words[word], |i| {
+                    checksum = checksum.wrapping_add(i as u64);
+                });
+            }
+            let word_scan = started.elapsed();
+
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                for_dirty_copy_indices(&by_bit, &[], first, last, |word| words[word], |i| {
+                    checksum = checksum.wrapping_add(i as u64);
+                });
+            }
+            let adaptive = started.elapsed();
+
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                for &(bit, index) in &by_bit {
+                    if words[bit as usize / 64] & (1u64 << (bit % 64)) != 0 {
+                        checksum = checksum.wrapping_add(index as u64);
+                    }
+                }
+            }
+            let per_copy = started.elapsed();
+            eprintln!("{name}: word_scan={word_scan:?}, adaptive={adaptive:?}, per_copy={per_copy:?}, checksum={checksum}");
         }
     }
 
