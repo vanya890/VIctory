@@ -99,6 +99,19 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// Converts a byte range into a raw buffer view. D3D12 raw SRV/UAV offsets
+/// must be 16-byte aligned; expose only complete dwords inside the resource.
+/// Keep the existing 512 MiB per-view cap.
+fn raw_view_range(buffer_len: u64, offset: u64, size: u64) -> Option<(u64, u32)> {
+    if offset % 16 != 0 || offset >= buffer_len {
+        return None;
+    }
+    let available = (buffer_len - offset) / 4;
+    let wanted = (size / 4).max(1);
+    let elements = wanted.min(available).min(1 << 27);
+    (elements != 0).then_some((offset / 4, elements as u32))
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -418,8 +431,8 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
     /// unordered access (`uav`), of `bytes` of `buffer` from byte `first`
-    /// (both multiples of 4), which it holds; a null one for no buffer, or
-    /// for unordered access to a buffer shaders cannot write.
+    /// (16-byte aligned), bounded by the buffer's width. Invalid ranges, absent
+    /// buffers, and non-writable UAVs produce a null view.
     pub(crate) fn raw_view_at(&self, index: u32, buffer: Option<&ID3D12Resource>, first: u64, bytes: u64, uav: bool) {
         let Some(host) = host() else { return };
         let writable = |b: &ID3D12Resource| {
@@ -427,11 +440,18 @@ impl HostHeap {
             unsafe { b.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
         };
         let buffer = buffer.filter(|&b| !uav || writable(b));
-        // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw).
-        let (first, elements) = match buffer {
-            Some(_) => (first / 4, (bytes / 4).clamp(1, 1 << 27) as u32),
-            // A null view still names its size.
-            None => (0, 1),
+        let (buffer, first, elements) = match buffer {
+            Some(b) => {
+                let width = unsafe { b.GetDesc() }.Width;
+                match raw_view_range(width, first, bytes) {
+                    Some((first, elements)) => (Some(b), first, elements),
+                    // Invalid or out-of-range raw views must not expose
+                    // memory beyond the resource; make them null instead.
+                    None => (None, 0, 1),
+                }
+            }
+            // A null view still names one dword.
+            None => (None, 0, 1),
         };
         // SAFETY: a slot of our heap; the buffer is live (or none: a null view).
         unsafe {
@@ -1837,6 +1857,31 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_view_ranges_are_aligned_and_bounded() {
+        assert_eq!(raw_view_range(1024, 0, 1024), Some((0, 256)));
+        assert_eq!(raw_view_range(1024, 16, 32), Some((4, 8)));
+        assert_eq!(raw_view_range(1024, 1008, 64), Some((252, 4)));
+        assert_eq!(raw_view_range(1023, 1008, 64), Some((252, 3)));
+        // Preserve the existing one-dword minimum for short/zero requests.
+        assert_eq!(raw_view_range(1024, 16, 0), Some((4, 1)));
+        assert_eq!(raw_view_range(1024, 16, 3), Some((4, 1)));
+        // A raw view starts on a 16-byte boundary, not merely a dword.
+        assert_eq!(raw_view_range(1024, 4, 16), None);
+        assert_eq!(raw_view_range(1024, 12, 16), None);
+        // No complete dword remains, or the requested start is past the end.
+        assert_eq!(raw_view_range(1024, 1024, 4), None);
+        assert_eq!(raw_view_range(1024, 1020, 4), None);
+        assert_eq!(raw_view_range(3, 0, 3), None);
+        // Huge requests clamp to the resource and the existing 512 MiB cap.
+        assert_eq!(raw_view_range(1024, 1008, u64::MAX), Some((252, 4)));
+        assert_eq!(raw_view_range(1 << 34, 0, 1 << 34), Some((0, 1 << 27)));
+        assert_eq!(raw_view_range(0, 0, 0), None);
+        // FirstElement is UINT64: do not accidentally narrow large offsets to u32.
+        let large_offset = (u64::from(u32::MAX) + 1) * 16;
+        assert_eq!(raw_view_range(1 << 40, large_offset, 64), Some((large_offset / 4, 16)));
+    }
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.
