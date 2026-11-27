@@ -431,8 +431,8 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
     /// unordered access (`uav`), of `bytes` of `buffer` from byte `first`
-    /// (16-byte aligned), bounded by the buffer's width; a null one for no buffer, or
-    /// for unordered access to a buffer shaders cannot write.
+    /// (16-byte aligned), bounded by the buffer's width. Invalid ranges, absent
+    /// buffers, and non-writable UAVs produce a null view.
     pub(crate) fn raw_view_at(&self, index: u32, buffer: Option<&ID3D12Resource>, first: u64, bytes: u64, uav: bool) {
         let Some(host) = host() else { return };
         let writable = |b: &ID3D12Resource| {
