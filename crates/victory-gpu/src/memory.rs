@@ -1122,7 +1122,7 @@ mod tests {
             &[],
             0,
             2,
-            |word| {
+            |_word| {
                 calls.set(calls.get() + 1);
                 u64::MAX
             },
@@ -1158,9 +1158,14 @@ mod tests {
 
             let started = std::time::Instant::now();
             for _ in 0..rounds {
-                for_dirty_copy_indices(&by_bit, &[], first, last, |word| words[word], |i| {
-                    checksum = checksum.wrapping_add(i as u64);
-                });
+                for_dirty_copy_indices(
+                    &by_bit,
+                    &[],
+                    first,
+                    last,
+                    |word| words[word],
+                    |i| checksum = checksum.wrapping_add(i as u64),
+                );
             }
             let adaptive = started.elapsed();
 
