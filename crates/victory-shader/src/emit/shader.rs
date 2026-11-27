@@ -573,8 +573,10 @@ impl Shader {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The flags of what lowering made, as the module writes it: what only
-        // unread values or never-taken edges used is not written.
-        let uses = self.m.uses();
+        // unread values or never-taken edges used is not written. Compute the
+        // CFG/liveness plan once and reuse it for bitcode emission below.
+        let plan = self.m.plan();
+        let uses = self.m.uses_of(&plan);
         for (flag, used) in [
             (flags::RESOURCE_HEAP, uses.heap),
             (flags::SAMPLER_HEAP, uses.sampler_heap),
@@ -916,7 +918,7 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
-        let bitcode = self.m.write();
+        let bitcode = self.m.write_with(&plan);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
