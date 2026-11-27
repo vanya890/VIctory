@@ -3228,8 +3228,13 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// keep what the host texture held.
     #[test]
     fn a_write_into_one_page_uploads_its_rows_alone() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
+        let host = crate::host::host();
+        if crate::switch::on("VICTORY_D3D12_WARP") {
+            assert!(host.is_some(), "WARP validation requested but no D3D12 host was created");
+            eprintln!("WARP host device created");
+        }
+        let Some(host) = host else {
+            return; // no host GPU here, unless WARP was explicitly requested
         };
         let slots = Slots::new(2);
         let read = compile_cs(READ);

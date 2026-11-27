@@ -4,6 +4,17 @@ use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
 };
 
+/// Keep ordinary no-GPU test runs skippable, but never let an explicitly
+/// requested WARP validation pass without creating its software device.
+fn gpu_available() -> bool {
+    let host = crate::host::host();
+    if crate::switch::on("VICTORY_D3D12_WARP") {
+        assert!(host.is_some(), "WARP validation requested but no D3D12 host was created");
+        eprintln!("WARP host device created");
+    }
+    host.is_some()
+}
+
 /// Two adjacent live allocations, ordinary committed memory followed by a
 /// write-watched pool.
 fn mixed_pages() -> usize {
@@ -102,7 +113,7 @@ fn check_rows(address: usize, mixed: bool) {
 
 #[test]
 fn mixed_pages_and_deferred_rows_reach_the_sampled_texture() {
-    if crate::host::host().is_none() {
+    if !gpu_available() {
         return;
     }
     // Both stay allocated, as in the other draw tests: the tracked pages' guards
@@ -212,7 +223,7 @@ fn check_block_rows(address: usize, mixed: bool) {
 
 #[test]
 fn block_compressed_rows_keep_their_block_alignment_across_pages() {
-    if crate::host::host().is_none() {
+    if !gpu_available() {
         return;
     }
     // The pools stay allocated, as in the test above.

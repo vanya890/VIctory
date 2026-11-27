@@ -42,13 +42,17 @@ jobs:
           $single = cargo test -p victory-gpu --features diagnostics --lib draw::tests::a_write_into_one_page_uploads_its_rows_alone --locked -- --list
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (@($single | Select-String -SimpleMatch "draw::tests::a_write_into_one_page_uploads_its_rows_alone: test").Count -ne 1) { throw "Expected exactly one fully tracked row regression test" }
-          cargo test -p victory-gpu --features diagnostics --lib draw::tests::a_write_into_one_page_uploads_its_rows_alone --locked -- --exact --nocapture --test-threads=1
+          $singleRun = cargo test -p victory-gpu --features diagnostics --lib draw::tests::a_write_into_one_page_uploads_its_rows_alone --locked -- --exact --nocapture --test-threads=1 2>&1
+          $singleRun | Write-Output
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($singleRun -match "WARP host device created")) { throw "The fully tracked row test did not confirm WARP host creation" }
           $mixed = cargo test -p victory-gpu --features diagnostics --lib draw::tests::tracked_rows --locked -- --list
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (@($mixed | Select-String -SimpleMatch "draw::tests::tracked_rows::").Count -ne 2) { throw "Expected exactly two mixed/untracked row regression tests" }
-          cargo test -p victory-gpu --features diagnostics --lib draw::tests::tracked_rows --locked -- --nocapture --test-threads=1
+          $mixedRun = cargo test -p victory-gpu --features diagnostics --lib draw::tests::tracked_rows --locked -- --nocapture --test-threads=1 2>&1
+          $mixedRun | Write-Output
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (@($mixedRun | Select-String -SimpleMatch "WARP host device created").Count -ne 2) { throw "Expected both mixed/untracked row tests to confirm WARP host creation" }
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
