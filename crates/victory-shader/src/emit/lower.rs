@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::UserData;
+use super::WaveMode;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
@@ -24,6 +25,7 @@ mod bvh;
 mod shift;
 mod waterfall;
 mod interp;
+mod wave;
 
 type Why = &'static str;
 
@@ -75,6 +77,12 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Barrier modes emitted by the test translation.
+    #[cfg(test)]
+    pub barrier_modes: Vec<u32>,
+    /// Fixed wave size requested by the test translation.
+    #[cfg(test)]
+    pub wave_size: Option<u32>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -99,9 +107,18 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with(parts, WaveMode::default())
+}
+
+#[cfg(test)]
+pub(crate) fn barrier_mode(writes_uavs: bool, relaxed: bool) -> u32 {
+    wave::barrier_mode(writes_uavs, relaxed)
+}
+
+pub(crate) fn lower_with(parts: &Parts, wave: WaveMode) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, wave).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -236,6 +253,13 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// Barriers in a proven single-wave group need fences but no group sync.
+    relaxed_barriers: HashSet<(usize, usize)>,
+    /// Programs requiring native Wave64 lane semantics are refused when unsupported by the host.
+    wave64_unsupported: bool,
+    /// Barrier modes emitted by the test translation.
+    #[cfg(test)]
+    barrier_modes: Vec<u32>,
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
     heap: [bool; 2],
     /// The source DPP fetched for the current instruction, and its index.
@@ -544,7 +568,7 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, wave: WaveMode) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -562,50 +586,9 @@ impl<'a> Lower<'a> {
         });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
-        let mut console_lanes = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
-            // Code reading other lanes needs the console's wave size and
-            // lane order; so do lane masks read as numbers, and LDS shared
-            // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
-                let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
-                    || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
-            }) || {
-                // Masks held as numbers or constant lane sets: the lane
-                // tests its own bit by its console lane.
-                let whens = x.st.exits.iter().filter_map(|e| match *e {
-                    LaneExit::Branch { when, .. } => Some(when),
-                    _ => None,
-                });
-                let mut all: Vec<Bool> =
-                    x.st.guards
-                        .iter()
-                        .flatten()
-                        .flatten()
-                        .copied()
-                        .chain(whens)
-                        .collect();
-                all.sort_unstable();
-                all.dedup();
-                all.into_iter().any(|g| {
-                    x.st.bools
-                        .support(g)
-                        .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
-                })
-            };
-            let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
-            }
         }
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
@@ -652,6 +635,19 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let wave_plan = wave::plan(
+            p,
+            x.st,
+            &x.native.io,
+            x.native.wave64,
+            wave,
+            &x.res.waterfall.reads,
+            s.lds_dwords,
+        );
+        let wave64_unsupported = wave_plan.wave64_unsupported;
+        let relaxed_barriers = wave_plan.relaxed_barriers;
+        let console_lanes = wave_plan.console_lanes;
+        s.wave_size = wave_plan.wave_size;
         Lower {
             s,
             x,
@@ -691,6 +687,10 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            relaxed_barriers,
+            wave64_unsupported,
+            #[cfg(test)]
+            barrier_modes: Vec::new(),
             heap: [false; 2],
             src0: None,
             console_lanes,
@@ -1296,6 +1296,12 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
+        if self.wave64_unsupported {
+            return Err(Stop::Fail(ShaderError::Unsupported {
+                offset: 0,
+                what: "a wave64 program on a host without 64-lane waves (VICTORY_WAVE_WIDE=1)",
+            }));
+        }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1415,6 +1421,10 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            barrier_modes: self.barrier_modes,
+            #[cfg(test)]
+            wave_size: self.s.wave_size,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3513,7 +3523,12 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+                let mode = wave::barrier_mode(
+                    self.writes_uavs,
+                    self.relaxed_barriers.contains(&(b, i)),
+                );
+                #[cfg(test)]
+                self.barrier_modes.push(mode);
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
