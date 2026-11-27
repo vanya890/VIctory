@@ -1935,7 +1935,7 @@ mod tests {
         let (queue, array) = (new_queue(1), status_array(1));
         let mut r = request(
             PAGE_DESTINATION | MEMORY_SOURCE,
-            pages[31..].as_ptr().cast_mut().cast(),
+            pages[31..].as_mut_ptr().cast(),
             plain.len(),
             plain.as_ptr().cast(),
             0,
