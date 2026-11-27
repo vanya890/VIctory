@@ -1898,6 +1898,69 @@ mod tests {
         assert_eq!(seen, plain);
     }
     #[test]
+    fn physical_page_destinations_across_backing_sections() {
+        use crate::modules::xmem;
+
+        // 33 pages cross the default 2 MiB Windows section boundary.
+        let mut pages = vec![0usize; 33];
+        let mut n = pages.len();
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
+            1
+        );
+        assert_eq!(n, pages.len());
+
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            pages.len() * PAGE,
+            0x2000 | 0x2040_0000,
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, pages.len(), pages.as_ptr()),
+            mapped
+        );
+
+        // DirectStorage's offset is within the first 64 KiB page. Start at
+        // page 31 so this write crosses from the 2 MiB section into page 32.
+        let offset = PAGE - 40;
+        let plain = pattern(100);
+        assert!(
+            xmem::page_window(&pages[31..], offset, plain.len()).is_none(),
+            "cross-section writes must use the staging + write_physical fallback"
+        );
+
+        let (queue, array) = (new_queue(1), status_array(1));
+        let mut r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            pages[31..].as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        r.page_offset = offset as u64;
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+
+        // SAFETY: all 33 pages are mapped read-write.
+        let seen = unsafe {
+            std::slice::from_raw_parts(mapped.cast::<u8>().add(31 * PAGE + offset), plain.len())
+        };
+        assert_eq!(seen, plain);
+
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, pages.len(), std::ptr::null()),
+            mapped
+        );
+        assert_eq!(xmem::XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+    }
+
+    #[test]
     fn a_page_list_filled_after_its_request_starts() {
         use crate::modules::xmem;
         let (mut given, mut page) = (1usize, [0usize; 1]);
