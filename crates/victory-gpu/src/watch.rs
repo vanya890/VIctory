@@ -476,6 +476,16 @@ impl Tracked {
         merged
     }
 
+    /// Requeues tracked pages returned by `take` when their copy could not
+    /// be staged. Writes since the take remain in the set too.
+    pub(crate) fn retry(&self, taken: &[(usize, usize)]) {
+        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        for &(from, to) in taken {
+            changed.extend(from / PAGE..to.div_ceil(PAGE));
+        }
+        set_dirty(self.changed.2, !changed.is_empty());
+    }
+
     /// [`Tracked::take`], the runs on pages with nothing mapped apart: they
     /// read as zeros, with no copy to try (each such page cost a dozen
     /// failing kernel reads, 7-30 ms a frame in run perf4).

@@ -2099,6 +2099,8 @@ const QUAD_STRIP: u32 = 20;
 
 #[cfg(test)]
 mod tests {
+    mod tracked_rows;
+
     use super::*;
 
     /// A root signature that indexes the heaps directly needs one of each
@@ -2709,6 +2711,10 @@ uint ps() : SV_Target { return 1; }
     #[test]
     fn root_views_reach_their_copy_and_read_zeros_past_it() {
         let Some(host) = crate::host::host() else {
+            assert!(
+                !crate::switch::on("VICTORY_D3D12_WARP"),
+                "WARP validation requested but no D3D12 host was created"
+            );
             return; // no host GPU here
         };
         const MIB: u64 = 1 << 20;
@@ -3215,6 +3221,68 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (n, x) = submit();
         assert_eq!(n, 1, "mip 1 alone");
         assert!((x - 64.0 / 255.0).abs() < 1e-6, "mip 0 kept: {x}");
+    }
+
+    /// A title write into one page of a large mip detiles and copies the
+    /// rows of that page alone: the rows written arrive, the other rows
+    /// keep what the host texture held.
+    #[test]
+    fn a_write_into_one_page_uploads_its_rows_alone() {
+        let host = crate::host::host();
+        if crate::switch::on("VICTORY_D3D12_WARP") {
+            assert!(host.is_some(), "WARP validation requested but no D3D12 host was created");
+            eprintln!("WARP host device created");
+        }
+        let Some(host) = host else {
+            return; // no host GPU here, unless WARP was explicitly requested
+        };
+        let slots = Slots::new(2);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        // RGBA8 512x512, one mip, linear, in memory the journal follows.
+        let address = crate::watch::tests::pool(32) as u64;
+        let object = texture_at_address(address, &texture_words(512, 512, 28, 0x100, 0));
+        let (_, desc) = crate::resource::texture_memory(object).unwrap();
+        let layout = crate::resource::texture_layout(&desc).unwrap().planes[0].layout.clone();
+        let row = |y: u32| layout.offset(0, 0, y, 0).unwrap() as usize;
+        assert_eq!(row(32) % crate::watch::PAGE, 0, "rows 32.. start a page");
+        assert!(row(64) - row(32) <= crate::watch::PAGE, "rows 32..64 within one page");
+        // SAFETY: the texture's memory (its layout's size).
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, layout.size as usize) };
+        let mut view = [0u32; 10];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        let view = View::Shader(object as usize, Some(view));
+        slots.make(0, &view);
+        let submit = || {
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Srv), &view, false);
+            run(&list, &slots, &read, 0, Some(&out), (8, 8));
+            list.close();
+            let before = crate::texture::copied(object);
+            host.execute(&[&list]);
+            // SAFETY: inside the mapped output, 64x64 texels of 16 bytes.
+            let rows: Vec<f32> = (0..64).map(|y| unsafe { (data as *const [f32; 4]).add(y * 64).read()[0] }).collect();
+            (crate::texture::copied(object) - before, rows)
+        };
+        let is = |x: f32, b: u8| (x - f32::from(b) / 255.0).abs() < 1e-6;
+        let (n, rows) = submit();
+        assert_eq!(n, 1);
+        assert!(rows.iter().all(|&x| is(x, 0x40)), "{rows:?}");
+        let page = crate::watch::PAGE;
+        // SAFETY: one page of the texture's memory, rows 32.. .
+        unsafe { std::ptr::write_bytes((address as usize + row(32)) as *mut u8, 0x80, page) };
+        let (n, rows) = submit();
+        assert_eq!(n, 1);
+        for (y, &x) in rows.iter().enumerate() {
+            assert!(is(x, if y < 32 { 0x40 } else { 0x80 }), "row {y}: {x}");
+        }
+        // SAFETY: the first page, rows ..32.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0xc0, page) };
+        let (n, rows) = submit();
+        assert_eq!(n, 1);
+        for (y, &x) in rows.iter().enumerate() {
+            assert!(is(x, if y < 32 { 0xc0 } else { 0x80 }), "row {y}: {x}");
+        }
     }
 
     /// A depth texture with stencil (the console's 16-bit depth, the
