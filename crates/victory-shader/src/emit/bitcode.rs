@@ -521,8 +521,13 @@ impl Module {
     /// What the instructions [`Module::write`] writes use, of what the
     /// shader flags declare (which must match it, or the validator refuses
     /// the module: "Flags must match usage").
+    #[cfg(test)]
     pub fn uses(&self) -> Uses {
-        let plan = self.plan();
+        self.uses_of(&self.plan())
+    }
+
+    /// [`Module::uses`] computed from an existing [`Plan`].
+    pub(crate) fn uses_of(&self, plan: &Plan) -> Uses {
         let wide = |t: Ty| self.types[t.0 as usize] == TypeDef::Int(64);
         let mut u = Uses::default();
         for b in plan.layout.iter().map(|&b| &self.blocks[b]) {
@@ -655,7 +660,7 @@ impl Module {
     /// (lowering splits them so that loops have dedicated exits and
     /// preheaders, as DXC emits them), or its predecessor would reach the
     /// target twice (the target's phis have one entry per predecessor).
-    fn plan(&self) -> Plan {
+    pub(crate) fn plan(&self) -> Plan {
         let live = self.live();
         let succs = |b: usize| successors(self.term(b));
         let mut seen = vec![false; self.blocks.len()];
@@ -717,14 +722,22 @@ impl Module {
         plan
     }
 
+    #[cfg(test)]
     pub fn write(&self) -> Vec<u8> {
-        let plan = self.plan();
+        self.write_with(&self.plan())
+    }
+
+    /// [`Module::write`] using a precomputed [`Plan`]. The caller must not
+    /// alter blocks, instructions, or terminators, or replace constants used
+    /// by branch conditions, between [`Module::plan`] and this call.
+    /// Appending types, constants, and metadata is fine.
+    pub(crate) fn write_with(&self, plan: &Plan) -> Vec<u8> {
         let (live, layout) = (&plan.live, &plan.layout);
         let term_of = |b: usize| self.term(b);
         let target = |t: usize| plan.pos[plan.to(t)];
         let from = |b: usize| plan.pos[plan.src(b)];
 
-        let ((kept_globals, g_n), (kept, n)) = self.kept(&plan);
+        let ((kept_globals, g_n), (kept, n)) = self.kept(plan);
 
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
@@ -1036,7 +1049,7 @@ pub struct Uses {
 }
 
 /// What [`Module::write`] writes ([`Module::plan`]).
-struct Plan {
+pub(crate) struct Plan {
     /// Per instruction: written.
     live: Vec<bool>,
     /// Per block: reached from the entry.
@@ -1642,6 +1655,27 @@ mod tests {
             let bytes = synthetic(regs, stages, read).write();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
         }
+    }
+
+    #[test]
+    fn reused_plan_matches_fresh_uses_and_write() {
+        let mut m = synthetic(64, 64, 64);
+        let plan = m.plan();
+        let uses_reused = m.uses_of(&plan);
+        // Shader::finish appends types, constants, and metadata after planning.
+        let _float = m.float();
+        let tag = m.md_str("dx.entryPoints");
+        let k = m.i32(0xfeed_beef);
+        let kv = m.md_value(k);
+        let node = m.md_node(vec![Some(tag), Some(kv)]);
+        m.named_md("dx.test", vec![node]);
+
+        let uses_fresh = m.uses();
+        assert_eq!(
+            (uses_reused.heap, uses_reused.sampler_heap, uses_reused.wave, uses_reused.int64),
+            (uses_fresh.heap, uses_fresh.sampler_heap, uses_fresh.wave, uses_fresh.int64),
+        );
+        assert_eq!(m.write_with(&plan), m.write());
     }
 
     #[test]
