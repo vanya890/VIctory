@@ -1877,6 +1877,10 @@ mod tests {
         // Huge requests clamp to the resource and the existing 512 MiB cap.
         assert_eq!(raw_view_range(1024, 1008, u64::MAX), Some((252, 4)));
         assert_eq!(raw_view_range(1 << 34, 0, 1 << 34), Some((0, 1 << 27)));
+        assert_eq!(raw_view_range(0, 0, 0), None);
+        // FirstElement is UINT64: do not accidentally narrow large offsets to u32.
+        let large_offset = (u64::from(u32::MAX) + 1) * 16;
+        assert_eq!(raw_view_range(1 << 40, large_offset, 64), Some((large_offset / 4, 16)));
     }
 
     /// Typed buffer views of integer formats carry their kind in the
