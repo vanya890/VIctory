@@ -1096,11 +1096,14 @@ mod tests {
             last_word,
             |word| {
                 calls.set(calls.get() + 1);
-                match word {
-                    0 => 1 << 3,
-                    1_000_070usize / 64 => 1 << (1_000_070u32 % 64),
-                    2_000_200usize / 64 => 1 << (2_000_200u32 % 64),
-                    _ => 0,
+                if word == 0 {
+                    1u64 << 3
+                } else if word == 1_000_070usize / 64 {
+                    1u64 << (1_000_070u32 % 64)
+                } else if word == 2_000_200usize / 64 {
+                    1u64 << (2_000_200u32 % 64)
+                } else {
+                    0
                 }
             },
         );
