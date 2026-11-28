@@ -72,7 +72,7 @@ A completed research task does not mean its implementation PR is merged. Track i
 - Separate confirmed facts, reproductions, hypotheses, and recommendations.
 - Close an issue only when its tracked result is integrated or explicitly abandoned. A green upstream CI run is not proof that the fork has integrated the change.
 - Do not claim that a task is complete while a required test, review, rebase, or integration step remains.
-- Self-audit notes and any optional review comments must identify concrete code paths, invariants, failure modes, and evidence. Generic approvals such as "looks good" are not meaningful review.
+- Author self-audits and required peer-review comments in swarm mode must identify concrete code paths, invariants, failure modes, and evidence. Generic approvals such as "looks good" are not meaningful review.
 
 ## 3. Branch and pull-request policy
 
@@ -219,7 +219,7 @@ Do not cherry-pick a large integration PR merely because it makes a title reach 
 - Merge authorization in this file applies to the coordinating agent acting after it has completed and documented its self-audit and verified available evidence. It does NOT authorize candidate-controlled workflows to merge themselves, change branch protections, publish secrets, or bypass required checks.
 - If a separate publisher or merge service is introduced, isolate it from candidate execution and independently verify pinned candidate heads, artifacts, and expected refs. Do not trust reports or bundles produced in a candidate-controlled workspace without validation.
 - Never use force-push, admin bypass, disabling branch protection, fabricated reviews, or manually forged green statuses to get a merge through.
-- Human or peer review is welcome and may be required by actual GitHub repository settings, but it is NOT a blanket policy requirement in this file. The coordinating agent is explicitly authorized to make merge decisions under the self-audit and validation gates above.
+- In swarm mode, peer review is required as specified in section 4.1; in genuine single-agent mode, use the documented adversarial self-audit fallback. Human review may also be required by actual GitHub repository settings. The coordinating agent is explicitly authorized to make merge decisions under the applicable review, self-audit, and validation gates above.
 - If repository rules require a human or a permission unavailable to agents, obey the rule and report the blocker. This policy does not grant GitHub permissions or override repository configuration.
 
 ## 8. Correctness rules for low-level changes
