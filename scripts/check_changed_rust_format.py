@@ -62,8 +62,8 @@ def overlaps_changed_lines(
 
 def main() -> int:
     base_ref = os.environ.get("BASE_REF", "dev").strip()
-    if not base_ref:
-        raise RuntimeError("BASE_REF must identify the target branch or previous commit")
+    if not base_ref or re.fullmatch(r"0{40}", base_ref):
+        base_ref = "dev"
 
     command(["git", "fetch", "--no-tags", "origin", base_ref])
     base = "FETCH_HEAD"
