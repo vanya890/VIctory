@@ -66,7 +66,7 @@ jobs:
 
           run_id=""
           for attempt in $(seq 1 60); do
-            response="$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?event=workflow_dispatch&branch=${HEAD_REF}&per_page=50")"
+            response="$(gh api -X GET "repos/${REPOSITORY}/actions/workflows/ci.yml/runs" -f event=workflow_dispatch -f branch="${HEAD_REF}" -F per_page=50)"
             run_id="$(jq -r --arg sha "${HEAD_SHA}" --arg started "${dispatch_started_at}" '.workflow_runs[] | select(.head_sha == $sha and .created_at >= $started and .event == "workflow_dispatch") | .id' <<<"${response}" | head -n 1)"
             if [[ -n "${run_id}" ]]; then break; fi
             sleep 5
