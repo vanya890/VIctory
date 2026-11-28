@@ -166,6 +166,8 @@ An AI agent MAY merge a PR into `dev` without waiting for the project owner when
 
 Before the merge:
 
+Before merging, if no run exists for the exact candidate SHA, invoke the repository CI workflow through `workflow_dispatch` against that candidate ref when the available GitHub interface supports it. Verify the resulting run's `head_sha` exactly matches the reviewed candidate. A run for an earlier SHA, another branch, or only the PR merge commit is not evidence for the candidate head. If dispatch is unavailable, do not claim CI passed or bypass the validation gate; report the concrete tooling limitation and use a supported repository event to request checks.
+
 1. Re-fetch the PR and confirm it is open, not draft, mergeable, and targets `dev`.
 2. Re-check the exact head SHA, base SHA, peer review results (or documented solo-mode justification), unresolved threads, and CI status.
 3. Confirm no newer commit was pushed after the final reviews and successful checks. Any new commit invalidates reviews of affected code and requires re-review.
