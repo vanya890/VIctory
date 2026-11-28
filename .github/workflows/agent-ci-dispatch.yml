@@ -1,0 +1,82 @@
+name: Agent CI Dispatch Bridge
+run-name: Dispatch CI · Issue #${{ github.event.issue.number }}
+
+on:
+  issues:
+    types: [opened]
+
+permissions: {}
+
+jobs:
+  dispatch:
+    if: ${{ github.event.issue.user.login == 'vanya890' && github.event.sender.login == 'vanya890' && startsWith(github.event.issue.title, '[agent-ci]') && !github.event.issue.pull_request }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Validate exact PR head
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const body = process.env.ISSUE_BODY ?? '';
+          let command;
+          try { command = JSON.parse(body); } catch { throw new Error('Issue body must be a JSON object.'); }
+          if (!command || Array.isArray(command) || typeof command !== 'object') throw new Error('Command must be a JSON object.');
+          if (Object.keys(command).sort().join(',') !== 'pr,sha') throw new Error('Allowed fields are exactly: pr, sha.');
+          if (!Number.isSafeInteger(command.pr) || command.pr < 1) throw new Error('pr must be a positive integer.');
+          if (typeof command.sha !== 'string' || !/^[0-9a-f]{40}$/i.test(command.sha)) throw new Error('sha must be a full 40-character commit SHA.');
+          const repo = process.env.REPOSITORY;
+          const response = await fetch(`${process.env.GITHUB_API_URL}/repos/${repo}/pulls/${command.pr}`, {
+            headers: { authorization: `Bearer ${process.env.GH_TOKEN}`, accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' }
+          });
+          if (!response.ok) throw new Error(`GitHub PR lookup failed: HTTP ${response.status} ${await response.text()}`);
+          const pr = await response.json();
+          if (pr.state !== 'open') throw new Error('PR must be open.');
+          if (pr.base?.ref !== 'dev') throw new Error('Only PRs targeting dev may be dispatched.');
+          if (pr.head?.repo?.full_name !== repo) throw new Error('PR head must belong to this repository.');
+          if (pr.head?.sha?.toLowerCase() !== command.sha.toLowerCase()) throw new Error('Requested SHA is not the current exact PR head.');
+          if (typeof pr.head?.ref !== 'string' || !pr.head.ref || pr.head.ref.includes(':')) throw new Error('Invalid PR head branch.');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `head_ref=${pr.head.ref}\nhead_sha=${pr.head.sha}\npr_number=${pr.number}\n`);
+          console.log(`Validated PR #${pr.number}: ${pr.head.ref} @ ${pr.head.sha}`);
+          NODE
+
+      - name: Dispatch CI and publish the exact run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          HEAD_REF: ${{ steps.candidate.outputs.head_ref }}
+          HEAD_SHA: ${{ steps.candidate.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.candidate.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          dispatch_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          gh api --method POST "repos/${REPOSITORY}/actions/workflows/ci.yml/dispatches" -f ref="${HEAD_REF}"
+          echo "workflow_dispatch accepted for ${HEAD_REF} @ ${HEAD_SHA}"
+
+          run_id=""
+          for attempt in $(seq 1 60); do
+            response="$(gh api -X GET "repos/${REPOSITORY}/actions/workflows/ci.yml/runs" -f event=workflow_dispatch -f branch="${HEAD_REF}" -F per_page=50)"
+            run_id="$(jq -r --arg sha "${HEAD_SHA}" --arg started "${dispatch_started_at}" '.workflow_runs[] | select(.head_sha == $sha and .created_at >= $started and .event == "workflow_dispatch") | .id' <<<"${response}" | head -n 1)"
+            if [[ -n "${run_id}" ]]; then break; fi
+            sleep 5
+          done
+
+          if [[ -z "${run_id}" ]]; then
+            gh api --method POST "repos/${REPOSITORY}/issues/${ISSUE_NUMBER}/comments" -f body="CI dispatch was accepted for PR #${PR_NUMBER} (${HEAD_SHA}), but no matching run appeared within five minutes. Check the Actions page manually."
+            exit 1
+          fi
+
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${run_id}"
+          gh api --method POST "repos/${REPOSITORY}/issues/${ISSUE_NUMBER}/comments" -f body="CI dispatched for PR #${PR_NUMBER} at exact head \`${HEAD_SHA}\`.\n\nRun: ${run_url}"
+          echo "Dispatched run: ${run_url}"
