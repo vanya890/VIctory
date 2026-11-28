@@ -124,11 +124,11 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         for &l in lists {
             for segment in crate::list::segments(l) {
                 let waits = segment.waits();
-                held.push(this as usize, Item::Segment(segment, waits));
+                held.push(this, Item::Segment(segment, waits));
             }
         }
         account().submissions += 1;
-        pump(&mut held, Why::Submission);
+        pump(held, Why::Submission);
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
@@ -176,12 +176,50 @@ impl Drop for KeptFence {
     }
 }
 
-/// Every queue's held work.
+/// Every queue's held work, pinning each queue object while its FIFO is
+/// non-empty so releasing a queue with pending work neither frees it before
+/// `kind(queue)` runs nor lets a newly created queue alias its address.
 #[cfg(windows)]
-type Holding = crate::hold::Held<std::sync::Arc<crate::host::HostList>, KeptFence>;
+struct Holding {
+    held: crate::hold::Held<std::sync::Arc<crate::host::HostList>, KeptFence>,
+    pinned: Vec<usize>,
+}
 
 #[cfg(windows)]
-static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(crate::hold::Held::new());
+impl Holding {
+    const fn new() -> Self {
+        Holding { held: crate::hold::Held::new(), pinned: Vec::new() }
+    }
+
+    fn push(&mut self, queue: This, item: Item<std::sync::Arc<crate::host::HostList>, KeptFence>) {
+        let key = queue as usize;
+        if !self.pinned.contains(&key) {
+            object::add_ref(queue);
+            self.pinned.push(key);
+        }
+        self.held.push(key, item);
+    }
+
+    fn holds_work(&self, queue: usize) -> bool {
+        self.held.holds_work(queue)
+    }
+
+    fn take_drained(&mut self) -> Vec<This> {
+        let mut drained = Vec::new();
+        self.pinned.retain(|&q| {
+            if self.held.holds_work(q) {
+                true
+            } else {
+                drained.push(q as This);
+                false
+            }
+        });
+        drained
+    }
+}
+
+#[cfg(windows)]
+static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(Holding::new());
 
 #[cfg(windows)]
 fn held() -> std::sync::MutexGuard<'static, Holding> {
@@ -191,7 +229,7 @@ fn held() -> std::sync::MutexGuard<'static, Holding> {
 /// Runs held work that may run now (`why` for the frame line).
 pub(crate) fn pump_held(why: Why) {
     #[cfg(windows)]
-    pump(&mut held(), why);
+    pump(held(), why);
     #[cfg(not(windows))]
     let _ = why;
 }
@@ -200,8 +238,8 @@ pub(crate) fn pump_held(why: Why) {
 /// value, our timer).
 pub(crate) fn pump_held_if_free(why: Why) {
     #[cfg(windows)]
-    if let Ok(mut held) = HELD.try_lock() {
-        pump(&mut held, why);
+    if let Ok(held) = HELD.try_lock() {
+        pump(held, why);
     }
     #[cfg(not(windows))]
     let _ = why;
@@ -215,13 +253,13 @@ pub(crate) fn pump_held_if_free(why: Why) {
 const VALVE: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[cfg(windows)]
-fn pump(held: &mut Holding, why: Why) {
-    if held.is_empty() {
+fn pump(mut guard: std::sync::MutexGuard<'static, Holding>, why: Why) {
+    if guard.held.is_empty() {
         return;
     }
     let Some(host) = crate::host::host() else { return };
     let read = read_value;
-    for (queue, waits) in held.force_older_than(VALVE) {
+    for (queue, waits) in guard.held.force_older_than(VALVE) {
         account().forced += 1;
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
     }
@@ -240,11 +278,8 @@ fn pump(held: &mut Holding, why: Why) {
         crate::fence::set(f.as_this(), value);
         drop(f);
     };
-    let pumped = held.pump(&mut crate::hold::World {
-        read: &read,
-        fence: &fence,
-        run: &mut run,
-        signal: &mut signal,
+    let pumped = guard.held.pump(&mut crate::hold::World {
+        read: &read, fence: &fence, run: &mut run, signal: &mut signal,
     });
     if pumped.segments > 0 || pumped.unknown > 0 {
         let mut a = account();
@@ -256,9 +291,17 @@ fn pump(held: &mut Holding, why: Why) {
             a.released.push((kind(queue), waited, why));
         }
     }
-    // Once work stays held, a timer tests it every 2 ms: memory the title
-    // writes from the CPU, or the valve, may let it go with no call of ours.
-    if held.blocked(&read).is_empty() {
+    // Resolve all queue metadata while pins and the HELD guard are alive.
+    let drained = guard.take_drained();
+    // Pumped::blocked is the final queue-state result. Do not re-read wait
+    // words by calling blocked() again on the hot path.
+    let has_blocked = pumped.blocked;
+    drop(guard);
+    // Final COM Release may acquire PRIVATE; never do it while holding HELD.
+    for queue in drained {
+        release(queue);
+    }
+    if !has_blocked {
         return;
     }
     static TIMER: std::sync::Once = std::sync::Once::new();
@@ -313,7 +356,12 @@ fn account_frame(frame: u64) {
     let (cuts, early) = crate::list::take_cuts();
     let (fence_waits, fence_waited) = crate::fence::take_waited();
     let a = std::mem::take(&mut *account());
-    let blocked = held().blocked(&read_value);
+    let blocked: Vec<_> = {
+        let guard = held();
+        guard.held.blocked(&read_value).into_iter()
+            .map(|(queue, items, waited, unmet)| (kind(queue), items, waited, unmet))
+            .collect()
+    };
     if a.released.is_empty() && blocked.is_empty() && a.forced == 0 && a.unknown == 0 && a.mappings == 0 {
         return;
     }
@@ -344,16 +392,16 @@ fn account_frame(frame: u64) {
         "held work released this frame (queue type, ms, by): {:?}",
         a.released.iter().map(|(k, d, w)| (k, d.as_secs_f64() * 1e3, w)).collect::<Vec<_>>()
     );
-    for (queue, items, waited, unmet) in &blocked {
+    for (queue_kind, items, waited, unmet) in &blocked {
         let level_warn = blocked.len() > 1;
         let unmet: Vec<String> = unmet
             .iter()
             .map(|w| format!("{:#x} cmp {} {:#x} (is {:?})", w.address, w.comparison, w.reference, read_value(w.address, w.bytes)))
             .collect();
         if level_warn {
-            tracing::warn!(frame, queue = kind(*queue), items, waited_ms = waited.as_millis(), ?unmet, "two or more queues hold work at the present");
+            tracing::warn!(frame, queue = *queue_kind, items, waited_ms = waited.as_millis(), ?unmet, "two or more queues hold work at the present");
         } else {
-            tracing::info!(frame, queue = kind(*queue), items, waited_ms = waited.as_millis(), ?unmet, "a queue holds work at the present");
+            tracing::info!(frame, queue = *queue_kind, items, waited_ms = waited.as_millis(), ?unmet, "a queue holds work at the present");
         }
     }
     if a.forced > 0 || a.unknown > 0 || a.mappings > 0 {
@@ -396,6 +444,19 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
+/// `SuspendX(flags)`: on the console, a title's suspend routine stops its
+/// queues' GPU work (`ResumeX` restarts it). Our submissions have run when
+/// Execute returns (work held for a wait runs as soon as the wait is met),
+/// and a suspended title is never resumed here, since the process ends
+/// (`lifecycle::end_title`), so there is nothing to stop.
+extern "system" fn suspend_x(_: This, flags: u32) -> HRESULT {
+    tracing::debug!(flags, "command queue suspended");
+    S_OK
+}
+/// `ResumeX`: nothing was stopped (see [`suspend_x`]).
+extern "system" fn resume_x(_: This) -> HRESULT {
+    S_OK
+}
 /// At once, or behind the work the queue holds (its fence, and the memory
 /// the title reads it at, move only once that work has run).
 extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
@@ -406,12 +467,12 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     {
         let mut held = held();
         if held.holds_work(this as usize) {
-            held.push(this as usize, Item::Signal(KeptFence::new(fence), value));
+            held.push(this, Item::Signal(KeptFence::new(fence), value));
         } else {
             crate::fence::set(fence, value);
         }
         // Another queue may wait for this fence.
-        pump(&mut held, Why::Signal);
+        pump(held, Why::Signal);
     }
     #[cfg(not(windows))]
     {
@@ -429,8 +490,8 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if crate::host::host().is_some() {
         let mut held = held();
         if crate::fence::value(fence) < value {
-            held.push(this as usize, Item::FenceWait(KeptFence::new(fence), value));
-            pump(&mut held, Why::Wait);
+            held.push(this, Item::FenceWait(KeptFence::new(fence), value));
+            pump(held, Why::Wait);
         }
     }
     #[cfg(not(windows))]
@@ -557,13 +618,9 @@ extern "system" fn present(
         && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
-        use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
-        use windows::core::Interface;
-
-        const COPY_SOURCE: u32 = 0x800;
         // SAFETY: the title passes the plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
-        let mut resources: Vec<(This, ID3D12Resource, u32, bool)> =
+        let mut resources: Vec<(This, std::sync::Arc<crate::resource::HostTexture>)> =
             Vec::with_capacity(slice.len());
         for plane in slice {
             if plane.count == 0 || plane.resources.is_null() {
@@ -571,34 +628,22 @@ extern "system" fn present(
             }
             // SAFETY: the plane lists `count` resources.
             let resource = unsafe { *plane.resources };
-            if let Some(texture) = crate::resource::host_resource(resource) {
-                // Distinct title resources may refer to one host texture.
-                // Keep its original state for every plane and restore it once.
-                let prior = resources.iter().find_map(|(_, earlier, state, _)| {
-                    (earlier.as_raw() == texture.as_raw()).then_some(*state)
-                });
-                let state = prior.unwrap_or_else(|| {
-                    crate::resource::host_transition(resource, COPY_SOURCE)
-                        .map_or(COPY_SOURCE, |(_, before)| before)
-                });
-                resources.push((resource, texture, state, prior.is_none()));
+            if let Some(copy) = crate::resource::host_copy(resource) {
+                resources.push((resource, copy));
             }
         }
         if !resources.is_empty() {
-            let sources: Vec<(&_, u32)> = resources
+            let sources: Vec<_> = resources
                 .iter()
-                .map(|(_, tex, state, _)| (tex, *state))
+                .map(|(resource, copy)| {
+                    crate::host::PresentPlane::Tracked(copy, crate::resource::view_format_of(*resource, copy))
+                })
                 .collect();
-            let shown = host.present(&sources, frame);
-            for &(resource, _, state, first) in &resources {
-                if first {
-                    crate::resource::host_transition(resource, state);
-                }
-            }
+            let (shown, state) = host.present_planes(&sources, frame);
             #[cfg(feature = "diagnostics")]
-            blinks(frame, resources[0].0, resources[0].2, shown);
+            blinks(frame, resources[0].0, state, shown);
             #[cfg(not(feature = "diagnostics"))]
-            let _ = shown;
+            let _ = (shown, state);
         }
     }
     #[cfg(not(windows))]
@@ -731,7 +776,7 @@ extern "system" fn desc(this: This, out: *mut QueueDesc) {
 /// The queue methods by their slot in older titles' queues (the 2020-era
 /// layout): IUnknown 3, object 4, device child 1, queue 26 (12 as on PC,
 /// then console ones).
-const METHODS: [(usize, *const ()); 15] = [
+const METHODS: [(usize, *const ()); 17] = [
     (0, query as *const ()),
     (2, release as *const ()),
     (7, object::parent_device as *const ()), // 0x38
@@ -742,6 +787,8 @@ const METHODS: [(usize, *const ()); 15] = [
     (14, signal as *const ()),               // 0x70
     (15, wait as *const ()),                 // 0x78
     (16, timestamp_frequency as *const ()),  // 0x80
+    (21, suspend_x as *const ()),            // 0xa8
+    (22, resume_x as *const ()),             // 0xb0
     (26, desc as *const ()),                 // 0xd0
     (29, copy_page_mappings as *const ()),   // 0xe8 page mapping batch
     (30, present as *const ()),              // 0xf0
@@ -854,6 +901,134 @@ mod tests {
         assert_eq!(restored, TARGET, "the two planes share one rendering state");
     }
 
+    /// Presenting a texture while another queue submits work on it must never
+    /// expose a phantom COPY_SOURCE state, emit a stale before-state barrier,
+    /// or clobber the state left by the concurrent submission.
+    #[cfg(windows)]
+    #[test]
+    fn present_does_not_expose_copy_source_or_clobber_concurrent_state() {
+        use std::collections::HashMap;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET,
+        };
+        use windows::core::Interface;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const TARGET: u32 = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        const SHADER: u32 = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
+        let address = crate::watch::tests::pool(1);
+        let null = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        #[repr(align(8))]
+        struct TextureWords([u32; 14]);
+        let desc = TextureWords([3, 0, 0, 0, 32, 0, 32, 1 | 1 << 16, 28, 1, 0, 1, 1, 0]);
+        let mut resource = null;
+        assert_eq!(
+            crate::resource::create_at_address(
+                null,
+                address as u64,
+                desc.0.as_ptr().cast(),
+                0,
+                null.cast(),
+                &iid,
+                &mut resource,
+            ),
+            S_OK
+        );
+        let copy = crate::resource::host_copy(resource).unwrap();
+        let raw = copy.texture.as_raw() as usize;
+        let setup = host.new_list().unwrap();
+        crate::list::ensure_state(&setup, resource, TARGET);
+        // SAFETY: live render target on an open list.
+        unsafe {
+            setup.list.ClearRenderTargetView(
+                host.rtv(&copy.texture, None),
+                &[0.2, 0.4, 0.6, 1.0],
+                None,
+            );
+        }
+        setup.close();
+        host.execute(&[&setup]);
+        assert_eq!(copy.state.load(Ordering::Relaxed), TARGET);
+
+        // Hold the presenter lock while another thread enters `present`, so a
+        // concurrent `Host::execute` runs between entering `present` and the
+        // present copy executing.
+        let hold = crate::host::tests::hold_presenter(host);
+        let (started_tx, started_rx) = mpsc::channel();
+        let resource_addr = resource as usize;
+        let presenter_thread = std::thread::spawn(move || {
+            let resource = resource_addr as This;
+            let plane = Plane {
+                token: 0,
+                count: 1,
+                resources: std::ptr::from_ref(&resource),
+                _rest: [0; 6],
+            };
+            let _ = crate::host::tests::issued();
+            started_tx.send(()).unwrap();
+            let hr = present(std::ptr::null(), 1, &plane, std::ptr::null());
+            (hr, crate::host::tests::issued())
+        });
+        started_rx.recv().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while copy.state.load(Ordering::Relaxed) == TARGET && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let observed_during_present = copy.state.load(Ordering::Relaxed);
+
+        let mut gpu_states = HashMap::from([(raw, TARGET)]);
+        let _ = crate::host::tests::issued();
+        let concurrent = host.new_list().unwrap();
+        crate::list::ensure_state(&concurrent, resource, SHADER);
+        concurrent.close();
+        host.execute(&[&concurrent]);
+        let concurrent_barriers = crate::host::tests::issued();
+        let concurrent_replay = crate::host::tests::replay(&concurrent_barriers, &mut gpu_states);
+
+        drop(hold);
+        let (hr, present_barriers) = presenter_thread.join().unwrap();
+        let present_replay = crate::host::tests::replay(&present_barriers, &mut gpu_states);
+        let state_after_present = copy.state.load(Ordering::Relaxed);
+
+        let _ = crate::host::tests::issued();
+        let followup = host.new_list().unwrap();
+        crate::list::ensure_state(&followup, resource, TARGET);
+        followup.close();
+        host.execute(&[&followup]);
+        let followup_barriers = crate::host::tests::issued();
+        let followup_replay = crate::host::tests::replay(&followup_barriers, &mut gpu_states);
+
+        let release = slot::<extern "system" fn(This) -> u32>(resource, 0x10);
+        assert_eq!(release(resource), 0);
+        drop((setup, concurrent, followup, copy));
+        crate::watch::tests::free(address);
+
+        assert_eq!(hr, S_OK);
+        assert_eq!(
+            observed_during_present, TARGET,
+            "present must not mutate tracked state before acquiring the submission lock"
+        );
+        assert_eq!(concurrent_replay, Ok(()), "concurrent submission barriers");
+        assert_eq!(present_replay, Ok(()), "present copy barriers");
+        assert_eq!(
+            state_after_present, SHADER,
+            "present must not clobber the state left by a concurrent submission"
+        );
+        assert_eq!(followup_replay, Ok(()), "follow-up submission barriers");
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's
     /// own table decides.
@@ -919,6 +1094,34 @@ mod tests {
         assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
         assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
+    }
+
+    /// Grand Theft Auto VI's suspend routine calls `SuspendX(0)` at 0xb8;
+    /// `ResumeX` follows at 0xc0. Both succeed, in either queue layout.
+    #[test]
+    fn queues_suspend_and_resume() {
+        let (old, new) = (queue_table(false), queue_table(true));
+        assert_eq!(new[23], suspend_x as *const ()); // 0xb8
+        assert_eq!(new[24], resume_x as *const ()); // 0xc0
+        assert_eq!(old[21], new[23]); // 0xa8 in older queues
+        assert_eq!(old[22], new[24]); // 0xb0
+        for (table, at) in [(&FUNCTIONS, 0xa8), (&NEWER_FUNCTIONS, 0xb8)] {
+            let object = Queue {
+                object: Object::new(table),
+                kind: 0,
+                desc: QueueDesc {
+                    kind: 0,
+                    priority: 0,
+                    flags: 0,
+                    nodes: 0,
+                },
+            };
+            let q: This = std::ptr::from_ref(&object).cast();
+            let suspend = slot::<extern "system" fn(This, u32) -> HRESULT>(q, at);
+            let resume = slot::<extern "system" fn(This) -> HRESULT>(q, at + 8);
+            assert_eq!(suspend(q, 0), S_OK);
+            assert_eq!(resume(q), S_OK);
+        }
     }
 
     #[test]
@@ -1149,6 +1352,269 @@ mod tests {
         for obj in [
             list_a1, list_b1, list_b2, list_b3, list_a3, alloc, queue_a, queue_b, buf,
         ] {
+            assert_eq!(slot::<Release>(obj, 0x10)(obj), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn released_queue_holding_work_stays_alive_and_does_not_alias_new_queues() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let null = std::ptr::null();
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+        type Release = extern "system" fn(This) -> u32;
+        const GREATER_EQUAL: u32 = 7;
+
+        let mut words = Box::new([0u64; 2]);
+        let gate_ptr = (&raw mut words[0]) as u64;
+        let done_ptr = (&raw mut words[1]) as u64;
+        struct Unblock(u64);
+        impl Drop for Unblock {
+            fn drop(&mut self) {
+                // SAFETY: `words` outlives this guard; unblock any held wait on panic.
+                unsafe { (self.0 as *mut u64).write_volatile(1) };
+                pump_held(Why::Fence);
+            }
+        }
+        let _unblock = Unblock(gate_ptr);
+
+        let compute_desc = QueueDesc {
+            kind: 2,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let graphics_desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut q1, mut allocator, mut l1, mut l2) = (null, null, null, null);
+        assert_eq!(create(null, &compute_desc, &QUEUE_IIDS[0], &mut q1), S_OK);
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 2, allocator, null, &list_iid, &mut l1),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut l2),
+            S_OK
+        );
+
+        // `q1` waits for `gate >= 1`, then writes `done = 42`.
+        crate::list::wait64(l1, gate_ptr, GREATER_EQUAL, 1, 0);
+        crate::list::write64(l1, done_ptr, 42, 0, 0);
+        assert_eq!(slot::<Close>(l1, 0x48)(l1), S_OK);
+        slot::<Execute>(q1, 0x50)(q1, 1, &l1);
+        assert_eq!(
+            // SAFETY: `words` is live.
+            unsafe { (done_ptr as *const u64).read_volatile() },
+            0,
+            "q1 stays held while gate == 0"
+        );
+
+        // Title legally releases `q1` while its held work is still pending.
+        let q1_addr = q1 as usize;
+        let refs_left = slot::<Release>(q1, 0x10)(q1);
+
+        // Create replacement queues; without pinning, one reuses `q1_addr` and
+        // its unblocked submission gets queued behind dead `q1`'s blocked wait.
+        let mut replacements = Vec::new();
+        let mut q2 = null;
+        for _ in 0..1024 {
+            let mut candidate = null;
+            assert_eq!(
+                create(null, &graphics_desc, &QUEUE_IIDS[0], &mut candidate),
+                S_OK
+            );
+            replacements.push(candidate);
+            if candidate as usize == q1_addr {
+                q2 = candidate;
+                break;
+            }
+        }
+        if q2.is_null() {
+            q2 = replacements[0];
+        }
+
+        // `q2` writes `gate = 1` with no waits — must run immediately and unblock `q1`.
+        crate::list::write64(l2, gate_ptr, 1, 0, 0);
+        assert_eq!(slot::<Close>(l2, 0x48)(l2), S_OK);
+        slot::<Execute>(q2, 0x50)(q2, 1, &l2);
+
+        // SAFETY: `words` is live and submissions are synchronous once unblocked.
+        let gate_after = unsafe { (gate_ptr as *const u64).read_volatile() };
+        // SAFETY: `words` is live and `q1` completes synchronously when unblocked.
+        let done_after = unsafe { (done_ptr as *const u64).read_volatile() };
+        assert_eq!(
+            (gate_after, done_after, q2 as usize != q1_addr, refs_left),
+            (1, 42, true, 1),
+            "q2 must not deadlock behind or alias released q1 while HELD pins q1"
+        );
+        assert_eq!(host.log_messages(), None);
+
+        for q in replacements {
+            assert_eq!(slot::<Release>(q, 0x10)(q), 0);
+        }
+        for obj in [l1, l2, allocator] {
+            assert_eq!(slot::<Release>(obj, 0x10)(obj), 0);
+        }
+        assert!(
+            !held().pinned.contains(&q1_addr),
+            "HELD must release its pin once q1 drains"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn held_queue_pinning_handles_multiple_items_signals_waits_and_concurrent_accounting() {
+        use std::sync::Barrier;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let null = std::ptr::null();
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+        type Signal = extern "system" fn(This, This, u64) -> HRESULT;
+        type Wait = extern "system" fn(This, This, u64) -> HRESULT;
+        type FenceSignal = extern "system" fn(This, u64) -> HRESULT;
+        type FenceCompleted = extern "system" fn(This) -> u64;
+        type Release = extern "system" fn(This) -> u32;
+        const GREATER_EQUAL: u32 = 7;
+
+        let mut words = Box::new([0u64; 3]);
+        let gate_ptr = (&raw mut words[0]) as u64;
+        let out1_ptr = (&raw mut words[1]) as u64;
+        let out2_ptr = (&raw mut words[2]) as u64;
+
+        let copy_desc = QueueDesc {
+            kind: 3,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut q, mut allocator, mut l1, mut l2, mut fence) = (null, null, null, null, null);
+        assert_eq!(create(null, &copy_desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 3, allocator, null, &list_iid, &mut l1),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 3, allocator, null, &list_iid, &mut l2),
+            S_OK
+        );
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+            S_OK
+        );
+
+        // Enqueue two held lists plus a held Signal on the same queue: HELD must
+        // add exactly one reference for the queue, not one per item.
+        crate::list::wait64(l1, gate_ptr, GREATER_EQUAL, 1, 0);
+        crate::list::write64(l1, out1_ptr, 11, 0, 0);
+        assert_eq!(slot::<Close>(l1, 0x48)(l1), S_OK);
+        crate::list::write64(l2, out2_ptr, 22, 0, 0);
+        assert_eq!(slot::<Close>(l2, 0x48)(l2), S_OK);
+
+        slot::<Execute>(q, 0x50)(q, 1, &l1);
+        slot::<Execute>(q, 0x50)(q, 1, &l2);
+        assert_eq!(slot::<Signal>(q, signal_slot(q))(q, fence, 7), S_OK);
+
+        let q_addr = q as usize;
+        assert_eq!(
+            slot::<Release>(q, 0x10)(q),
+            1,
+            "multiple held items pin the queue once"
+        );
+        assert!(held().pinned.contains(&q_addr));
+
+        // Snapshot `account_frame` while the released queue is still blocked,
+        // then race `account_frame` against unblocking and draining `q`.
+        account_frame(900);
+        let start = Barrier::new(2);
+        std::thread::scope(|s| {
+            let unblocker = s.spawn(|| {
+                start.wait();
+                // SAFETY: `words` outlives the thread scope.
+                unsafe { (gate_ptr as *mut u64).write_volatile(1) };
+                pump_held(Why::Fence);
+            });
+            start.wait();
+            account_frame(901);
+            unblocker.join().unwrap();
+        });
+
+        // SAFETY: `words` is live and `q` has drained.
+        assert_eq!(unsafe { (out1_ptr as *const u64).read_volatile() }, 11);
+        // SAFETY: `words` is live and `q` has drained.
+        assert_eq!(unsafe { (out2_ptr as *const u64).read_volatile() }, 22);
+        assert_eq!(slot::<FenceCompleted>(fence, 0x40)(fence), 7);
+        assert!(
+            !held().pinned.contains(&q_addr),
+            "pin is removed and released once q drains"
+        );
+
+        // Queue pinned by `Item::FenceWait` also stays alive until the fence is signaled.
+        let (mut q_wait, mut fence2) = (null, null);
+        assert_eq!(create(null, &copy_desc, &QUEUE_IIDS[0], &mut q_wait), S_OK);
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence2),
+            S_OK
+        );
+        let wait_slot = signal_slot(q_wait) + 8;
+        assert_eq!(slot::<Wait>(q_wait, wait_slot)(q_wait, fence2, 5), S_OK);
+        let q_wait_addr = q_wait as usize;
+        assert_eq!(
+            slot::<Release>(q_wait, 0x10)(q_wait),
+            1,
+            "pending FenceWait pins the queue"
+        );
+        assert_eq!(slot::<FenceSignal>(fence2, 0x50)(fence2, 5), S_OK);
+        assert!(
+            !held().pinned.contains(&q_wait_addr),
+            "pin is released once FenceWait completes"
+        );
+        assert_eq!(host.log_messages(), None);
+
+        for obj in [l1, l2, allocator, fence, fence2] {
             assert_eq!(slot::<Release>(obj, 0x10)(obj), 0);
         }
     }

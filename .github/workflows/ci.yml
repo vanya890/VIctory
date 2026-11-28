@@ -2,8 +2,10 @@ name: CI
 
 on:
   pull_request:
+    branches: [dev, main]
   push:
-    branches: [main]
+    branches: [dev, main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,9 +23,13 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+      - name: Test coordination triage scripts
+        run: python -B -I -m unittest discover -s scripts -p 'test_coordination_triage.py' -v
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build

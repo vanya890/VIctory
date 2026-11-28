@@ -927,4 +927,86 @@ mod tests {
         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
         assert_eq!(addr.len(), 2);
     }
+
+    #[test]
+    fn v_cmpx_vop3_and_sdwa_always_write_exec() {
+        let dst_of = |words: &[u32], wave64: bool| {
+            let code: Vec<u8> = words
+                .iter()
+                .chain(&[0xBF81_0000])
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            let Fields::Valu(v) = decode(&code).unwrap()[0].fields(wave64) else {
+                panic!("not a VALU instruction");
+            };
+            v.dst
+        };
+
+        // VOP3 v_cmpx_lt_f32 with non-EXEC vdst (0x00, ignored by GFX10 HW)
+        // and canonical vdst (0x7e): both decode and print EXEC.
+        for vop3_cmpx in [[0xD411_0100, 0x0001_E501], [0xD411_017E, 0x0001_E501]] {
+            assert_eq!(
+                dst_of(&vop3_cmpx, false),
+                Some(Operand::Scalar {
+                    code: 126,
+                    dwords: 1
+                })
+            );
+            assert_eq!(
+                dst_of(&vop3_cmpx, true),
+                Some(Operand::Scalar {
+                    code: 126,
+                    dwords: 2
+                })
+            );
+            assert_eq!(one(&vop3_cmpx, false), "v_cmpx_lt_f32 exec_lo, abs(v1), 1.0");
+            assert_eq!(one(&vop3_cmpx, true), "v_cmpx_lt_f32 exec, abs(v1), 1.0");
+        }
+
+        // VOPC SDWA v_cmpx_eq_f16 (opcode 0xda) with sd=1, sdst=s6 in ext:
+        // GFX10 VOPCX_SDWA has no sdst and still writes EXEC.
+        let sdwa_cmpx = [0x7DB4_04F9, 0x0600_8601];
+        assert_eq!(
+            dst_of(&sdwa_cmpx, false),
+            Some(Operand::Scalar {
+                code: 126,
+                dwords: 1
+            })
+        );
+        assert_eq!(
+            dst_of(&sdwa_cmpx, true),
+            Some(Operand::Scalar {
+                code: 126,
+                dwords: 2
+            })
+        );
+        assert_eq!(
+            one(&sdwa_cmpx, false),
+            "v_cmpx_eq_f16 exec_lo, v1, v2 src0_sel:BYTE_0"
+        );
+        assert_eq!(
+            one(&sdwa_cmpx, true),
+            "v_cmpx_eq_f16 exec, v1, v2 src0_sel:BYTE_0"
+        );
+
+        // Control: non-EXEC v_cmp_eq_f16 (opcode 0xca) with SDWA sd=1, sdst=s6
+        // still writes s6 / s[6:7].
+        let sdwa_cmp = [0x7D94_04F9, 0x0600_8601];
+        assert_eq!(
+            dst_of(&sdwa_cmp, false),
+            Some(Operand::Scalar { code: 6, dwords: 1 })
+        );
+        assert_eq!(
+            dst_of(&sdwa_cmp, true),
+            Some(Operand::Scalar { code: 6, dwords: 2 })
+        );
+        assert_eq!(
+            one(&sdwa_cmp, false),
+            "v_cmp_eq_f16 s6, v1, v2 src0_sel:BYTE_0"
+        );
+        assert_eq!(
+            one(&sdwa_cmp, true),
+            "v_cmp_eq_f16 s[6:7], v1, v2 src0_sel:BYTE_0"
+        );
+    }
 }

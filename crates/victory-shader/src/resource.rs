@@ -463,18 +463,29 @@ impl<'a> Tracer<'a> {
 
     /// The scalar loads from the root signature's memory ([`USER_DATA`])
     /// and the user-data byte offset each reads at (an error for a computed
-    /// one). Compute programs only: they get 16 user SGPRs, and one whose
-    /// parameters do not fit reads them through the pointer in user data
-    /// 0-1 (its high dword masked to the 40-bit address).
+    /// one). Compute programs get 16 user SGPRs, and one whose parameters
+    /// do not fit reads them through the pointer in user data 0-1 (its high
+    /// dword masked to the 40-bit address); geometry programs carry the
+    /// same pointer in their first user SGPRs (s[8:9] after the system's).
     fn spill_loads(&self) -> Vec<(Site, Result<u32, &'static str>)> {
         let input = |r| self.p.inputs.iter().find(|i| i.0 == r).map(|i| i.1);
-        let (Some(lo), Some(hi)) = (input(Reg::S(0)), input(Reg::S(1))) else {
+        let (Some(lo), Some(hi)) = (
+            input(Reg::S(self.stage.user_sgpr(0))),
+            input(Reg::S(self.stage.user_sgpr(1))),
+        ) else {
             return Vec::new();
         };
-        if self.stage != HwStage::Cs
-            || !self.layout.iter().any(|p| p.user_data >= 16)
-            || self.layout.iter().any(|p| p.user_data < 2 && p.sgprs > 0)
-        {
+        match self.stage {
+            // Compute uses the memory only once its parameters overflow
+            // the user SGPRs; a geometry program's signature memory is
+            // there whenever user data 0-1 holds no parameter.
+            HwStage::Cs if !self.layout.iter().any(|p| p.user_data >= 16) => {
+                return Vec::new();
+            }
+            HwStage::Cs | HwStage::Gs => {}
+            _ => return Vec::new(),
+        }
+        if self.layout.iter().any(|p| p.user_data < 2 && p.sgprs > 0) {
             return Vec::new();
         }
         let high = |t: Term| {
@@ -532,7 +543,7 @@ impl<'a> Tracer<'a> {
 
     /// The value holding dword `dword` of root parameter `param`.
     fn param_word(&self, param: usize, dword: u32) -> Option<Value> {
-        if self.layout[param].user_data >= 16 && self.stage == HwStage::Cs {
+        if self.layout[param].user_data >= 16 && matches!(self.stage, HwStage::Cs | HwStage::Gs) {
             return self.first_spilled.get(&(param, dword)).copied();
         }
         let reg = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + dword as u8);
@@ -3895,5 +3906,31 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    /// A geometry program's signature memory is read through the pointer
+    /// in user data 0-1 — its first user SGPRs (s[8:9]) — like a compute
+    /// program's through s[0:1] (Grand Theft Auto VI's voxelization, 195
+    /// programs loading at 0x44).
+    #[test]
+    fn a_geometry_programs_signature_memory_loads_through_its_pointer() {
+        let r = track_words(
+            &[
+                0x8701_FF09,
+                0x0000_00FF, // s_and_b32 s1, s9, 0xff (the pointer's high)
+                0xBE80_0308, // s_mov_b32 s0, s8 (its low)
+                0xF400_0000,
+                0xFA00_00B8, // s_load_dword s0, s[0:1], 0xb8
+                S_ENDPGM,
+            ],
+            &[
+                param(Table, 8, 1),
+                param(Constants, 11, 2),
+                param(ResourceHeap, 13, 1),
+                param(SamplerHeap, 14, 1),
+            ],
+            HwStage::Gs,
+        );
+        assert_eq!(r.scalar, [((0, 2), at(USER_DATA, 0xF8))]);
     }
 }

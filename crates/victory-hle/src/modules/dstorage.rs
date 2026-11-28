@@ -23,9 +23,10 @@ use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
+use windows_sys::Win32::Foundation::ERROR_INVALID_USER_BUFFER;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
@@ -219,9 +220,10 @@ extern "system" fn create_queue(
 /// Grand Theft Auto VI asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
-    if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
-    }
+    let Some(scheduler) = scheduler() else {
+        return E_OUTOFMEMORY;
+    };
+    scheduler.lock().staging = u64::from(size);
     S_OK
 }
 
@@ -401,55 +403,62 @@ unsafe impl Send for Job {}
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
-    static SCHEDULER: OnceLock<Option<Scheduler>> = OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    let scheduler = SCHEDULER
+    static SCHEDULER: OnceLock<Option<Arc<Scheduler>>> = OnceLock::new();
+    SCHEDULER
         .get_or_init(|| {
-            Some(Scheduler {
-                lanes: Mutex::new(Lanes {
-                    lanes: HashMap::new(),
-                    next_id: 0,
-                    next_seq: 0,
-                    staged: 0,
-                    staging: STAGING,
-                    starved: false,
-                    clock: [0; 3],
-                    now: 0,
-                    lane_now: [0; 3],
-                    done: Default::default(),
-                    refused: 0,
-                    bcpack: Default::default(),
-                    pages: 0,
-                    since: None,
-                }),
-                work: Condvar::new(),
-                finished: Condvar::new(),
-            })
-        })
-        .as_ref()?;
-    STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let started = (0..workers)
-            .filter(|i| {
+            let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+            Scheduler::start(workers, |i, scheduler| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || work(&scheduler))
                     .is_ok()
             })
-            .count();
-        tracing::info!(workers = started, "dstorage: workers");
-    });
-    Some(scheduler)
+        })
+        .as_deref()
 }
 
 impl Scheduler {
+    /// Workers receive the scheduler directly. They must not call
+    /// `scheduler()` while its `OnceLock` is still initializing.
+    fn start(workers: usize, mut spawn: impl FnMut(usize, Arc<Self>) -> bool) -> Option<Arc<Self>> {
+        let scheduler = Arc::new(Self {
+            lanes: Mutex::new(Lanes {
+                lanes: HashMap::new(),
+                next_id: 0,
+                next_seq: 0,
+                staged: 0,
+                staging: STAGING,
+                starved: false,
+                clock: [0; 3],
+                now: 0,
+                lane_now: [0; 3],
+                done: Default::default(),
+                refused: 0,
+                bcpack: Default::default(),
+                pages: 0,
+                since: None,
+            }),
+            work: Condvar::new(),
+            finished: Condvar::new(),
+        });
+        let started = (0..workers)
+            .filter(|&i| spawn(i, Arc::clone(&scheduler)))
+            .count();
+        if started == 0 {
+            tracing::warn!("dstorage: no worker thread could start");
+            return None;
+        }
+        tracing::info!(workers = started, "dstorage: workers");
+        Some(scheduler)
+    }
+
     fn lock(&self) -> MutexGuard<'_, Lanes> {
         self.lanes.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 /// A worker: runs the next read of the most deserving queue.
-fn work(scheduler: &'static Scheduler) {
+fn work(scheduler: &Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -985,19 +994,70 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         .state
         .file;
     let started = std::time::Instant::now();
-    let mut done = 0;
-    let result = loop {
-        if done == out.len() {
-            break Ok(());
-        }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
-            Ok(0) => break Err(END_OF_FILE),
-            Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
-        }
-    };
+    let result = read_file_into(out, request.offset, request.options == 0, |buf, at| {
+        file.seek_read(buf, at)
+    });
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
+}
+
+const RAW_READ_STAGING_LIMIT: usize = 1024 * 1024;
+
+fn read_file_into(
+    out: &mut [u8],
+    offset: u64,
+    allow_staging: bool,
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> Result<(), HRESULT> {
+    let mut done = 0;
+    while done < out.len() {
+        let at = offset.checked_add(done as u64).ok_or(E_INVALIDARG)?;
+        match read(&mut out[done..], at) {
+            Ok(0) => return Err(END_OF_FILE),
+            Ok(n) if n <= out.len() - done => done += n,
+            Ok(_) => return Err(E_INVALIDARG),
+            Err(error)
+                if allow_staging
+                    && error.raw_os_error() == Some(ERROR_INVALID_USER_BUFFER as i32) =>
+            {
+                tracing::debug!("dstorage: staging raw read after invalid user buffer");
+                return read_file_staged(&mut out[done..], at, read);
+            }
+            Err(error) => return Err(from_win32(&error)),
+        }
+    }
+    Ok(())
+}
+
+fn read_file_staged(
+    out: &mut [u8],
+    offset: u64,
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> Result<(), HRESULT> {
+    let capacity = out.len().min(RAW_READ_STAGING_LIMIT);
+    let mut staging = Vec::new();
+    staging
+        .try_reserve_exact(capacity)
+        .map_err(|_| E_OUTOFMEMORY)?;
+    staging.resize(capacity, 0);
+
+    let mut done = 0;
+    while done < out.len() {
+        let at = offset.checked_add(done as u64).ok_or(E_INVALIDARG)?;
+        let len = (out.len() - done).min(staging.len());
+        let n = read(&mut staging[..len], at).map_err(|error| from_win32(&error))?;
+        if n == 0 {
+            return Err(END_OF_FILE);
+        }
+        if n > len {
+            return Err(E_INVALIDARG);
+        }
+        let destination = &mut out[done..done + n];
+        let _writing = victory_gpu::kernel_will_write(destination.as_mut_ptr() as usize, n);
+        destination.copy_from_slice(&staging[..n]);
+        done += n;
+    }
+    Ok(())
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1010,10 +1070,25 @@ fn into_destination(
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
+    into_destination_with(request, len, |at, len| {
+        victory_gpu::kernel_will_write(at, len)
+    }, fill)
+}
+
+/// The raw-destination write lease must enclose the entire fill operation:
+/// DirectStorage's ERROR_INVALID_USER_BUFFER fallback reads into host staging
+/// memory and copies each chunk before the request can complete.
+fn into_destination_with<G>(
+    request: &Request,
+    len: usize,
+    acquire_write: impl FnOnce(usize, usize) -> G,
+    fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
+) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        let _writing = victory_gpu::kernel_will_write(request.destination as usize, len);
+        // GPU side's guard on title buffers; open them first and keep the
+        // lease alive until every direct or staged copy has completed.
+        let _writing = acquire_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -1126,6 +1201,229 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn raw_staged_read_keeps_destination_lease_until_all_chunks_are_copied() {
+        use std::sync::atomic::AtomicBool;
+
+        struct Lease<'a>(&'a AtomicBool);
+        impl Drop for Lease<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+
+        let expected = b"partial then staged chunks";
+        let mut destination = vec![0; expected.len()];
+        let request = Request {
+            options: 0,
+            destination: destination.as_mut_ptr().cast(),
+            page_offset: 0,
+            destination_size: expected.len() as u32,
+            source: std::ptr::null(),
+            offset: 41,
+            source_size: expected.len() as u32,
+            intermediate_size: 0,
+            tag: 0,
+            name: c"lease-test".as_ptr(),
+        };
+        let lease_active = AtomicBool::new(false);
+        let mut reads = 0;
+
+        into_destination_with(
+            &request,
+            expected.len(),
+            |at, len| {
+                assert_eq!(at, destination.as_ptr() as usize);
+                assert_eq!(len, expected.len());
+                assert!(!lease_active.swap(true, Ordering::SeqCst));
+                Lease(&lease_active)
+            },
+            |out| {
+                read_file_into(out, 41, true, |staging, at| {
+                    assert!(lease_active.load(Ordering::SeqCst), "lease dropped during staged read");
+                    reads += 1;
+                    match reads {
+                        1 => {
+                            staging[..3].copy_from_slice(&expected[..3]);
+                            Ok(3)
+                        }
+                        2 => Err(std::io::Error::from_raw_os_error(
+                            ERROR_INVALID_USER_BUFFER as i32,
+                        )),
+                        _ => {
+                            let start = (at - 41) as usize;
+                            let n = staging.len().min(5);
+                            staging[..n].copy_from_slice(&expected[start..start + n]);
+                            Ok(n)
+                        }
+                    }
+                })?;
+                assert!(lease_active.load(Ordering::SeqCst), "lease must cover every staged copy");
+                assert_eq!(out, expected);
+                Ok(out.len())
+            },
+        )
+        .unwrap();
+
+        assert!(!lease_active.load(Ordering::SeqCst), "lease drops after fill completes");
+        assert!(reads > 3, "exercise multiple staged chunks after a partial direct read");
+    }
+
+    #[test]
+    fn raw_read_keeps_direct_reads_on_the_original_buffer() {
+        let mut out = [0; 4];
+        let mut calls = 0;
+        read_file_into(&mut out, 7, true, |buf, at| {
+            calls += 1;
+            assert_eq!(at, 7);
+            assert_eq!(buf.len(), 4);
+            buf.copy_from_slice(b"data");
+            Ok(4)
+        })
+        .unwrap();
+        assert_eq!(&out, b"data");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn raw_read_stages_only_the_unread_suffix_after_invalid_user_buffer() {
+        let expected = b"partial and staged";
+        let mut out = vec![0; expected.len()];
+        let mut calls = 0;
+        read_file_into(&mut out, 41, true, |buf, at| {
+            calls += 1;
+            match calls {
+                1 => {
+                    buf[..3].copy_from_slice(&expected[..3]);
+                    Ok(3)
+                }
+                2 => Err(std::io::Error::from_raw_os_error(
+                    ERROR_INVALID_USER_BUFFER as i32,
+                )),
+                _ => {
+                    let start = (at - 41) as usize;
+                    let n = buf.len().min(2);
+                    buf[..n].copy_from_slice(&expected[start..start + n]);
+                    Ok(n)
+                }
+            }
+        })
+        .unwrap();
+        assert_eq!(out, expected);
+        assert_eq!(calls, 10);
+    }
+
+    #[test]
+    fn raw_read_staging_caps_each_read_and_preserves_failures() {
+        let expected = vec![0x5a; RAW_READ_STAGING_LIMIT + 7];
+        let mut out = vec![0; expected.len()];
+        let mut calls = 0;
+        let mut largest_staged_read = 0;
+        read_file_into(&mut out, 0, true, |buf, at| {
+            calls += 1;
+            if calls == 1 {
+                return Err(std::io::Error::from_raw_os_error(
+                    ERROR_INVALID_USER_BUFFER as i32,
+                ));
+            }
+            largest_staged_read = largest_staged_read.max(buf.len());
+            let start = at as usize;
+            buf.copy_from_slice(&expected[start..start + buf.len()]);
+            Ok(buf.len())
+        })
+        .unwrap();
+        assert_eq!(out, expected);
+        assert_eq!(calls, 3);
+        assert_eq!(largest_staged_read, RAW_READ_STAGING_LIMIT);
+
+        let mut out = [0; 1];
+        let error = read_file_into(&mut out, 0, true, |_, _| {
+            Err(std::io::Error::from_raw_os_error(5))
+        })
+        .unwrap_err();
+        assert_eq!(error, (0x8007_0005_u32) as i32);
+
+        let mut calls = 0;
+        let error = read_file_into(&mut out, 0, true, |_, _| {
+            calls += 1;
+            if calls == 1 {
+                Err(std::io::Error::from_raw_os_error(
+                    ERROR_INVALID_USER_BUFFER as i32,
+                ))
+            } else {
+                Err(std::io::Error::from_raw_os_error(5))
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error, (0x8007_0005_u32) as i32);
+        assert_eq!(calls, 2);
+
+        let error = read_file_into(&mut out, 0, true, |_, _| {
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_INVALID_USER_BUFFER as i32,
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error, (0x8007_06F8_u32) as i32);
+
+        let error = read_file_into(&mut out, 0, false, |_, _| {
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_INVALID_USER_BUFFER as i32,
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error, (0x8007_06F8_u32) as i32);
+    }
+
+    #[test]
+    fn raw_read_staging_preserves_eof_and_rejects_offset_overflow() {
+        let mut out = [0; 2];
+        let mut calls = 0;
+        let error = read_file_into(&mut out, 0, true, |_, _| {
+            calls += 1;
+            if calls == 1 {
+                Err(std::io::Error::from_raw_os_error(
+                    ERROR_INVALID_USER_BUFFER as i32,
+                ))
+            } else {
+                Ok(0)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error, END_OF_FILE);
+
+        let mut calls = 0;
+        let error = read_file_into(&mut out, u64::MAX, true, |buf, _| {
+            calls += 1;
+            buf[0] = 1;
+            Ok(1)
+        })
+        .unwrap_err();
+        assert_eq!(error, E_INVALIDARG);
+        assert_eq!(calls, 1);
+
+        let mut calls = 0;
+        let error = read_file_into(&mut out, u64::MAX, true, |buf, _| {
+            calls += 1;
+            if calls == 1 {
+                return Err(std::io::Error::from_raw_os_error(
+                    ERROR_INVALID_USER_BUFFER as i32,
+                ));
+            }
+            buf[0] = 1;
+            Ok(1)
+        })
+        .unwrap_err();
+        assert_eq!(error, E_INVALIDARG);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn a_scheduler_requires_at_least_one_worker() {
+        assert!(Scheduler::start(3, |_, _| false).is_none());
+        assert!(Scheduler::start(3, |index, _| index == 1).is_some());
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.

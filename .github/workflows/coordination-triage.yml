@@ -1,0 +1,70 @@
+name: Coordination triage
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+  schedule:
+    - cron: "23 */12 * * *"
+
+permissions: {}
+
+concurrency:
+  group: coordination-triage
+  cancel-in-progress: true
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: dev
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Test the read-only triage code
+        run: python -B -I -m unittest discover -s scripts -p 'test_coordination_triage.py' -v
+
+      - name: List upstream pull requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh pr list --repo Marvisak/VIctory --state open --limit 3000
+          --json number,title,url,isDraft,headRefOid,baseRefName,baseRefOid,closingIssuesReferences,author
+          > prs.json
+
+      - name: Fetch pinned upstream refs without checking out candidate code
+        shell: bash
+        run: |
+          git remote add upstream https://github.com/Marvisak/VIctory.git
+          git fetch --no-tags upstream +refs/heads/main:refs/remotes/upstream/main
+          python - <<'PY'
+          import json, subprocess
+          prs = json.load(open("prs.json", encoding="utf-8"))
+          numbers = [int(p["number"]) for p in prs
+                     if not p.get("isDraft") and p.get("baseRefName") == "main"]
+          refs = [f"+refs/pull/{n}/head:refs/remotes/upstream/pr/{n}" for n in numbers]
+          for start in range(0, len(refs), 150):
+              batch = refs[start:start + 150]
+              result = subprocess.run(["git", "fetch", "--no-tags", "upstream", *batch],
+                                      text=True, capture_output=True)
+              if result.returncode:
+                  for ref in batch:
+                      subprocess.run(["git", "fetch", "--no-tags", "upstream", ref],
+                                     text=True, capture_output=True)
+          PY
+
+      - name: Compare exact PR heads with upstream main and fork dev
+        run: python -B -I scripts/coordination_triage.py --repo . --prs prs.json --upstream-main refs/remotes/upstream/main --fork-dev HEAD --out out
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: coordination-triage-${{ github.run_id }}
+          path: out/
+          retention-days: 14

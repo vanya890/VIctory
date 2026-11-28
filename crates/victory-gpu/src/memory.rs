@@ -419,23 +419,37 @@ fn write_table(
         if len == 0 || end > 1 << 40 {
             continue;
         }
-        for page in start >> 16..=(end - 1) >> 16 {
-            let l1 = (page >> 12) as usize;
-            if level1[l1] == 0 {
+        let first_page = (start >> 16) as usize;
+        let past_page = end.div_ceil(1 << 16) as usize;
+        let first_whole = start.div_ceil(1 << 16) as usize;
+        let past_whole = (end >> 16) as usize;
+        let first_block = first_page / BLOCK;
+        let last_block = (past_page - 1) / BLOCK;
+        for (region, block) in level1[first_block..=last_block].iter_mut().enumerate() {
+            if *block == 0 {
                 if blocks.len() > CAPACITY {
                     full = true;
                     continue;
                 }
-                level1[l1] = blocks.len() as u32;
-                blocks.push(l1);
+                *block = blocks.len() as u32;
+                blocks.push(first_block + region);
                 owner.resize(owner.len() + BLOCK, NO_OWNER);
             }
-            let entry = level1[l1] as usize * BLOCK + (page & 0xFFF) as usize;
+            let region_start = (first_block + region) * BLOCK;
+            let first = first_page.max(region_start);
+            let past = past_page.min(region_start + BLOCK);
+            let offset = *block as usize * BLOCK + (first - region_start);
+            let entries = &mut owner[offset..offset + (past - first)];
+            let whole_start = first_whole.clamp(first, past);
+            let whole_end = past_whole.clamp(whole_start, past);
             // Larger copies come first: a copy holding the whole page takes
             // it from them; one holding part of it only takes it if free.
-            let whole = page << 16 >= start && (page + 1) << 16 <= end;
-            if whole || owner[entry] == NO_OWNER {
-                owner[entry] = k as u32;
+            if whole_start != first && entries[0] == NO_OWNER {
+                entries[0] = k as u32;
+            }
+            entries[whole_start - first..whole_end - first].fill(k as u32);
+            if whole_end != past && entries[past - first - 1] == NO_OWNER {
+                entries[past - first - 1] = k as u32;
             }
         }
     }
@@ -447,15 +461,18 @@ fn write_table(
     let l2_dwords = owner.len() * 2;
     let l2 = &mut out[LEVEL1..LEVEL1 + l2_dwords];
     let (slots, _) = l2.as_chunks_mut::<2>();
-    for (slot, &o) in slots.iter_mut().zip(&owner) {
-        if o == NO_OWNER {
-            slot[0] = null;
-            slot[1] = 0;
+    let mut at = 0;
+    for run in owner.chunk_by(|a, b| a == b) {
+        let o = run[0];
+        let entry = if o == NO_OWNER {
+            [null, 0]
         } else {
             let k = o as usize;
-            slot[0] = pairs[k];
-            slot[1] = copies[k].0 as u32;
-        }
+            [pairs[k], copies[k].0 as u32]
+        };
+        let past = at + run.len();
+        slots[at..past].fill(entry);
+        at = past;
     }
     (LEVEL1 + l2_dwords, blocks, owner)
 }
@@ -765,6 +782,34 @@ mod tests {
         assert_eq!(owner[entry(0x42_0000)], Some(1));
         assert_eq!(owner[entry(0xd_1234_0000)], Some(2));
         assert_eq!(blocks.len(), 3, "null, low 256 MiB, the high buffer's");
+    }
+
+    #[test]
+    fn page_ownership_at_region_boundaries() {
+        const PAGE: u64 = 1 << 16;
+        const REGION: u64 = PAGE * BLOCK as u64;
+        let copies = [
+            (REGION - 3 * PAGE, 6 * PAGE),      // outer, aligned
+            (REGION - 2 * PAGE + 3, 4 * PAGE),  // inner, partial at both ends
+            (2 * REGION - 7, 14),              // two partial pages, no whole pages
+            (3 * REGION + 8, 12),              // both edges in the same page
+        ];
+        let (table, blocks, _) = table(&copies, &[10, 20, 30, 40], 100);
+        for (address, expected) in [
+            (REGION - 2 * PAGE, 10),
+            (REGION - PAGE, 20),
+            (REGION, 20),
+            (REGION + PAGE, 20),
+            (REGION + 2 * PAGE, 10),
+            (2 * REGION - 7, 30),
+            (2 * REGION, 30),
+            (2 * REGION + PAGE, 100),
+            (3 * REGION + 8, 40),
+            (3 * REGION + PAGE, 100),
+        ] {
+            assert_eq!(look_up(&table, address).0, expected, "{address:#x}");
+        }
+        assert_eq!(blocks, [usize::MAX, 0, 1, 2, 3]);
     }
 
     /// Copies in more regions than a table has room for: the largest are

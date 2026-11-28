@@ -20,6 +20,9 @@ use tables::*;
 pub const PACKET_BYTES: usize = 2048;
 const PACKET_BITS: usize = PACKET_BYTES * 8;
 const HEADER_BITS: usize = 32;
+/// `PacketSkipCount == 0xff` marks a stream's final packet (no further packets
+/// belong to it).
+const END_OF_STREAM: u32 = 0xff;
 /// Samples per channel in one frame.
 pub const FRAME_SAMPLES: usize = 512;
 /// Samples per channel in one subframe, the unit of skips and loop ends.
@@ -50,6 +53,16 @@ pub struct Packet {
     pub frames: u32,
     pub first_frame_bit: u32,
     pub skip: u32,
+}
+
+impl Packet {
+    /// Index of this stream's next packet after `index`, or `None` if this
+    /// packet ends the stream (`skip == 0xff`).
+    fn next(self, index: usize) -> Option<usize> {
+        (self.skip != END_OF_STREAM)
+            .then(|| index.checked_add(1)?.checked_add(self.skip as usize))
+            .flatten()
+    }
 }
 
 pub fn packet(data: &[u8], index: usize) -> Option<Packet> {
@@ -88,8 +101,8 @@ impl Cursor<'_> {
             // Leaving a packet: jump over the other streams' packets.
             let previous = self.pos / PACKET_BITS;
             if previous > 0 {
-                let skip = packet(self.data, previous - 1)?.skip as usize;
-                self.pos = (previous + skip) * PACKET_BITS;
+                let next = packet(self.data, previous - 1)?.next(previous - 1)?;
+                self.pos = next.checked_mul(PACKET_BITS)?;
             }
             self.pos += HEADER_BITS;
         }
@@ -180,10 +193,11 @@ fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
     if end.is_multiple_of(PACKET_BITS) || (last && end / PACKET_BITS == index) || ends_in_packet_without_frames {
         // The next frame begins in the next packet of this stream that has one;
         // a packet with none (a frame spans all of it) holds no start.
-        let mut next = (end - 1) / PACKET_BITS + 1 + packet(data, (end - 1) / PACKET_BITS)?.skip as usize;
+        let last_packet = (end - 1) / PACKET_BITS;
+        let mut next = packet(data, last_packet)?.next(last_packet)?;
         let mut header = packet(data, next)?;
         while header.frames == 0 {
-            next += 1 + header.skip as usize;
+            next = header.next(next)?;
             header = packet(data, next)?;
         }
         end = next * PACKET_BITS + HEADER_BITS + header.first_frame_bit as usize;
@@ -1497,6 +1511,139 @@ mod tests {
         assert_eq!(c.bits, 60);
         // C was packet 1's only frame: the next would be in packet 2.
         assert_eq!(c.next, None);
+    }
+
+    /// `PacketSkipCount == 0xff` marks the final packet of a stream: frames
+    /// inside that packet still walk to completion (including one ending right
+    /// on the packet edge), then the stream stops instead of jumping 256
+    /// packets ahead into another interleaved stream.
+    #[test]
+    fn packet_skip_0xff_ends_the_stream_after_its_frames() {
+        let header = |frames: u32, first: u32, skip: u32| (frames << 26) | (first << 11) | skip;
+
+        // Multi-frame final packet in a >256-packet multi-stream buffer.
+        let mut data = vec![0u8; 257 * PACKET_BYTES];
+        set_bits(&mut data, 0, 32, header(2, 0, 0xff));
+        set_bits(&mut data, HEADER_BITS, LENGTH_BITS, 100);
+        set_bits(&mut data, HEADER_BITS + 100, LENGTH_BITS, 60);
+        // Packet 256 belongs to another stream and holds a valid frame.
+        set_bits(&mut data, 256 * PACKET_BITS, 32, header(1, 0, 0xff));
+        set_bits(&mut data, 256 * PACKET_BITS + HEADER_BITS, LENGTH_BITS, 80);
+
+        let first = read_frame(&data, HEADER_BITS).unwrap();
+        assert_eq!((first.bits, first.next), (100, Some(HEADER_BITS + 100)));
+        let second = read_frame(&data, HEADER_BITS + 100).unwrap();
+        assert_eq!(second.bits, 60);
+        assert_eq!(
+            second.next, None,
+            "0xff must end the stream, not jump +256 packets"
+        );
+
+        // Final frame ending exactly on the packet boundary.
+        let mut exact = vec![0u8; 257 * PACKET_BYTES];
+        let full_payload = (PACKET_BITS - HEADER_BITS) as u32;
+        set_bits(&mut exact, 0, 32, header(1, 0, 0xff));
+        set_bits(&mut exact, HEADER_BITS, LENGTH_BITS, full_payload);
+        set_bits(&mut exact, 256 * PACKET_BITS, 32, header(1, 0, 0xff));
+        set_bits(&mut exact, 256 * PACKET_BITS + HEADER_BITS, LENGTH_BITS, 80);
+
+        let full = read_frame(&exact, HEADER_BITS).unwrap();
+        assert_eq!(full.bits, full_payload as usize);
+        assert_eq!(
+            full.next, None,
+            "0xff at exact packet boundary must end the stream"
+        );
+    }
+
+    /// `PacketSkipCount == 0xff` also terminates streams on continuation-only
+    /// packets (`frames == 0`), chains of continuation packets, and payload
+    /// reads that would otherwise leave the final packet.
+    #[test]
+    fn packet_skip_0xff_stops_continuation_and_spanning_reads() {
+        let header = |frames: u32, first: u32, skip: u32| (frames << 26) | (first << 11) | skip;
+
+        // Frame starts in packet 0 (skip=1 over packet 1), ends in continuation
+        // packet 2 (frames=0, skip=0xff); packet 258 belongs to another stream.
+        let mut cont = vec![0u8; 259 * PACKET_BYTES];
+        set_bits(&mut cont, 0, 32, header(1, 0, 1));
+        set_bits(
+            &mut cont,
+            HEADER_BITS,
+            LENGTH_BITS,
+            (PACKET_BITS - HEADER_BITS + 40) as u32,
+        );
+        set_bits(&mut cont, 2 * PACKET_BITS, 32, header(0, 0, 0xff));
+        set_bits(&mut cont, 258 * PACKET_BITS, 32, header(1, 0, 0xff));
+        set_bits(&mut cont, 258 * PACKET_BITS + HEADER_BITS, LENGTH_BITS, 80);
+
+        let spanning = read_frame(&cont, HEADER_BITS).unwrap();
+        assert_eq!(spanning.bits, PACKET_BITS - HEADER_BITS + 40);
+        assert_eq!(
+            spanning.next, None,
+            "continuation packet with skip=0xff must end stream"
+        );
+
+        // Chain of frames==0 packets where the second carries skip=0xff.
+        let mut chain = vec![0u8; 259 * PACKET_BYTES];
+        set_bits(&mut chain, 0, 32, header(1, 0, 0));
+        set_bits(&mut chain, HEADER_BITS, LENGTH_BITS, 64);
+        set_bits(&mut chain, PACKET_BITS, 32, header(0, 0, 0));
+        set_bits(&mut chain, 2 * PACKET_BITS, 32, header(0, 0, 0xff));
+        set_bits(&mut chain, 258 * PACKET_BITS, 32, header(1, 0, 0xff));
+        set_bits(&mut chain, 258 * PACKET_BITS + HEADER_BITS, LENGTH_BITS, 80);
+
+        let f = read_frame(&chain, HEADER_BITS).unwrap();
+        assert_eq!(
+            f.next, None,
+            "skip=0xff in a frames==0 walk must end stream"
+        );
+
+        // A frame whose declared length runs past a skip=0xff packet must not
+        // pull payload bits from packet +256.
+        let mut overrun = vec![0u8; 257 * PACKET_BYTES];
+        set_bits(&mut overrun, 0, 32, header(1, 0, 0xff));
+        set_bits(
+            &mut overrun,
+            HEADER_BITS,
+            LENGTH_BITS,
+            (PACKET_BITS - HEADER_BITS + 32) as u32,
+        );
+        set_bits(&mut overrun, 256 * PACKET_BITS, 32, header(1, 0, 0xff));
+        assert!(
+            read_frame(&overrun, HEADER_BITS).is_none(),
+            "cursor must not cross out of a skip=0xff packet into packet +256"
+        );
+    }
+
+    /// The maximum non-sentinel `PacketSkipCount` (`0xfe` = 254) still skips
+    /// 254 interleaved packets to packet 255 for both spanning payload reads
+    /// and `next_frame`, then stops on packet 255's `0xff`.
+    #[test]
+    fn packet_skip_0xfe_still_advances_across_254_interleaved_packets() {
+        let header = |frames: u32, first: u32, skip: u32| (frames << 26) | (first << 11) | skip;
+        let mut data = vec![0u8; 512 * PACKET_BYTES];
+        // Fill interleaved packets 1..=254 with a distinct byte so a wrong jump
+        // is caught immediately.
+        data[PACKET_BYTES..255 * PACKET_BYTES].fill(0xee);
+        set_bits(&mut data, 0, 32, header(1, 0, 0xfe));
+        let len_a = PACKET_BITS - HEADER_BITS + 48;
+        set_bits(&mut data, HEADER_BITS, LENGTH_BITS, len_a as u32);
+        // Packet 255 (= 0 + 1 + 254) continues frame A with 48 zero/0xa5 bits,
+        // then holds frame B (60 bits) and ends the stream with skip=0xff.
+        set_bits(&mut data, 255 * PACKET_BITS, 32, header(1, 48, 0xff));
+        data[255 * PACKET_BYTES + 4..255 * PACKET_BYTES + 10].fill(0xa5);
+        let b_start = 255 * PACKET_BITS + HEADER_BITS + 48;
+        set_bits(&mut data, b_start, LENGTH_BITS, 60);
+        // Populate packet 511 (= 255 + 1 + 255) to verify 0xff on 255 stops.
+        set_bits(&mut data, 511 * PACKET_BITS, 32, header(1, 0, 0xff));
+        set_bits(&mut data, 511 * PACKET_BITS + HEADER_BITS, LENGTH_BITS, 80);
+
+        let a = read_frame(&data, HEADER_BITS).unwrap();
+        assert_eq!((a.bits, a.next), (len_a, Some(b_start)));
+        assert_eq!(&a.data[a.data.len() - 6..], &[0xa5; 6]);
+
+        let b = read_frame(&data, b_start).unwrap();
+        assert_eq!((b.bits, b.next), (60, None));
     }
 
     /// Deterministic noise: xorshift64, as in BCPack's noise test.

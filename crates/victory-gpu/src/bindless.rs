@@ -131,14 +131,31 @@ impl Viewed {
     /// host (`made`) or left without a host view.
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
         let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
+        #[cfg(test)]
+        tests::before_set_lock(std::ptr::from_ref(self) as usize);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(old) = inner.slots.remove(&index) {
             inner.count(&old, false);
         }
         if let Some(seen) = seen {
+            // `Resource::drop` removes the texture from `TEXTURES_AT` before
+            // calling `bindless::forget`; re-checking liveness under `inner`
+            // prevents a racing `set` from re-inserting a freed pointer.
+            if matches!(seen, Seen::Texture(r) if !crate::resource::is_live_texture(r)) {
+                return;
+            }
             inner.count(&seen, true);
             inner.slots.insert(index, seen);
         }
+    }
+
+    #[cfg(test)]
+    fn has_texture(&self, resource: usize) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .textures
+            .contains_key(&resource)
     }
 
     /// The buffer ranges views reach, merged per host copy and kind
@@ -692,5 +709,122 @@ void main(uint3 id : SV_DispatchThreadID) {
                 assert_eq!(v, base + i as u32 + u32::from(texel), "round {round}, dword {i}");
             }
         }
+    }
+
+    type SetHook = Box<dyn FnOnce() + Send>;
+    static BEFORE_SET_LOCK: Mutex<Option<(usize, SetHook)>> = Mutex::new(None);
+
+    pub(super) fn before_set_lock(viewed: usize) {
+        let hook = {
+            let mut slot = BEFORE_SET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            slot.take_if(|(target, _)| *target == viewed)
+                .map(|(_, hook)| hook)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Releasing a title texture while another thread is in `Viewed::set`
+    /// between resolving `seen(view)` and locking `Viewed::inner` must not
+    /// leave the freed `Resource` pointer registered in `inner.textures`.
+    #[test]
+    fn concurrent_release_during_viewed_set_does_not_leave_dangling_texture() {
+        use std::sync::mpsc;
+
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        static TEST_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tex = resource(3, 4, 1, 28, LINEAR);
+        assert!(
+            crate::resource::host_copy(tex).is_some(),
+            "host texture made"
+        );
+        let tex_addr = tex as usize;
+
+        let viewed = Arc::new(Viewed::default());
+        register(&viewed);
+        let viewed_key = Arc::as_ptr(&viewed) as usize;
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        *BEFORE_SET_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+            viewed_key,
+            Box::new(move || {
+                let _ = entered_tx.send(());
+                let _ = released_rx.recv();
+            }),
+        ));
+
+        let viewed_bg = Arc::clone(&viewed);
+        let setter = std::thread::spawn(move || {
+            let view = View::Shader(tex_addr, None);
+            viewed_bg.set(0, Some(&view), true);
+        });
+
+        entered_rx.recv().expect("setter reached lock boundary");
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10);
+        assert_eq!(
+            release(tex),
+            0,
+            "texture released while Viewed::set was paused"
+        );
+        released_tx.send(()).expect("resume setter");
+        setter.join().expect("setter finished");
+
+        assert!(
+            !viewed.has_texture(tex_addr),
+            "freed texture resource pointer must not remain in Viewed::textures"
+        );
+        assert!(
+            uploads(std::slice::from_ref(&viewed), &[]).is_none(),
+            "subsequent bindless uploads must skip the released texture cleanly"
+        );
+    }
+
+    /// A cloned `View::Shader` held across a concurrent `Resource::drop`
+    /// (as in `HostHeap::mirror`, `sync_heaps`, or `stamp_read`) must be
+    /// rejected safely by `resource::made_copy` and `Viewed::set` without
+    /// dereferencing or recording the freed texture pointer.
+    #[test]
+    fn release_before_viewed_set_and_made_copy_rejects_freed_texture() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let tex = resource(3, 4, 1, 28, LINEAR);
+        assert!(
+            crate::resource::host_copy(tex).is_some(),
+            "host texture made"
+        );
+        assert!(
+            crate::resource::made_copy(tex).is_some(),
+            "live texture has host copy"
+        );
+        let tex_addr = tex as usize;
+        let stale_view = View::Shader(tex_addr, None);
+        let viewed = Arc::new(Viewed::default());
+        register(&viewed);
+
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10);
+        assert_eq!(release(tex), 0);
+
+        assert!(
+            !crate::resource::is_live_texture(tex_addr),
+            "released texture removed from live set"
+        );
+        assert!(
+            crate::resource::made_copy(tex).is_none(),
+            "made_copy returns None for released texture without dereferencing"
+        );
+
+        viewed.set(0, Some(&stale_view), true);
+        assert!(
+            !viewed.has_texture(tex_addr),
+            "stale view of freed texture must not be registered"
+        );
+        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_none());
     }
 }

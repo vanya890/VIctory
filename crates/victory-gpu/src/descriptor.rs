@@ -158,6 +158,59 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Mirrors a contiguous descriptor copy with one heap lookup and pending lock.
+#[cfg(windows)]
+fn mirror_copy(dst: u64, count: u32, kind: u32, step: u64) {
+    let Some(bytes) = u64::from(count).checked_mul(step) else { return };
+    let Some(end) = dst.checked_add(bytes) else { return };
+    #[cfg(feature = "diagnostics")]
+    let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    drop(waited);
+    let Some(&(start, limit, at)) = heaps.iter().find(|&&(start, limit, _)| dst < limit && start < end) else {
+        return;
+    };
+    // SAFETY: registered heaps stay alive while the registry is locked.
+    let heap = unsafe { &*(at as *const Heap) };
+    if dst >= start
+        && end <= limit
+        && kind == heap.desc.kind
+        && (dst - start).is_multiple_of(step)
+    {
+        let first = ((dst - start) / step) as u32;
+        let Some(last) = first.checked_add(count) else { return };
+        if last > heap.desc.count { return; }
+        let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match heap.host.get() {
+            None => pending.extend(first..last),
+            Some(host) => {
+                drop(pending);
+                if let Some(host) = host {
+                    const BATCH: u32 = 256;
+                    for from in (first..last).step_by(BATCH as usize) {
+                        let to = from.saturating_add(BATCH).min(last);
+                        if to - from < 8 {
+                            for i in from..to {
+                                host.mirror(i, start + u64::from(i) * step, false);
+                            }
+                        } else {
+                            host.sync_slots(from, to, start, step);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    // Keep the original semantics for cross-heap, misaligned, and mismatched-kind ranges.
+    drop(heaps);
+    for i in 0..count {
+        mirror(dst + u64::from(i) * step);
+    }
+}
+
+
 /// Mirrors what the title wrote into its shader-visible heaps without a
 /// call: Grand Theft Auto VI copies descriptors (our records) into its heap
 /// as bytes, so only a change of its memory shows them. Each slot of a page
@@ -210,7 +263,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     // a texture takes up to milliseconds; title threads waited 1-6 s a frame,
     // runs evict2, noevict1). They are never released, so they outlive it;
     // the lock is held only to look the slots up and to make the views.
-    let placed: Vec<View> = {
+    let placed: Vec<PinnedView> = {
         let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps
             .iter()
@@ -228,6 +281,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     crate::texture::in_parallel(placed.len(), |i| {
         let _ = host::placed_texture(&placed[i]);
     });
+    drop(placed);
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -534,12 +588,88 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
-/// The view of entry `i` if `generation` is still its own.
+/// A resolved [`View`] that holds COM references to any `Resource` objects it
+/// names so a concurrent [`crate::resource::resource_release`] cannot free
+/// them while the caller inspects the view or builds host descriptors from it.
 #[cfg(windows)]
-fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+pub(crate) struct PinnedView {
+    view: View,
+    resources: [usize; 2],
+}
+
+#[cfg(windows)]
+impl std::ops::Deref for PinnedView {
+    type Target = View;
+
+    fn deref(&self) -> &View {
+        &self.view
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for PinnedView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.view.fmt(f)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PinnedView {
+    fn drop(&mut self) {
+        for r in self.resources {
+            if r != 0 {
+                crate::resource::resource_release(r as This);
+            }
+        }
+    }
+}
+
+/// Resolves entry `i` if `generation` is still current, pinning any `Resource`
+/// objects it names while `VIEWS` is held. Drops `views` before releasing any
+/// partial pin so `resource_release` never re-enters `VIEWS`.
+#[cfg(windows)]
+fn pin_entry(
+    views: std::sync::MutexGuard<'_, Views>,
+    i: u32,
+    generation: u32,
+) -> Option<PinnedView> {
     let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    if *current != generation {
+        return None;
+    }
+    let [r0, r1] = view.resources();
+    let unique = [r0, if r1 == r0 { 0 } else { r1 }];
+    let mut pinned = [0usize; 2];
+    for (slot, r) in pinned.iter_mut().zip(unique) {
+        if r == 0 {
+            continue;
+        }
+        if object::try_add_ref(r as This) {
+            *slot = r;
+        } else {
+            drop(views);
+            for prev in pinned {
+                if prev != 0 {
+                    crate::resource::resource_release(prev as This);
+                }
+            }
+            return None;
+        }
+    }
+    let view = view.clone();
+    drop(views);
+    Some(PinnedView {
+        view,
+        resources: pinned,
+    })
+}
+
+/// The view of entry `i` if `generation` is still its own, pinning its
+/// resources against concurrent release until the returned guard drops.
+#[cfg(windows)]
+fn view_at(i: u32, generation: u32) -> Option<PinnedView> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    pin_entry(views, i, generation)
 }
 
 /// For each record (tag, index, generation): whether it names a view that
@@ -554,7 +684,24 @@ fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
         .collect()
 }
 
+/// The view recorded at `handle`, if one is (and its resource is alive),
+/// pinning any referenced `Resource` objects until the guard drops.
+#[cfg(windows)]
+pub(crate) fn pinned_view(handle: u64) -> Option<PinnedView> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag != VIEW_TAG {
+        return None;
+    }
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    pin_entry(views, i, generation)
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
         return None;
@@ -654,15 +801,17 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let Some(step) = increment(kind).map(u64::from) else {
         return;
     };
-    let len = u64::from(count) * step;
-    if dst != 0 && src != 0 {
-        // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
-        #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+    if count == 0 || dst == 0 || src == 0 {
+        return;
     }
+    let Some(len) = u64::from(count).checked_mul(step) else { return };
+    if dst != src {
+        // SAFETY: both ranges are descriptor slots the title owns and may overlap.
+        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+    }
+    // Self-copy still mirrors: it can expose records written directly as bytes.
+    #[cfg(windows)]
+    mirror_copy(dst, count, kind, step);
 }
 
 /// Device method: ranges of descriptors (start and count each) gathered
@@ -981,6 +1130,88 @@ pub(crate) mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    /// A contiguous descriptor copy crossing adjacent heaps must use the
+    /// original per-handle fallback and enqueue both destination slots.
+    #[cfg(windows)]
+    #[test]
+    fn contiguous_copy_crossing_heap_boundary_mirrors_both_heaps() {
+        let mut memory = vec![0u8; 8 * 16];
+        let base = memory.as_mut_ptr() as u64;
+        let desc = HeapDesc { kind: SAMPLERS, count: 4, flags: SHADER_VISIBLE, nodes: 1 };
+        let mut first = std::ptr::null();
+        let mut second = std::ptr::null();
+        assert_eq!(create(desc, Placement { address: base, size: 4 * 16 }, &mut first), S_OK);
+        assert_eq!(create(desc, Placement { address: base + 4 * 16, size: 4 * 16 }, &mut second), S_OK);
+        let source = [0u8; 2 * 16];
+        copy_simple(std::ptr::null(), 2, base + 3 * 16, source.as_ptr() as u64, SAMPLERS);
+        let a = heap(first).pending.lock().unwrap().clone();
+        let b = heap(second).pending.lock().unwrap().clone();
+        assert_eq!(a, [3]);
+        assert_eq!(b, [0]);
+        release(first);
+        release(second);
+    }
+
+    /// The batch path replays lazy slots and covers both the 256-slot
+    /// batch boundary and the small per-handle tail.
+    #[cfg(windows)]
+    #[test]
+    fn descriptor_copies_mirror_batched_slots_before_and_after_host_creation() {
+        let null = std::ptr::null();
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 261,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let mut h = null;
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut h), S_OK);
+        let dst = heap(h).start;
+        let mut source = [[0u64; 2]; 261];
+        let src = source.as_mut_ptr() as u64;
+        for i in [0, 255, 256, 260] {
+            create_sampler(null, &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], src + i * 16);
+        }
+        copy_simple(null, 261, dst, src, SAMPLERS);
+        assert_eq!(heap(h).pending.lock().unwrap().len(), 261);
+        if crate::host::host().is_some() {
+            let host = heap(h).host().expect("host sampler heap");
+            for i in [0, 255, 256, 260] {
+                assert!(host.made(i));
+            }
+            // SAFETY: these are full descriptors in the live source and destination.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src as *const u8, (dst + 16) as *mut u8, 16);
+                (dst as *mut [u64; 2]).write_unaligned([0; 2]);
+            }
+            assert!(host.made(0));
+            assert!(!host.made(1));
+            copy_simple(null, 261, dst, dst, SAMPLERS);
+            assert!(!host.made(0), "a raw write cleared slot 0");
+            assert!(host.made(1), "a raw write installed slot 1");
+            assert!(host.made(260), "the tail descriptor survives");
+        }
+        release(h);
+    }
+
+    /// The underlying descriptor copy retains memmove semantics for both
+    /// overlap directions, and self-copy still exercises the mirror path.
+    #[test]
+    fn contiguous_descriptor_copy_preserves_overlap_and_self_copy() {
+        let mut memory = vec![0u8; 5 * 32];
+        for i in 0..5 {
+            memory[i * 32] = (i + 1) as u8;
+        }
+        let base = memory.as_mut_ptr() as u64;
+        copy_simple(std::ptr::null(), 4, base + 32, base, VIEWS_KIND);
+        assert_eq!((0..5).map(|i| memory[i * 32]).collect::<Vec<_>>(), [1, 1, 2, 3, 4]);
+        copy_simple(std::ptr::null(), 4, base, base + 32, VIEWS_KIND);
+        assert_eq!((0..5).map(|i| memory[i * 32]).collect::<Vec<_>>(), [1, 2, 3, 4, 4]);
+        let before = memory.clone();
+        copy_simple(std::ptr::null(), 5, base, base, VIEWS_KIND);
+        assert_eq!(memory, before);
     }
 
     /// A record the title copies into its shader-visible heap as bytes (no

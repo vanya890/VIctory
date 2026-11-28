@@ -13,6 +13,8 @@ pub const FILE_HEADER_SIZE: usize = 20;
 
 /// `IMAGE_FILE_HEADER::Characteristics` (u16).
 pub const FILE_HEADER_CHARACTERISTICS: usize = 18;
+/// `IMAGE_FILE_HEADER::SizeOfOptionalHeader` (u16).
+pub const FILE_HEADER_SIZE_OF_OPTIONAL_HEADER: usize = 16;
 
 /// `IMAGE_OPTIONAL_HEADER64::AddressOfEntryPoint` (u32).
 pub const OPT_ADDRESS_OF_ENTRY_POINT: usize = 16;
@@ -83,13 +85,35 @@ pub fn file_header_offset(data: &[u8]) -> Option<usize> {
 
 /// Offset of data directory `index` from the start of the file.
 pub fn data_directory_offset(data: &[u8], index: usize) -> Option<usize> {
+    let fh = file_header_offset(data)?;
+    let size = read_u16(data, fh.checked_add(FILE_HEADER_SIZE_OF_OPTIONAL_HEADER)?)? as usize;
     let opt = optional_header_offset(data)?;
+    if opt.checked_add(size)? > data.len() {
+        return None;
+    }
     let count = read_u32(data, opt.checked_add(OPT_NUMBER_OF_RVA_AND_SIZES)?)? as usize;
+    let room = size
+        .checked_sub(OPT_DATA_DIRECTORY)?
+        .checked_div(DATA_DIRECTORY_SIZE)?;
+    let count = count.min(room);
     if index >= count {
         return None;
     }
-    opt.checked_add(OPT_DATA_DIRECTORY)?
-        .checked_add(index.checked_mul(DATA_DIRECTORY_SIZE)?)
+    let table = opt.checked_add(OPT_DATA_DIRECTORY)?;
+    let end = table.checked_add(count.checked_mul(DATA_DIRECTORY_SIZE)?)?;
+    if end > opt.checked_add(size)? || end > data.len() {
+        return None;
+    }
+    let at = table.checked_add(index.checked_mul(DATA_DIRECTORY_SIZE)?)?;
+    if at.checked_add(DATA_DIRECTORY_SIZE)? > data.len() {
+        return None;
+    }
+    Some(at)
+}
+
+pub fn read_u16(data: &[u8], at: usize) -> Option<u16> {
+    let end = at.checked_add(2)?;
+    Some(u16::from_le_bytes(data.get(at..end)?.try_into().ok()?))
 }
 
 pub fn read_u32(data: &[u8], at: usize) -> Option<u32> {
@@ -118,6 +142,9 @@ mod tests {
         data[..2].copy_from_slice(b"MZ");
         data[DOS_E_LFANEW..DOS_E_LFANEW + 4].copy_from_slice(&0x40u32.to_le_bytes());
         let opt = optional_header_offset(&data).unwrap();
+        let fh = file_header_offset(&data).unwrap();
+        data[fh + FILE_HEADER_SIZE_OF_OPTIONAL_HEADER..fh + FILE_HEADER_SIZE_OF_OPTIONAL_HEADER + 2]
+            .copy_from_slice(&((OPT_DATA_DIRECTORY + 16 * DATA_DIRECTORY_SIZE) as u16).to_le_bytes());
         data[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
         data[opt + OPT_NUMBER_OF_RVA_AND_SIZES..opt + OPT_NUMBER_OF_RVA_AND_SIZES + 4]
             .copy_from_slice(&16u32.to_le_bytes());
@@ -223,6 +250,31 @@ mod tests {
         assert!(data_directory_offset(&data, 2).is_some());
         assert_eq!(data_directory_offset(&data, 3), None);
         assert_eq!(data_directory_offset(&data, dir::IAT), None);
+    }
+
+    #[test]
+    fn data_directory_offset_respects_size_of_optional_header() {
+        let mut data = image();
+        let fh = file_header_offset(&data).unwrap();
+        let opt = optional_header_offset(&data).unwrap();
+        // The optional header declares room for two data directories.
+        let size = (OPT_DATA_DIRECTORY + 2 * DATA_DIRECTORY_SIZE) as u16;
+        data[fh + FILE_HEADER_SIZE_OF_OPTIONAL_HEADER..fh + FILE_HEADER_SIZE_OF_OPTIONAL_HEADER + 2]
+            .copy_from_slice(&size.to_le_bytes());
+        assert_eq!(
+            data_directory_offset(&data, 1),
+            Some(opt + OPT_DATA_DIRECTORY + DATA_DIRECTORY_SIZE)
+        );
+        assert_eq!(data_directory_offset(&data, 2), None);
+
+        // A count beyond the declared optional header is not trusted.
+        data[opt + OPT_NUMBER_OF_RVA_AND_SIZES..opt + OPT_NUMBER_OF_RVA_AND_SIZES + 4]
+            .copy_from_slice(&16u32.to_le_bytes());
+        assert_eq!(data_directory_offset(&data, 2), None);
+
+        // Nor is an entry that runs past the end of the buffer.
+        let cut = &data[..opt + OPT_DATA_DIRECTORY + DATA_DIRECTORY_SIZE];
+        assert_eq!(data_directory_offset(cut, 1), None);
     }
 
     #[test]

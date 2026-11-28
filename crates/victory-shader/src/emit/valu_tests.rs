@@ -79,6 +79,12 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 }
 
 fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    try_build_valu_cs_lanes(body, 1)
+}
+
+/// [`try_build_valu_cs`] with `lanes` threads in the group (one wave of 32
+/// at most); `v0` holds each thread's index.
+fn try_build_valu_cs_lanes(body: &[u32], lanes: u32) -> Result<HostShader, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -127,7 +133,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads: [lanes, 1, 1],
         }),
         code,
     };
@@ -292,6 +298,50 @@ fn a_branch_to_fallthrough_keeps_both_values_at_a_join() {
     );
 }
 
+#[test]
+fn the_scc_a_waterfall_loop_leaves_is_false() {
+    let shader = build_valu_cs(&[
+        s_mov_b32(20, 126),                     // s20 = exec_lo
+        s_mov_b32(21, 126),                     // s21 = exec_lo
+        vop1(0x002, 22, vgpr(1)),               // loop: v_readfirstlane_b32 s22, v1
+        0x7C00_0000 | 0xD2 << 17 | 1 << 9 | 22, // v_cmpx_eq_u32 s22, v1
+        0xBE95_4715,                            // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFFC,                            // s_cbranch_execnz -> loop
+        s_mov_b32(126, 20),                     // exec_lo = s20
+        sop2(0x0A, 23, 1, 2),                   // s_cselect_b32 s23, s1, s2
+        vop1(0x001, 0, sgpr(23)),               // v0 = s23
+    ]);
+    run_cases(
+        &shader,
+        &[[3, 1, 2, 0], [0, 7, 9, 0]],
+        |backend, _, inputs, actual| {
+            assert_eq!(actual, inputs[2], "{backend}");
+        },
+    );
+}
+
+/// The same loop over 32 lanes keyed `lane & s0` (1, 2, 8 or 32 distinct
+/// keys), so it runs that many passes before the SCC is read.
+#[test]
+fn the_scc_a_waterfall_loop_over_many_keys_leaves_is_false() {
+    let mut body = vop3(0x11B, 5, sgpr(0), vgpr(0), 0).to_vec(); // v_and_b32 v5, s0, v0
+    body.extend([
+        s_mov_b32(20, 126),                     // s20 = exec_lo
+        s_mov_b32(21, 126),                     // s21 = exec_lo
+        vop1(0x002, 22, vgpr(5)),               // loop: v_readfirstlane_b32 s22, v5
+        0x7C00_0000 | 0xD2 << 17 | 5 << 9 | 22, // v_cmpx_eq_u32 s22, v5
+        0xBE95_4715,                            // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFFC,                            // s_cbranch_execnz -> loop
+        s_mov_b32(126, 20),                     // exec_lo = s20
+        sop2(0x0A, 23, 1, 2),                   // s_cselect_b32 s23, s1, s2
+        vop1(0x001, 0, sgpr(23)),               // v0 = s23
+    ]);
+    let shader = try_build_valu_cs_lanes(&body, 32).expect("build");
+    let cases = [0u32, 1, 7, 31].map(|m| [m, 5, 6, 0]);
+    run_cases(&shader, &cases, |backend, i, inputs, actual| {
+        assert_eq!(actual, inputs[2], "{backend}: case {i}");
+    });
+}
 #[test]
 fn v_fma_f16_rounds_once_and_preserves_other_half() {
     use super::host::Stride;
@@ -1475,6 +1525,87 @@ fn signed_64_bit_operands_sign_extend_their_literal() {
     // s_ashr_i64 s[6:7], -100, 4; v_mov_b32 v0, s7: the high dword.
     let ashr = [sop2(0x23, 6, 255, 0x84), MINUS_100, vop1(0x001, 0, sgpr(7))];
     check("s_ashr_i64", &ashr, &[([0; 4], u32::MAX)]);
+}
+
+/// The counts the 64-bit shift tests use: 0, 1, 31, 32, 33 and 63, and three
+/// past 63. Counts 32 and 33 check that the hardware's sixth count bit is
+/// preserved, and the counts past 63 check that higher bits are ignored.
+const SHIFT_CASES: [[u32; 4]; 9] = [
+    [0x0000_0001, 0x8000_0000, 0, 0],
+    [0x0000_0001, 0x8000_0000, 1, 0],
+    [0x0000_0001, 0x8000_0000, 31, 0],
+    [0x0000_0001, 0x8000_0000, 32, 0],
+    [0x0000_0001, 0x8000_0000, 33, 0],
+    [0x0000_0001, 0x8000_0000, 63, 0],
+    [0xFFFF_FFFF, 0xFFFF_FFFF, 64, 0],
+    [0xFFFF_FFFF, 0xFFFF_FFFF, 65, 0],
+    [0x0000_0000, 0x4000_0000, 0xFFFF_FFFF, 0],
+];
+
+/// Runs `cases` (the value's low dword, its high one, the count, unused)
+/// through a body that leaves the low dword of a 64-bit shift in `v0`, or the
+/// high one when `high`, comparing against `want`.
+fn run_shift64(
+    name: &str,
+    body: &[u32],
+    high: bool,
+    cases: &[[u32; 4]],
+    want: fn(u64, u32) -> u64,
+) {
+    let shader = build_valu_cs(body);
+    run_cases(&shader, cases, |backend, i, inp, got| {
+        let v = u64::from(inp[0]) | u64::from(inp[1]) << 32;
+        let r = want(v, inp[2]);
+        let want = if high { (r >> 32) as u32 } else { r as u32 };
+        assert_eq!(got, want, "{backend}: {name} case {i} {inp:x?}");
+    });
+}
+
+/// The 64-bit shifts of both forms, on the counts above: the hardware counts
+/// to six bits, and a count of 32 or more is not the same as 0 or 1.
+#[test]
+fn sixty_four_bit_shifts_count_to_six_bits() {
+    let shl = |v: u64, n: u32| v << (n & 63);
+    let shr = |v: u64, n: u32| v >> (n & 63);
+    let ashr = |v: u64, n: u32| ((v as i64) >> (n & 63)) as u64;
+    // SOP2 op s[6:7], s[0:1], s2 (the count is the third root constant).
+    let scalar = |op: u8, high: bool| {
+        let dst = if high { 7 } else { 6 };
+        vec![sop2(op, 6, 0, 2), vop1(0x001, 0, sgpr(dst))]
+    };
+    // VOP3 op v[5:6], v3 (the count), v[1:2] (the value).
+    let vector = |op: u16, high: bool| {
+        let dst = if high { 6 } else { 5 };
+        let mut words = vop3(op, 5, vgpr(3), vgpr(1), 0).to_vec();
+        words.push(vop1(0x001, 0, vgpr(dst)));
+        words
+    };
+    for high in [false, true] {
+        run_shift64("s_lshl_b64", &scalar(0x1F, high), high, &SHIFT_CASES, shl);
+        run_shift64("s_lshr_b64", &scalar(0x21, high), high, &SHIFT_CASES, shr);
+        run_shift64("s_ashr_i64", &scalar(0x23, high), high, &SHIFT_CASES, ashr);
+        run_shift64(
+            "v_lshlrev_b64",
+            &vector(0x2FF, high),
+            high,
+            &SHIFT_CASES,
+            shl,
+        );
+        run_shift64(
+            "v_lshrrev_b64",
+            &vector(0x300, high),
+            high,
+            &SHIFT_CASES,
+            shr,
+        );
+        run_shift64(
+            "v_ashrrev_i64",
+            &vector(0x301, high),
+            high,
+            &SHIFT_CASES,
+            ashr,
+        );
+    }
 }
 
 #[test]

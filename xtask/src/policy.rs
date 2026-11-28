@@ -147,10 +147,14 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    // Project-owned Python automation is permitted only under scripts/.
+    // It remains subject to every size, binary-signature and encoded-data check below.
+    let project_script = ext.as_deref() == Some("py") && path.starts_with("scripts/");
     let allowed = ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
-            .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
+            .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e))
+        || project_script;
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }
@@ -235,6 +239,21 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+        assert!(check("scripts/coordination_triage.py", b"print('read-only')\n").is_empty());
+        assert!(check("scripts/tool.py", b"print(1)\\n").is_empty());
+    }
+
+    #[test]
+    fn python_scripts_do_not_bypass_embedded_data_checks() {
+        let payload = format!("const DATA = \"{}\";\\n", "A1".repeat(400));
+        assert!(
+            !check("scripts/payload.py", payload.as_bytes()).is_empty(),
+            "Python under scripts/ must still reject encoded payloads"
+        );
+        assert!(
+            !check("scripts/large.py", &vec![b'a'; 600 * 1024]).is_empty(),
+            "Python under scripts/ must still obey the file-size limit"
+        );
     }
 
     #[test]
@@ -247,6 +266,10 @@ mod tests {
         assert!(
             !check("data.bin", b"hello").is_empty(),
             "extension not allowed"
+        );
+        assert!(
+            !check("src/unapproved.py", b"print('not allowed here')\n").is_empty(),
+            "Python is restricted to the scripts directory"
         );
         assert!(
             !check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(),

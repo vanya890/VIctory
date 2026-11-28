@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    E_FAIL, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
@@ -20,6 +22,277 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCSTR, PCWSTR, s, w};
+
+/// Returns the next fence value, reserving UINT64_MAX for D3D12 device removal.
+fn next_submission_value(current: u64) -> Option<u64> {
+    current.checked_add(1).filter(|value| *value != u64::MAX)
+}
+
+/// Confirms that a submitted command list has actually completed before any
+/// GPU-written data is read back or resources are retired.
+fn confirm_submission_completion(
+    signal: windows::core::Result<()>,
+    set_event: impl FnOnce() -> windows::core::Result<()>,
+    wait: impl FnOnce() -> WAIT_EVENT,
+    submitted: u64,
+    completed_value: impl FnOnce() -> u64,
+) -> windows::core::Result<()> {
+    signal?;
+    set_event()?;
+
+    // Preserve GetLastError from WAIT_FAILED: no other Win32 call may run
+    // between WaitForSingleObject and Error::from_thread().
+    let result = wait();
+    if result == WAIT_FAILED {
+        return Err(windows::core::Error::from_thread());
+    }
+    if result != WAIT_OBJECT_0 {
+        return Err(windows::core::Error::new(
+            E_FAIL,
+            format!("host submission event wait returned {:#x}", result.0),
+        ));
+    }
+
+    let completed = completed_value();
+    // D3D12 reserves UINT64_MAX as the device-removed fence value. Check it
+    // before the monotonic comparison, where it would otherwise look complete.
+    if completed == u64::MAX {
+        return Err(windows::core::Error::from_hresult(
+            DXGI_ERROR_DEVICE_REMOVED,
+        ));
+    }
+    if completed < submitted {
+        return Err(windows::core::Error::new(
+            E_FAIL,
+            format!("host submission fence completed {completed}, expected at least {submitted}"),
+        ));
+    }
+    Ok(())
+}
+
+/// A completion API can fail because the device was removed even when the
+/// individual call's HRESULT is not DXGI_ERROR_DEVICE_REMOVED. The device's
+/// own removal reason is authoritative for that case.
+fn submission_failure_is_device_removed(
+    error: &windows::core::Error,
+    removal_reason: &windows::core::Result<()>,
+) -> bool {
+    error.code() == DXGI_ERROR_DEVICE_REMOVED || removal_reason.is_err()
+}
+
+/// Formats a submission failure without discarding the diagnostics that
+/// identify the GPU work in flight when the device was removed.
+fn submission_failure_report(
+    submitted: u64,
+    lists: usize,
+    error: &windows::core::Error,
+    device_removed: bool,
+    removal_data: &str,
+    notes: &str,
+    removed_during: &str,
+) -> String {
+    if device_removed {
+        format!(
+            "host GPU device removed after submission {submitted} of {lists} lists: {error}{removal_data}{notes}{removed_during}"
+        )
+    } else {
+        format!("host GPU submission {submitted} did not complete: {error}")
+    }
+}
+
+#[cfg(test)]
+mod submission_completion_tests {
+    use std::cell::Cell;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+
+    use windows::Win32::Foundation::{
+        E_FAIL, ERROR_INVALID_HANDLE, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    use windows::core::{Error, HRESULT};
+
+    use super::{
+        confirm_submission_completion, submission_failure_is_device_removed,
+        submission_failure_report,
+    };
+
+    const SUBMITTED: u64 = 7;
+
+    #[test]
+    fn submission_counter_never_uses_the_device_removed_sentinel() {
+        use super::next_submission_value;
+
+        assert_eq!(next_submission_value(0), Some(1));
+        assert_eq!(next_submission_value(u64::MAX - 2), Some(u64::MAX - 1));
+        assert_eq!(next_submission_value(u64::MAX - 1), None);
+        assert_eq!(next_submission_value(u64::MAX), None);
+    }
+
+    #[test]
+    fn signaled_wait_at_or_past_target_confirms_completion() {
+        for completed in [SUBMITTED, SUBMITTED + 1] {
+            // SAFETY: create a private, initially signaled auto-reset event.
+            let event = unsafe { CreateEventW(None, false, true, None) }.unwrap();
+            // SAFETY: this test owns the newly created handle.
+            let _owned = unsafe { OwnedHandle::from_raw_handle(event.0) };
+            let result = confirm_submission_completion(
+                Ok(()),
+                || Ok(()),
+                // SAFETY: the owned event remains live throughout the wait.
+                || unsafe { WaitForSingleObject(event, 0) },
+                SUBMITTED,
+                || completed,
+            );
+            result.unwrap();
+        }
+    }
+
+    #[test]
+    fn signal_failure_stops_before_event_registration_or_wait() {
+        let set_event_called = Cell::new(false);
+        let wait_called = Cell::new(false);
+        let result = confirm_submission_completion(
+            Err(Error::new(E_FAIL, "signal failed")),
+            || {
+                set_event_called.set(true);
+                Ok(())
+            },
+            || {
+                wait_called.set(true);
+                WAIT_OBJECT_0
+            },
+            SUBMITTED,
+            || panic!("failed signal queried the fence"),
+        );
+        assert!(result.is_err());
+        assert!(!set_event_called.get());
+        assert!(!wait_called.get());
+    }
+
+    #[test]
+    fn event_registration_failure_stops_before_wait() {
+        let wait_called = Cell::new(false);
+        let result = confirm_submission_completion(
+            Ok(()),
+            || Err(Error::new(E_FAIL, "SetEventOnCompletion failed")),
+            || {
+                wait_called.set(true);
+                WAIT_OBJECT_0
+            },
+            SUBMITTED,
+            || panic!("failed event registration queried the fence"),
+        );
+        assert!(result.is_err());
+        assert!(!wait_called.get());
+    }
+
+    #[test]
+    fn failed_wait_preserves_the_win32_error() {
+        // SAFETY: Win32 rejects a null handle without dereferencing it.
+        let wait = unsafe { WaitForSingleObject(HANDLE::default(), 0) };
+        assert_eq!(wait, WAIT_FAILED);
+        let result = confirm_submission_completion(
+            Ok(()),
+            || Ok(()),
+            || wait,
+            SUBMITTED,
+            || panic!("failed wait queried the fence"),
+        );
+        assert_eq!(
+            result.unwrap_err().code(),
+            HRESULT::from_win32(ERROR_INVALID_HANDLE.0)
+        );
+    }
+
+    #[test]
+    fn unexpected_wait_result_is_rejected_without_querying_fence() {
+        let result = confirm_submission_completion(
+            Ok(()),
+            || Ok(()),
+            || WAIT_TIMEOUT,
+            SUBMITTED,
+            || panic!("unexpected wait queried the fence"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn incomplete_fence_is_rejected() {
+        let result = confirm_submission_completion(
+            Ok(()),
+            || Ok(()),
+            || WAIT_OBJECT_0,
+            SUBMITTED,
+            || SUBMITTED - 1,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn device_removed_sentinel_is_not_treated_as_completion() {
+        let result = confirm_submission_completion(
+            Ok(()),
+            || Ok(()),
+            || WAIT_OBJECT_0,
+            SUBMITTED,
+            || u64::MAX,
+        );
+        assert_eq!(result.unwrap_err().code(), DXGI_ERROR_DEVICE_REMOVED);
+    }
+
+    #[test]
+    fn device_removed_submission_failure_keeps_rich_diagnostics() {
+        let removed_hresult = Error::from(DXGI_ERROR_DEVICE_REMOVED);
+        let healthy_reason: windows::core::Result<()> = Ok(());
+        assert!(submission_failure_is_device_removed(
+            &removed_hresult,
+            &healthy_reason
+        ));
+
+        let ordinary_error = Error::new(E_FAIL, "event wait failed");
+        let removed_reason: windows::core::Result<()> =
+            Err(Error::from(DXGI_ERROR_DEVICE_REMOVED));
+        assert!(submission_failure_is_device_removed(
+            &ordinary_error,
+            &removed_reason
+        ));
+
+        let report = submission_failure_report(
+            SUBMITTED,
+            3,
+            &removed_hresult,
+            true,
+            "; page fault at 0x1234",
+            "; list 0: Dispatch",
+            "; removed while list 1 ran alone",
+        );
+        assert!(report.contains("device removed"), "{report}");
+        assert!(report.contains("page fault at 0x1234"), "{report}");
+        assert!(report.contains("list 0: Dispatch"), "{report}");
+        assert!(report.contains("removed while list 1 ran alone"), "{report}");
+    }
+
+    #[test]
+    fn ordinary_submission_failure_does_not_claim_device_removal() {
+        let error = Error::new(E_FAIL, "event wait failed");
+        let removal_reason: windows::core::Result<()> = Ok(());
+        assert!(!submission_failure_is_device_removed(&error, &removal_reason));
+
+        let report = submission_failure_report(
+            SUBMITTED,
+            1,
+            &error,
+            false,
+            "; unexpected DRED data",
+            "; stale list notes",
+            "; stale group",
+        );
+        assert!(report.contains("did not complete"), "{report}");
+        assert!(!report.contains("DRED"), "{report}");
+        assert!(!report.contains("stale"), "{report}");
+    }
+}
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -207,8 +480,17 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
+        // Strictly opt-in: long title workloads can exceed the normal GPU
+        // watchdog window. This disables timeout only for VIctory's direct
+        // queue; a real GPU hang can leave the display unresponsive much longer.
+        let no_tdr = crate::switch::on("VICTORY_NO_TDR");
         let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+            Flags: if no_tdr {
+                D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT
+            } else {
+                D3D12_COMMAND_QUEUE_FLAG_NONE
+            },
             ..Default::default()
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
@@ -392,6 +674,11 @@ pub(crate) mod tests {
         ISSUED.with(|l| std::mem::take(&mut *l.borrow_mut()))
     }
 
+    /// Holds the presenter lock for deterministic concurrency tests.
+    pub(crate) fn hold_presenter(host: &super::Host) -> impl Drop + '_ {
+        host.presenter.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Replays transitions in the order the GPU runs them from the states
     /// in `states` (resources not in it are not checked), by the debug
     /// layer's rule: each barrier's before-state is the resource's current
@@ -447,7 +734,10 @@ pub(crate) mod tests {
         let again = crate::shadow::take_reads();
         assert!(!again.contains(&plain) && !again.contains(&memory), "each once");
         crate::shadow::forget_read(memory);
-        assert!(!crate::shadow::take_reads().contains(&memory), "forgotten: its mark cleared");
+        // The next submission clears the old mark before the GPU writes a
+        // new one; clearing it in take_reads would lose that new mark.
+        crate::shadow::clear_forgotten();
+        assert!(!crate::shadow::take_reads().contains(&memory), "forgotten: its old mark cleared");
         crate::shadow::tests::mark_read(true, memory);
         assert!(crate::shadow::take_reads().contains(&memory), "read again after it was forgotten");
     }
@@ -1156,7 +1446,11 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.execute_locked(submitted, runs);
+    }
+
+    fn execute_locked(&self, mut submitted: std::sync::MutexGuard<'_, u64>, runs: &[&HostList]) {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1266,24 +1560,57 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         let mut removed_in = None;
+        // Clear marks forgotten while preparing this submission before its
+        // shaders can write fresh marks to the same bitmap slots.
+        crate::shadow::clear_forgotten();
         for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
+            let Some(next) = next_submission_value(*submitted) else {
+                fail(format_args!("host submission fence value exhausted before submission"));
+            };
+            *submitted = next;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
+            // SAFETY: lists are closed; this queue, fence and event belong
+            // to the host, and the submission mutex serializes their use.
+            let completion = unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                confirm_submission_completion(
+                    self.queue.Signal(&self.fence, *submitted),
+                    || self.fence.SetEventOnCompletion(*submitted, self.event),
+                    || WaitForSingleObject(self.event, INFINITE),
+                    *submitted,
+                    || self.fence.GetCompletedValue(),
+                )
+            };
+            if let Err(error) = completion {
+                // SAFETY: a plain query. On removal, keep the same DRED,
+                // command-note and per-list context as the post-loop path.
+                let removal_reason = unsafe { self.device.GetDeviceRemovedReason() };
+                let device_removed =
+                    submission_failure_is_device_removed(&error, &removal_reason);
+                if device_removed && groups.len() > 1 {
+                    removed_in = Some(i);
                 }
+                let (removal_data, notes, during) = if device_removed {
+                    (
+                        self.removal_data(runs),
+                        last_notes(runs),
+                        removed_during(runs, removed_in),
+                    )
+                } else {
+                    (String::new(), String::new(), String::new())
+                };
+                let report = submission_failure_report(
+                    *submitted,
+                    runs.len(),
+                    &error,
+                    device_removed,
+                    &removal_data,
+                    &notes,
+                    &during,
+                );
+                fail(format_args!("{report}"));
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
@@ -1458,7 +1785,7 @@ impl Host {
         let mut text = String::new();
         let mut fault_va = None;
         // SAFETY: the outputs are the runtime's, valid while the device
-        // lives; nodes are walked as linked, histories have their counts.
+        // lives; nodes are walked as linked, command histories are read only through accessible pages.
         unsafe {
             if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
                 && fault.PageFaultVA != 0
@@ -1499,7 +1826,7 @@ impl Host {
             let crumbs = match dred.GetAutoBreadcrumbsOutput() {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
-                    text.push_str(&format!("; no breadcrumbs ({e})"));
+                    text.push_str(&no_breadcrumbs(dred_on(), &e));
                     return text;
                 }
             };
@@ -1546,18 +1873,15 @@ impl Host {
             for (p, index) in nodes.iter().zip(&index) {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
-                    let history =
-                        std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
-                    text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
-                        p.BreadcrumbCount, history[done as usize].0
-                    ));
+                    let history = readable_history(p.pCommandHistory, p.BreadcrumbCount);
+                    text.push_str(&stopped_at(&history, p.BreadcrumbCount, done));
                     let run = index.map(|i| runs[i]);
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
                         let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
                         history
+                            .ops
                             .iter()
                             .enumerate()
                             .filter(|(_, op)| **op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER)
@@ -1572,9 +1896,11 @@ impl Host {
                     let markers: Vec<(u32, String)> = Vec::new();
                     #[cfg(not(feature = "diagnostics"))]
                     let _ = fault_va;
-                    if done > 0 {
-                        text.push_str(&in_flight(history, &markers, done as usize));
-                    } else if let Some(r) = run {
+                    if done > 0 && (done as usize) < history.ops.len() {
+                        text.push_str(&in_flight(&history.ops, &markers, done as usize));
+                    } else if done == 0
+                        && let Some(r) = run
+                    {
                         let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }
@@ -1590,7 +1916,7 @@ impl Host {
         let Some(queue) = &self.messages else {
             return None;
         };
-        let mut first_error = None;
+        let mut seen = Vec::new();
         // SAFETY: each message is read into a buffer of the size the queue
         // reports, then the queue is emptied.
         unsafe {
@@ -1607,14 +1933,14 @@ impl Host {
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
                     tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
-                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
-                        first_error = Some(text.to_owned());
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                        seen.push((m.ID, m.Severity, text.to_owned()));
                     }
                 }
             }
             queue.ClearStoredMessages();
         }
-        first_error
+        removal_cause(&seen)
     }
 
     /// A host render target view of `resource`, valid until it is recorded.
@@ -1819,14 +2145,23 @@ impl HostList {
         // One host texture for the whole move (`crate::resource::evict` may
         // give it up meanwhile; this list then holds it).
         let copy = crate::resource::host_copy(resource)?;
+        self.transition_copy(&copy, wanted)
+    }
+
+    /// [`HostList::transition`] for an already-pinned host texture.
+    pub(crate) fn transition_copy(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<(ID3D12Resource, u32)> {
         let texture = copy.texture.clone();
         if let Some(Some(twin)) = copy.twin.get()
-            && crate::twin::route(self, &copy, twin, wanted)
+            && crate::twin::route(self, copy, twin, wanted)
         {
             return None;
         }
-        let wanted = legal_state(&texture, wanted);
-        self.track(&copy, wanted).map(|before| (texture, before))
+        let wanted = copy.legal(wanted);
+        self.track(copy, wanted).map(|before| (texture, before))
     }
 
     /// The list's state for host texture `copy` becomes `wanted` (a legal
@@ -1857,7 +2192,7 @@ impl HostList {
         copy: &std::sync::Arc<crate::resource::HostTexture>,
         wanted: u32,
     ) -> Option<D3D12_RESOURCE_BARRIER> {
-        let wanted = legal_state(&copy.texture, wanted);
+        let wanted = copy.legal(wanted);
         let before = self.track(copy, wanted)?;
         Some(transition(
             &copy.texture,
@@ -2536,6 +2871,11 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+/// [`read_into`] a buffer not yet written: on true every byte of `dst` is.
+pub(crate) fn read_into_uninit(src: *const u8, dst: &mut [std::mem::MaybeUninit<u8>]) -> bool {
+    read(src, dst.as_mut_ptr().cast(), dst.len())
+}
+
 /// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
 /// page is not readable or a destination page not writable (the bytes
 /// before that page may have been copied).
@@ -2546,7 +2886,10 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     // SAFETY: the destination is `len` bytes the caller may write, host
     // memory or title memory; the kernel checks both ranges, and a page it
     // cannot read or write fails the call instead of faulting.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    unsafe {
+        ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0
+            && done == len
+    }
 }
 
 /// Copies host memory into title memory after a submission (what shaders
@@ -2585,7 +2928,7 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 
 #[cfg(test)]
 mod title_copies {
-    use super::{copy_mapped, write_mapped};
+    use super::{copy_mapped, read_into_uninit, write_mapped};
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
         VirtualAlloc, VirtualFree, VirtualProtect,
@@ -2622,6 +2965,28 @@ mod title_copies {
 
     fn pattern() -> Vec<u8> {
         (0..3 * BLOCK).map(|i| (i % 251) as u8 + 1).collect()
+    }
+
+    #[test]
+    fn read_into_uninit_rejects_unreadable_source_and_fills_entire_buffer() {
+        let source = holed(0x5a);
+
+        let mut unreadable = Box::<[u8]>::new_uninit_slice(BLOCK);
+        // SAFETY: the middle block is reserved but not committed; the kernel
+        // checks the source range and reports the failed read.
+        assert!(!read_into_uninit(unsafe { source.add(BLOCK) }, &mut unreadable));
+
+        // SAFETY: this range starts in the committed first block and crosses
+        // into the reserved middle block; a partial copy is not a full read.
+        assert!(!read_into_uninit(unsafe { source.add(BLOCK / 2) }, &mut unreadable));
+
+        let mut readable = Box::<[u8]>::new_uninit_slice(BLOCK);
+        assert!(read_into_uninit(source, &mut readable));
+        // SAFETY: a successful ReadProcessMemory call wrote every byte.
+        let readable = unsafe { readable.assume_init() };
+        assert!(readable.iter().all(|&byte| byte == 0x5a));
+
+        release(source);
     }
 
     #[test]
@@ -2767,12 +3132,109 @@ impl Host {
 /// family's.
 fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
-        27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
-        87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
-        23..=25 => DXGI_FORMAT_R10G10B10A2_UNORM,
-        9..=14 => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        28 | 29 | 31 => DXGI_FORMAT_R8G8B8A8_UNORM,
+        87 | 88 | 91 | 93 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        24 => DXGI_FORMAT_R10G10B10A2_UNORM,
+        10 | 11 | 13 => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        // Typeless resources and integer primaries need a typed view or an
+        // explicit conversion path; never reinterpret their bits as UNORM.
         _ => return None,
     })
+}
+
+/// Whether a color resource format is typeless and therefore needs the
+/// actual typed view format supplied by the title.
+pub(crate) fn is_typeless_color_format(format: DXGI_FORMAT) -> bool {
+    matches!(format.0, 1 | 5 | 9 | 15 | 23 | 27 | 33 | 39 | 48 | 53 | 60 | 90 | 92)
+}
+
+/// Whether a raw copy would reinterpret component encoding and must instead
+/// pass through the fullscreen compositor.
+fn needs_format_conversion(src: DXGI_FORMAT, dst: DXGI_FORMAT) -> bool {
+    matches!((src.0, dst.0), (11 | 13, 10) | (31, 28) | (88 | 93, 87))
+}
+
+/// The typed SRV format for a presented plane. Typeless resources are
+/// rejected by the plane's SRV lookup unless the caller supplies the actual
+/// typed view format used to render the pixels.
+fn compositor_srv_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+    Some(match format.0 {
+        2 | 6 | 10 | 11 | 13 | 16 | 24 | 26 | 28 | 31 | 34 | 35 | 37 | 41 | 49 | 51 | 54 | 56
+        | 58 | 61 | 63 | 67 | 85 | 86 | 87 | 88 | 89 => format,
+        29 => DXGI_FORMAT_R8G8B8A8_UNORM,
+        90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        92 | 93 => DXGI_FORMAT_B8G8R8X8_UNORM,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod present_format_tests {
+    use super::*;
+
+    #[test]
+    fn primary_format_mapping_rejects_integer_and_ambiguous_typeless_formats() {
+        assert_eq!(swap_format(DXGI_FORMAT_R8G8B8A8_UINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R8G8B8A8_SINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R16G16B16A16_UINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R16G16B16A16_SINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R10G10B10A2_UINT), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R8G8B8A8_TYPELESS), None);
+        assert_eq!(swap_format(DXGI_FORMAT_R16G16B16A16_TYPELESS), None);
+        assert_eq!(swap_format(DXGI_FORMAT_B8G8R8X8_TYPELESS), None);
+        assert_eq!(
+            swap_format(DXGI_FORMAT_B8G8R8X8_UNORM),
+            Some(DXGI_FORMAT_B8G8R8A8_UNORM)
+        );
+    }
+
+    #[test]
+    fn compositor_uses_typed_views_and_requires_numeric_conversion() {
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R16G16B16A16_UNORM),
+            Some(DXGI_FORMAT_R16G16B16A16_UNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R16G16B16A16_SNORM),
+            Some(DXGI_FORMAT_R16G16B16A16_SNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R8G8B8A8_SNORM),
+            Some(DXGI_FORMAT_R8G8B8A8_SNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R8G8B8A8_UINT),
+            None
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R16G16B16A16_UINT),
+            None
+        );
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_R16G16B16A16_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        ));
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_R16G16B16A16_SNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        ));
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_R8G8B8A8_SNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        ));
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_B8G8R8X8_UNORM,
+            DXGI_FORMAT_B8G8R8A8_UNORM
+        ));
+        assert!(!needs_format_conversion(
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        ));
+        assert!(!needs_format_conversion(
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        ));
+    }
 }
 
 const BUFFERS: u32 = 2;
@@ -3177,14 +3639,84 @@ impl Meter {
     }
 }
 
+/// A texture presented by [`Host::present_planes`].
+pub(crate) enum PresentPlane<'a> {
+    /// A title texture, its tracked host state, and the typed RTV format used
+    /// by the title when the host resource itself is typeless. Callers obtain
+    /// the override with `resource::view_format(title_resource)`.
+    Tracked(&'a crate::resource::HostTexture, Option<u32>),
+    /// A raw host texture in a known state (tests).
+    #[cfg(all(test, feature = "diagnostics"))]
+    Raw(&'a ID3D12Resource, u32, Option<u32>),
+}
+
+impl<'a> PresentPlane<'a> {
+    fn texture(&self) -> &'a ID3D12Resource {
+        match self {
+            Self::Tracked(copy, _) => &copy.texture,
+            #[cfg(all(test, feature = "diagnostics"))]
+            Self::Raw(texture, _, _) => texture,
+        }
+    }
+
+    fn state(&self) -> u32 {
+        match self {
+            Self::Tracked(copy, _) => copy.state.load(Ordering::Relaxed),
+            #[cfg(all(test, feature = "diagnostics"))]
+            Self::Raw(_, state, _) => *state,
+        }
+    }
+
+    fn view_format(&self) -> Option<DXGI_FORMAT> {
+        match self {
+            Self::Tracked(_, format) => format.map(|f| DXGI_FORMAT(f as i32)),
+            #[cfg(all(test, feature = "diagnostics"))]
+            Self::Raw(_, _, format) => format.map(|f| DXGI_FORMAT(f as i32)),
+        }
+    }
+
+    /// The format a compositor may safely sample. A typeless resource needs
+    /// the actual typed view that produced its pixels; a denied-SRV resource
+    /// cannot be sampled at all.
+    fn srv_format(&self) -> Option<DXGI_FORMAT> {
+        // SAFETY: this plane owns a live host resource.
+        let desc = unsafe { self.texture().GetDesc() };
+        if desc.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 != 0 {
+            return None;
+        }
+        let format = self.view_format().unwrap_or(desc.Format);
+        if self.view_format().is_none() && is_typeless_color_format(format) {
+            return None;
+        }
+        compositor_srv_format(format)
+    }
+}
+
 impl Host {
     /// Shows one or more `planes` (each a live host texture and its current
     /// host state, kept in that state), compositing planes 1.. on top of
     /// plane 0 when multiple planes are presented, as frame `frame` (saved if
     /// captures are on). `None` if nothing was shown; else, in diagnostics
     /// builds, whether the frame was black.
+    #[cfg(all(test, feature = "diagnostics"))]
     pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
-        self.present_with_compositor(
+        let planes: Vec<_> = planes
+            .iter()
+            .map(|&(texture, state)| PresentPlane::Raw(texture, state, None))
+            .collect();
+        self.present_planes(&planes, frame).0
+    }
+
+    /// Shows one or more `planes`, reading each tracked texture's live host
+    /// state under `Host::submitted` so concurrent submissions never observe a
+    /// phantom transition state or race with the present copy's barriers.
+    /// Returns the presentation outcome and the primary plane's observed state.
+    pub(crate) fn present_planes(
+        &self,
+        planes: &[PresentPlane<'_>],
+        frame: u64,
+    ) -> (Option<bool>, u32) {
+        self.present_planes_with_compositor(
             planes,
             frame,
             Compositor::new,
@@ -3193,71 +3725,118 @@ impl Host {
         )
     }
 
+    #[cfg(all(test, feature = "diagnostics"))]
     fn present_with_compositor(
         &self,
         planes: &[(&ID3D12Resource, u32)],
+        frame: u64,
+        create_compositor: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
+        inspect: impl FnOnce(&ID3D12Resource, &D3D12_PLACED_SUBRESOURCE_FOOTPRINT),
+    ) -> Option<bool> {
+        let planes: Vec<_> = planes
+            .iter()
+            .map(|&(texture, state)| PresentPlane::Raw(texture, state, None))
+            .collect();
+        self.present_planes_with_compositor(&planes, frame, create_compositor, inspect)
+            .0
+    }
+
+    fn present_planes_with_compositor(
+        &self,
+        planes: &[PresentPlane<'_>],
         frame: u64,
         create_compositor: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
         #[cfg(all(test, feature = "diagnostics"))] inspect: impl FnOnce(
             &ID3D12Resource,
             &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         ),
-    ) -> Option<bool> {
-        let &(primary, _) = planes.first()?;
+    ) -> (Option<bool>, u32) {
+        let Some(first) = planes.first() else {
+            return (None, 0);
+        };
+        let primary = first.texture();
+        let fallback_state = || first.state();
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
-        let Some(format) = swap_format(primary_desc.Format) else {
-            tracing::warn!(format = primary_desc.Format.0, "cannot present this format");
-            return None;
+        let primary_format = first.view_format().unwrap_or(primary_desc.Format);
+        let Some(format) = swap_format(primary_format) else {
+            tracing::warn!(format = primary_format.0, "cannot present this format");
+            return (None, fallback_state());
         };
+        let conversion_required = needs_format_conversion(primary_format, format);
+        let sampleable: Vec<_> = planes
+            .iter()
+            .take(MAX_PLANES as usize)
+            .filter_map(|plane| plane.srv_format().map(|srv| (plane, srv)))
+            .collect();
+        let primary_sampleable = sampleable
+            .first()
+            .is_some_and(|(plane, _)| plane.texture().as_raw() == primary.as_raw());
+        if conversion_required && !primary_sampleable {
+            tracing::warn!(
+                format = primary_format.0,
+                "cannot convert a primary plane that has no legal shader-resource view"
+            );
+            return (None, fallback_state());
+        }
+        let mut use_compositor = primary_sampleable
+            && (conversion_required || sampleable.len() > 1);
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let Presentation { presenter, retry } = &mut *presentation;
         if presenter.is_none() && !retry.ready(Instant::now()) {
-            return None;
+            return (None, fallback_state());
         }
         let cached_format = presenter
             .as_ref()
             .and_then(|p| p.compositor.as_ref())
             .map(|c| c.format);
         let mut new_compositor = None;
-        let planes = if planes.len() > 1 && cached_format != Some(format) {
+        if use_compositor && cached_format != Some(format) {
             match create_compositor(&self.device, format) {
-                Ok(c) => {
-                    new_compositor = Some(c);
-                    planes
+                Ok(c) => new_compositor = Some(c),
+                Err(e) if conversion_required => {
+                    tracing::warn!(
+                        error = %e,
+                        format = format.0,
+                        "cannot present a primary plane that requires format conversion"
+                    );
+                    return (None, fallback_state());
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "presenting the primary plane after compositor initialization failed");
-                    &planes[..1]
+                    use_compositor = false;
                 }
             }
-        } else {
-            planes
-        };
+        }
         let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
-        for &(tex, _) in &planes[1..] {
-            // SAFETY: live resource.
-            let d = unsafe { tex.GetDesc() };
-            width = width.max(d.Width as u32);
-            height = height.max(d.Height);
+        if use_compositor {
+            for (plane, _) in &sampleable[1..] {
+                // SAFETY: each sampleable plane holds a live host resource.
+                let d = unsafe { plane.texture().GetDesc() };
+                width = width.max(d.Width as u32);
+                height = height.max(d.Height);
+            }
         }
         if presenter.is_none() {
             *presenter = match retry
-                .attempt(Instant::now(), || self.presenter(width, height, format))?
+                .attempt(Instant::now(), || self.presenter(width, height, format))
             {
-                Ok(p) => Some(p),
-                Err((step, e)) => {
+                Some(Ok(p)) => Some(p),
+                Some(Err((step, e))) => {
                     tracing::warn!(error = %e, step, width, height, format = format.0, "no swap chain");
-                    return None;
+                    return (None, fallback_state());
                 }
+                None => return (None, fallback_state()),
             };
         }
-        let p = presenter.as_mut()?;
+        let Some(p) = presenter.as_mut() else {
+            return (None, fallback_state());
+        };
         if let Some(c) = new_compositor {
             p.compositor = Some(c);
         }
         if (p.width, p.height, p.format) != (width, height, format) {
-            let resized = retry.attempt(Instant::now(), || {
+            let Some(resized) = retry.attempt(Instant::now(), || {
                 // SAFETY: no back buffer is held; every submission was waited for.
                 unsafe {
                     p.swap_chain.ResizeBuffers(
@@ -3268,12 +3847,14 @@ impl Host {
                         DXGI_SWAP_CHAIN_FLAG(0),
                     )
                 }
-            })?;
+            }) else {
+                return (None, fallback_state());
+            };
             match resized {
                 Ok(()) => (p.width, p.height, p.format) = (width, height, format),
                 Err(e) => {
                     tracing::warn!(error = %e, width, height, format = format.0, "swap chain not resized");
-                    return None;
+                    return (None, fallback_state());
                 }
             }
         }
@@ -3281,12 +3862,20 @@ impl Host {
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
-                return None;
+                return (None, fallback_state());
             };
+            // Serialize tracked state reads, barrier recording, and execution
+            // with `Host::execute` so `p.copy` matches the live GPU state.
+            let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let primary_state = first.state();
+            let sampleable_states: Vec<(&ID3D12Resource, u32, DXGI_FORMAT)> = sampleable
+                .iter()
+                .map(|(plane, format)| (plane.texture(), plane.state(), *format))
+                .collect();
             p.copy.reset();
             let list = &p.copy.list;
-            let (capture, probe) = if planes.len() == 1 {
-                let (texture, state) = planes[0];
+            let (capture, probe) = if !use_compositor {
+                let (texture, state) = (primary, primary_state);
                 let state = D3D12_RESOURCE_STATES(state as i32);
                 let mut before = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
@@ -3298,7 +3887,25 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
                 list.ResourceBarrier(&before);
-                list.CopyResource(&back, texture);
+                let mut dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::ManuallyDrop::new(Some(back.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                let mut src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::ManuallyDrop::new(Some(texture.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                // SAFETY: the command list has consumed both locations; drop
+                // the COM references we placed in their ManuallyDrop fields.
+                std::mem::ManuallyDrop::drop(&mut dst.pResource);
+                std::mem::ManuallyDrop::drop(&mut src.pResource);
                 #[cfg(all(test, feature = "diagnostics"))]
                 let capture = {
                     // Inspect what reached the swap chain, before Present.
@@ -3338,7 +3945,8 @@ impl Host {
                 list.ResourceBarrier(&after);
                 (capture, probe)
             } else {
-                let comp = p.compositor.as_ref().expect("compositor was prepared for multiple planes");
+                let comp = p.compositor.as_ref().expect("compositor was prepared for the primary conversion or multiple planes");
+                let planes = &sampleable_states;
                 let rtv = comp.rtv_heap.GetCPUDescriptorHandleForHeapStart();
                 self.device.CreateRenderTargetView(
                     &back,
@@ -3356,12 +3964,10 @@ impl Host {
                 );
                 let srv_cpu_base = comp.srv_heap.GetCPUDescriptorHandleForHeapStart();
                 let srv_gpu_base = comp.srv_heap.GetGPUDescriptorHandleForHeapStart();
-                let count = planes.len().min(MAX_PLANES as usize);
+                let count = planes.len();
                 let mut before = Vec::with_capacity(count + 1);
                 let mut after = Vec::with_capacity(count);
-                for (i, &(tex, state)) in planes[..count].iter().enumerate() {
-                    let d = tex.GetDesc();
-                    let srv_fmt = swap_format(d.Format).unwrap_or(d.Format);
+                for (i, &(tex, state, srv_fmt)) in planes.iter().enumerate() {
                     let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
                         ptr: srv_cpu_base.ptr + i * comp.srv_stride as usize,
                     };
@@ -3386,7 +3992,7 @@ impl Host {
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
                         && planes[..i]
                             .iter()
-                            .all(|(earlier, _)| earlier.as_raw() != tex.as_raw())
+                            .all(|(earlier, _, _)| earlier.as_raw() != tex.as_raw())
                     {
                         before.push(transition(
                             tex,
@@ -3468,7 +4074,7 @@ impl Host {
                 (capture, probe)
             };
             p.copy.close();
-            self.execute(&[&p.copy]);
+            self.execute_locked(submitted, &[&p.copy]);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 // Tests inspect the completed copy before flip-discard Present
@@ -3480,11 +4086,14 @@ impl Host {
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            return (
+                Some(probe.is_some_and(|b| crate::capture::black(&b))),
+                primary_state,
+            );
             #[cfg(not(feature = "diagnostics"))]
             {
                 let _ = (capture, probe);
-                Some(false)
+                (Some(false), primary_state)
             }
         }
     }
@@ -3756,6 +4365,38 @@ fn removed_during(runs: &[&HostList], list: Option<usize>) -> String {
     String::new()
 }
 
+fn no_breadcrumbs(dred: bool, e: &windows::core::Error) -> String {
+    if !dred && e.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_UNSUPPORTED {
+        "; no breadcrumbs (device-removed data is off: VICTORY_D3D12_DRED=1 in a diagnostics build)"
+            .to_owned()
+    } else {
+        format!("; no breadcrumbs ({e})")
+    }
+}
+
+#[cfg(test)]
+mod removal_report {
+    use super::no_breadcrumbs;
+    use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_INVALID_CALL, DXGI_ERROR_UNSUPPORTED};
+
+    #[test]
+    fn breadcrumbs_off_names_the_switch_not_the_runtime_error() {
+        let e = windows::core::Error::from(DXGI_ERROR_UNSUPPORTED);
+        let off = no_breadcrumbs(false, &e);
+        assert!(off.contains("VICTORY_D3D12_DRED=1"), "{off}");
+        assert!(!off.contains("0x887A0004"), "{off}");
+        let on = no_breadcrumbs(true, &e);
+        assert!(on.contains("0x887A0004"), "{on}");
+    }
+
+    #[test]
+    fn breadcrumbs_off_keeps_other_errors() {
+        let e = windows::core::Error::from(DXGI_ERROR_INVALID_CALL);
+        let off = no_breadcrumbs(false, &e);
+        assert!(off.contains("0x887A0001"), "{off}");
+        assert!(!off.contains("VICTORY_D3D12_DRED"), "{off}");
+    }
+}
 /// For adapters without device-removed data (the software one): the last
 /// commands each list of the failed submission noted (diagnostics, with
 /// `VICTORY_D3D12_DRED`).
@@ -3797,6 +4438,220 @@ fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
 /// barriers overlaps on the GPU), by kind, and what the markers just
 /// before them say (`HostList::note_op`: diagnostics builds with
 /// device-removed data on).
+const MAX_BREADCRUMB_HISTORY_BYTES: usize = 64 << 20;
+const BREADCRUMB_PAGE_BYTES: usize = 4 << 10;
+const BREADCRUMB_OPS_PER_PAGE: usize =
+    BREADCRUMB_PAGE_BYTES / std::mem::size_of::<D3D12_AUTO_BREADCRUMB_OP>();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryStop {
+    Complete,
+    Unreadable,
+    Limit,
+    Allocation,
+    Invalid,
+}
+
+struct BreadcrumbHistory {
+    ops: Vec<D3D12_AUTO_BREADCRUMB_OP>,
+    stop: HistoryStop,
+    limit_bytes: usize,
+}
+
+fn readable_history(
+    history: *const D3D12_AUTO_BREADCRUMB_OP,
+    count: u32,
+) -> BreadcrumbHistory {
+    readable_history_with_limit(history, count, MAX_BREADCRUMB_HISTORY_BYTES)
+}
+
+fn readable_history_with_limit(
+    history: *const D3D12_AUTO_BREADCRUMB_OP,
+    count: u32,
+    max_bytes: usize,
+) -> BreadcrumbHistory {
+    let element = std::mem::size_of::<D3D12_AUTO_BREADCRUMB_OP>();
+    let invalid = || BreadcrumbHistory {
+        ops: Vec::new(),
+        stop: HistoryStop::Invalid,
+        limit_bytes: max_bytes,
+    };
+    let Some(requested) = element.checked_mul(count as usize) else {
+        return invalid();
+    };
+    let limit_bytes = max_bytes - max_bytes % element;
+    let length = requested.min(limit_bytes);
+    let limited = requested > length;
+    if length == 0 {
+        return BreadcrumbHistory {
+            ops: Vec::new(),
+            stop: if limited { HistoryStop::Limit } else { HistoryStop::Complete },
+            limit_bytes,
+        };
+    }
+    let start = history as usize;
+    if !start.is_multiple_of(std::mem::align_of::<D3D12_AUTO_BREADCRUMB_OP>()) {
+        return invalid();
+    }
+    let Some(end) = start.checked_add(length) else {
+        return invalid();
+    };
+
+    let mut ops = Vec::new();
+    let mut piece = [D3D12_AUTO_BREADCRUMB_OP(0); BREADCRUMB_OPS_PER_PAGE];
+    let mut at = start;
+    while at < end {
+        let n = (BREADCRUMB_PAGE_BYTES - at % BREADCRUMB_PAGE_BYTES).min(end - at);
+        let elements = n / element;
+        // The source is element-aligned and page boundaries are multiples of
+        // the enum size, so this page-sized destination is sufficient.
+        if !read(at as *const u8, piece.as_mut_ptr().cast(), n) {
+            return BreadcrumbHistory {
+                ops,
+                stop: HistoryStop::Unreadable,
+                limit_bytes,
+            };
+        }
+        if ops.try_reserve(elements).is_err() {
+            return BreadcrumbHistory {
+                ops,
+                stop: HistoryStop::Allocation,
+                limit_bytes,
+            };
+        }
+        ops.extend_from_slice(&piece[..elements]);
+        at += n;
+    }
+    BreadcrumbHistory {
+        ops,
+        stop: if limited { HistoryStop::Limit } else { HistoryStop::Complete },
+        limit_bytes,
+    }
+}
+
+fn stopped_at(history: &BreadcrumbHistory, count: u32, done: u32) -> String {
+    let op = history
+        .ops
+        .get(done as usize)
+        .map_or_else(|| "unknown".to_owned(), |op| op.0.to_string());
+    let mut text = format!("; a list stopped at command {done} of {count} (op {op})");
+    match history.stop {
+        HistoryStop::Complete => {}
+        HistoryStop::Unreadable => text.push_str(&format!(
+            ", only its first {} commands could be read",
+            history.ops.len()
+        )),
+        HistoryStop::Limit => text.push_str(&format!(
+            ", breadcrumb history read capped at {} bytes after {} commands",
+            history.limit_bytes,
+            history.ops.len()
+        )),
+        HistoryStop::Allocation => text.push_str(&format!(
+            ", breadcrumb history allocation failed after {} commands",
+            history.ops.len()
+        )),
+        HistoryStop::Invalid => text.push_str(
+            ", breadcrumb history pointer or length was invalid; no commands were read",
+        ),
+    }
+    text
+}
+
+#[cfg(test)]
+mod breadcrumbs {
+    use super::{HistoryStop, readable_history_with_limit, stopped_at};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_AUTO_BREADCRUMB_OP, D3D12_AUTO_BREADCRUMB_OP_DISPATCH,
+        D3D12_AUTO_BREADCRUMB_OP_SETMARKER,
+    };
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree,
+    };
+
+    const PAGE: usize = 4 << 10;
+
+    fn op(i: usize) -> D3D12_AUTO_BREADCRUMB_OP {
+        if i.is_multiple_of(2) {
+            D3D12_AUTO_BREADCRUMB_OP_SETMARKER
+        } else {
+            D3D12_AUTO_BREADCRUMB_OP_DISPATCH
+        }
+    }
+
+    /// Reserve `pages` pages and commit/fill only the listed page indices.
+    fn reserved(pages: usize, committed: &[usize]) -> *mut D3D12_AUTO_BREADCRUMB_OP {
+        // SAFETY: a fresh reservation; only committed pages are written.
+        unsafe {
+            let base = VirtualAlloc(
+                std::ptr::null(),
+                pages * PAGE,
+                MEM_RESERVE,
+                PAGE_NOACCESS,
+            )
+            .cast::<D3D12_AUTO_BREADCRUMB_OP>();
+            assert!(!base.is_null());
+            for &page in committed {
+                let at = base.cast::<u8>().add(page * PAGE);
+                assert!(!VirtualAlloc(at.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+                let first = page * PAGE / 4;
+                for i in 0..PAGE / 4 {
+                    base.add(first + i).write(op(first + i));
+                }
+            }
+            base
+        }
+    }
+
+    fn release(base: *mut D3D12_AUTO_BREADCRUMB_OP) {
+        // SAFETY: a reservation returned by `reserved`.
+        assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn history_stops_at_the_first_unreadable_page() {
+        let base = reserved(3, &[0, 2]);
+        let count = (3 * PAGE / 4) as u32;
+        let history = readable_history_with_limit(base, count, 3 * PAGE);
+        assert_eq!(history.ops.len(), PAGE / 4);
+        assert_eq!(history.stop, HistoryStop::Unreadable);
+        assert!(stopped_at(&history, count, (PAGE / 4) as u32).contains("op unknown"));
+        assert!(stopped_at(&history, count, 0).contains("only its first 1024 commands could be read"));
+        release(base);
+    }
+
+    #[test]
+    fn unreadable_first_page_returns_an_empty_prefix() {
+        let base = reserved(1, &[]);
+        let count = (PAGE / 4) as u32;
+        let history = readable_history_with_limit(base, count, PAGE);
+        assert!(history.ops.is_empty());
+        assert_eq!(history.stop, HistoryStop::Unreadable);
+        let report = stopped_at(&history, count, 0);
+        assert!(report.contains("op unknown"));
+        assert!(report.contains("only its first 0 commands could be read"));
+        release(base);
+    }
+
+    #[test]
+    fn readable_history_is_capped_before_allocating_the_report() {
+        let base = reserved(2, &[0, 1]);
+        let count = (2 * PAGE / 4) as u32;
+        let history = readable_history_with_limit(base, count, PAGE);
+        assert_eq!(history.ops.len(), PAGE / 4);
+        assert_eq!(history.stop, HistoryStop::Limit);
+        assert!(stopped_at(&history, count, (PAGE / 4) as u32).contains("capped at 4096 bytes"));
+        release(base);
+    }
+
+    #[test]
+    fn overflowing_history_address_is_rejected_without_reading() {
+        let base = (usize::MAX - 3) as *const D3D12_AUTO_BREADCRUMB_OP;
+        let history = readable_history_with_limit(base, 2, PAGE);
+        assert!(history.ops.is_empty());
+        assert_eq!(history.stop, HistoryStop::Invalid);
+    }
+}
 fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], done: usize) -> String {
     let barrier = |op: &D3D12_AUTO_BREADCRUMB_OP| *op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER;
     let from = history[..done].iter().rposition(barrier).map_or(0, |b| b + 1);
@@ -4129,5 +4984,701 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+    }
+
+    #[test]
+    fn present_primary_bgrx_uses_typed_view_and_integer_primary_is_rejected() {
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX format test: no D3D12 device");
+            return;
+        };
+        let make = |format: DXGI_FORMAT| -> ID3D12Resource {
+            let mut texture = None;
+            // SAFETY: live device and a valid 2D render-target description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 32,
+                            Height: 32,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: format,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+            }
+            texture.unwrap()
+        };
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let bgrx = make(DXGI_FORMAT_B8G8R8X8_TYPELESS);
+        let list = host.new_list().unwrap();
+        let rtv = host.rtv(
+            &bgrx,
+            Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: DXGI_FORMAT_B8G8R8X8_UNORM,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_RTV { MipSlice: 0, PlaneSlice: 0 },
+                },
+            }),
+        );
+        // SAFETY: live typed RTV on an open list.
+        unsafe { list.list.ClearRenderTargetView(rtv, &[0.0, 1.0, 0.0, 1.0], None) };
+        list.close();
+        host.execute(&[&list]);
+
+        let mut pixel = None;
+        let shown = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(
+                &bgrx,
+                state,
+                Some(DXGI_FORMAT_B8G8R8X8_UNORM.0 as u32),
+            )],
+            4,
+            Compositor::new,
+            |buffer, footprint| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: the present copy completed; footprint names a live RGBA pixel.
+                pixel = Some(unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u8; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                });
+            },
+        );
+        assert!(shown.0.is_some(), "typeless BGRX with its actual typed RTV must composite");
+        assert_eq!(pixel, Some([0, 255, 0, 255]));
+
+        let integer = make(DXGI_FORMAT_R8G8B8A8_UINT);
+        let mut compositor_attempted = false;
+        let rejected = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(&integer, state, None)],
+            5,
+            |_, _| {
+                compositor_attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |_, _| {},
+        );
+        assert!(rejected.0.is_none(), "integer primary formats must not be reinterpreted as UNORM");
+        assert!(!compositor_attempted);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn present_conversion_requires_typed_view_and_shader_resource_access() {
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX typed-view test: no D3D12 device");
+            return;
+        };
+        let make = |format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS| -> ID3D12Resource {
+            let mut texture = None;
+            // SAFETY: live device and a valid 2D resource description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 32,
+                            Height: 32,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: format,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Flags: flags,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+            }
+            texture.unwrap()
+        };
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let typeless = make(
+            DXGI_FORMAT_R16G16B16A16_TYPELESS,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        );
+        let list = host.new_list().unwrap();
+        let rtv = host.rtv(
+            &typeless,
+            Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: DXGI_FORMAT_R16G16B16A16_UNORM,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_RTV { MipSlice: 0, PlaneSlice: 0 },
+                },
+            }),
+        );
+        // SAFETY: live typed RTV on an open list.
+        unsafe { list.list.ClearRenderTargetView(rtv, &[1.0, 0.5, 0.0, 1.0], None) };
+        list.close();
+        host.execute(&[&list]);
+
+        let mut pixel = None;
+        let converted = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(
+                &typeless,
+                state,
+                Some(DXGI_FORMAT_R16G16B16A16_UNORM.0 as u32),
+            )],
+            6,
+            Compositor::new,
+            |buffer, footprint| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: completed present copy; footprint points to one RGBA16F texel.
+                pixel = Some(unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u16; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                });
+            },
+        );
+        assert!(converted.0.is_some(), "typed UNORM RTV metadata must enable conversion");
+        let [red, green, blue, alpha] = pixel.expect("converted primary pixel");
+        assert_eq!((red, blue, alpha), (0x3c00, 0x0000, 0x3c00));
+        assert!(matches!(green, 0x37ff | 0x3800), "expected ~0.5 as f16, got {green:#06x}");
+
+        // Use a fresh Host so no other parallel test can have cached a
+        // compositor with this format and bypass the injected creation error.
+        let isolated = create().expect("isolated D3D12 host");
+        let mut isolated_texture = None;
+        // SAFETY: live isolated device and a valid 2D render-target description.
+        unsafe {
+            isolated.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 32,
+                        Height: 32,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R16G16B16A16_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut isolated_texture,
+                )
+                .unwrap();
+        }
+        let isolated_texture = isolated_texture.unwrap();
+        let mut attempted = false;
+        let failed = isolated.present_planes_with_compositor(
+            &[PresentPlane::Raw(&isolated_texture, state, None)],
+            7,
+            |_, _| {
+                attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |_, _| panic!("conversion-required primary must not be copied raw"),
+        );
+        assert!(attempted);
+        assert!(failed.0.is_none(), "failed compositor must not raw-copy mismatched texels");
+
+        let ambiguous = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(&typeless, state, None)],
+            8,
+            |_, _| panic!("typeless primary without its actual view must be rejected"),
+            |_, _| panic!("ambiguous typeless primary must not be presented"),
+        );
+        assert!(ambiguous.0.is_none());
+
+        let denied = make(
+            DXGI_FORMAT_R16G16B16A16_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+                | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+        );
+        let mut denied_attempted = false;
+        let rejected = host.present_planes_with_compositor(
+            &[PresentPlane::Raw(&denied, state, None)],
+            9,
+            |_, _| {
+                denied_attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |_, _| panic!("DENY_SHADER_RESOURCE primary must not be sampled or copied raw"),
+        );
+        assert!(rejected.0.is_none());
+        assert!(!denied_attempted);
+
+        let direct_primary = make(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        );
+        let denied_overlay = make(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+                | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+        );
+        let setup = host.new_list().unwrap();
+        // SAFETY: live render-target views on an open list.
+        unsafe {
+            setup.list.ClearRenderTargetView(
+                host.rtv(&direct_primary, None),
+                &[1.0, 0.0, 0.0, 1.0],
+                None,
+            );
+            setup.list.ClearRenderTargetView(
+                host.rtv(&denied_overlay, None),
+                &[0.0, 1.0, 0.0, 1.0],
+                None,
+            );
+        }
+        setup.close();
+        host.execute(&[&setup]);
+        let mut direct_pixel = None;
+        let mut overlay_compositor_attempted = false;
+        let direct = host.present_planes_with_compositor(
+            &[
+                PresentPlane::Raw(&direct_primary, state, None),
+                PresentPlane::Raw(&denied_overlay, state, None),
+            ],
+            10,
+            |_, _| {
+                overlay_compositor_attempted = true;
+                Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ))
+            },
+            |buffer, footprint| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: the present copy completed; footprint names a live RGBA pixel.
+                direct_pixel = Some(unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u8; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                });
+            },
+        );
+        assert!(direct.0.is_some(), "the legal primary plane remains presentable");
+        assert!(!overlay_compositor_attempted, "a DENY_SHADER_RESOURCE overlay is not sampled");
+        assert_eq!(direct_pixel, Some([255, 0, 0, 255]));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn present_single_plane_copies_subresource_zero_of_mipmapped_and_array_textures() {
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX subresource test: no D3D12 device");
+            return;
+        };
+        let make = |mips: u16, array: u16, color: [f32; 4]| -> ID3D12Resource {
+            let mut texture = None;
+            // SAFETY: live device and a valid 2D render-target description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 32,
+                            Height: 32,
+                            DepthOrArraySize: array,
+                            MipLevels: mips,
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+                let texture = texture.unwrap();
+                let desc = D3D12_RENDER_TARGET_VIEW_DESC {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    ViewDimension: if array > 1 {
+                        D3D12_RTV_DIMENSION_TEXTURE2DARRAY
+                    } else {
+                        D3D12_RTV_DIMENSION_TEXTURE2D
+                    },
+                    Anonymous: if array > 1 {
+                        D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2DArray: D3D12_TEX2D_ARRAY_RTV {
+                                MipSlice: 0,
+                                FirstArraySlice: 0,
+                                ArraySize: 1,
+                                PlaneSlice: 0,
+                            },
+                        }
+                    } else {
+                        D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_RTV { MipSlice: 0, PlaneSlice: 0 },
+                        }
+                    },
+                };
+                let list = host.new_list().unwrap();
+                list.list.ClearRenderTargetView(host.rtv(&texture, Some(&desc)), &color, None);
+                list.close();
+                host.execute(&[&list]);
+                texture
+            }
+        };
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let mipmapped = make(3, 1, [0.0, 1.0, 0.0, 1.0]);
+        let arrayed = make(1, 2, [0.0, 0.0, 1.0, 1.0]);
+        let first_pixel = |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the present copy completed; footprint names a live RGBA pixel.
+            unsafe {
+                buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                let rgba = mapped
+                    .cast::<u8>()
+                    .add(footprint.Offset as usize)
+                    .cast::<[u8; 4]>()
+                    .read();
+                buffer.Unmap(0, None);
+                rgba
+            }
+        };
+        let mut mip_pixel = None;
+        assert!(
+            host.present_with_compositor(&[(&mipmapped, state)], 10, Compositor::new, |b, f| {
+                mip_pixel = Some(first_pixel(b, f));
+            }).is_some()
+        );
+        assert_eq!(mip_pixel, Some([0, 255, 0, 255]));
+        let mut array_pixel = None;
+        assert!(
+            host.present_with_compositor(&[(&arrayed, state)], 11, Compositor::new, |b, f| {
+                array_pixel = Some(first_pixel(b, f));
+            }).is_some()
+        );
+        assert_eq!(array_pixel, Some([0, 0, 255, 255]));
+    }
+}
+
+#[cfg(test)]
+mod present_state_sync_tests {
+    use super::*;
+    use crate::object::{S_OK, This, slot};
+
+    /// `Host::present_planes` reads tracked texture states only after
+    /// acquiring `Host::submitted`, so a submission running while presentation
+    /// prepares cannot make `p.copy` emit stale before-state barriers on either
+    /// the single-plane fallback path or the multi-plane compositor path.
+    #[test]
+    fn present_planes_reads_live_state_under_submission_lock() {
+        let Some(host) = host() else {
+            return;
+        };
+        const TARGET: u32 = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        const SHADER: u32 = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
+        const COPY_SRC: u32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+
+        let address = crate::watch::tests::pool(2);
+        let null = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        #[repr(align(8))]
+        struct TextureWords([u32; 14]);
+        let desc = TextureWords([3, 0, 0, 0, 32, 0, 32, 1 | 1 << 16, 28, 1, 0, 1, 1, 0]);
+        let make = |page: usize| {
+            let mut resource = null;
+            assert_eq!(
+                crate::resource::create_at_address(
+                    null,
+                    (address + page * crate::watch::PAGE) as u64,
+                    desc.0.as_ptr().cast(),
+                    0,
+                    null.cast(),
+                    &iid,
+                    &mut resource,
+                ),
+                S_OK
+            );
+            resource
+        };
+        let (scene, overlay) = (make(0), make(1));
+        let scene_copy = crate::resource::host_copy(scene).unwrap();
+        let overlay_copy = crate::resource::host_copy(overlay).unwrap();
+        let scene_raw = scene_copy.texture.as_raw() as usize;
+        let overlay_raw = overlay_copy.texture.as_raw() as usize;
+
+        let setup = host.new_list().unwrap();
+        crate::list::ensure_state(&setup, scene, TARGET);
+        crate::list::ensure_state(&setup, overlay, TARGET);
+        // SAFETY: live render targets on an open list.
+        unsafe {
+            setup
+                .list
+                .ClearRenderTargetView(host.rtv(&scene_copy.texture, None), &[1.0, 0.0, 0.0, 1.0], None);
+            setup.list.ClearRenderTargetView(
+                host.rtv(&overlay_copy.texture, None),
+                &[0.0, 0.0, 0.5, 0.5],
+                None,
+            );
+        }
+        setup.close();
+        host.execute(&[&setup]);
+        let mut gpu_states = std::collections::HashMap::from([(scene_raw, TARGET), (overlay_raw, TARGET)]);
+
+        // Case 1: single-plane fallback after an intervening submission moves
+        // `scene` from RENDER_TARGET to COPY_SOURCE while compositor setup runs.
+        let mut fallback_ran = false;
+        let mut fallback_state = 0;
+        let mut fallback_barriers = Vec::new();
+        for _ in 0..8 {
+            if let Some(p) = host.presenter.lock().unwrap_or_else(|e| e.into_inner()).presenter.as_mut() {
+                p.compositor = None;
+            }
+            let _ = tests::issued();
+            let (_, state) = host.present_planes_with_compositor(
+                &[
+                    PresentPlane::Tracked(&scene_copy, None),
+                    PresentPlane::Tracked(&overlay_copy, None),
+                ],
+                1,
+                |_, _| {
+                    fallback_ran = true;
+                    let intervening = host.new_list().unwrap();
+                    crate::list::ensure_state(&intervening, scene, COPY_SRC);
+                    intervening.close();
+                    host.execute(&[&intervening]);
+                    Err(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_FAIL,
+                    ))
+                },
+                #[cfg(feature = "diagnostics")]
+                |_, _| {},
+            );
+            fallback_barriers = tests::issued();
+            fallback_state = state;
+            if fallback_ran {
+                break;
+            }
+        }
+        assert!(fallback_ran, "compositor callback ran for single-plane fallback");
+        assert_eq!(fallback_state, COPY_SRC);
+        assert_eq!(scene_copy.state.load(Ordering::Relaxed), COPY_SRC);
+        assert_eq!(tests::replay(&fallback_barriers, &mut gpu_states), Ok(()));
+
+        // Case 2: multi-plane composite after an intervening submission moves
+        // `scene` to PIXEL_SHADER_RESOURCE and `overlay` to COPY_SOURCE.
+        let mut composite_ran = false;
+        let mut composite_shown = None;
+        let mut composite_state = 0;
+        let mut composite_barriers = Vec::new();
+        for _ in 0..8 {
+            if let Some(p) = host.presenter.lock().unwrap_or_else(|e| e.into_inner()).presenter.as_mut() {
+                p.compositor = None;
+            }
+            let _ = tests::issued();
+            let (shown, state) = host.present_planes_with_compositor(
+                &[
+                    PresentPlane::Tracked(&scene_copy, None),
+                    PresentPlane::Tracked(&overlay_copy, None),
+                ],
+                2,
+                |device, format| {
+                    composite_ran = true;
+                    let intervening = host.new_list().unwrap();
+                    crate::list::ensure_state(&intervening, scene, SHADER);
+                    crate::list::ensure_state(&intervening, overlay, COPY_SRC);
+                    intervening.close();
+                    host.execute(&[&intervening]);
+                    Compositor::new(device, format)
+                },
+                #[cfg(feature = "diagnostics")]
+                |_, _| {},
+            );
+            composite_barriers = tests::issued();
+            composite_shown = shown;
+            composite_state = state;
+            if composite_ran {
+                break;
+            }
+        }
+        assert!(composite_ran, "compositor callback ran for multi-plane composite");
+        assert_eq!(composite_state, SHADER);
+        assert_eq!(scene_copy.state.load(Ordering::Relaxed), SHADER);
+        assert_eq!(overlay_copy.state.load(Ordering::Relaxed), COPY_SRC);
+        assert_eq!(tests::replay(&composite_barriers, &mut gpu_states), Ok(()));
+        if composite_shown.is_some() {
+            assert!(
+                composite_barriers.contains(&(overlay_raw, COPY_SRC, SHADER))
+                    && composite_barriers.contains(&(overlay_raw, SHADER, COPY_SRC)),
+                "compositor copy must transition overlay from its live COPY_SOURCE state and back: {composite_barriers:?}"
+            );
+        }
+
+        let release = |resource: This| slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+        assert_eq!(release(scene), 0);
+        assert_eq!(release(overlay), 0);
+        drop((setup, scene_copy, overlay_copy));
+        crate::watch::tests::free(address);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+}
+
+/// The last run of InfoQueue errors from one D3D12 call before the runtime's
+/// device-removal message. This is a heuristic: messages are emitted in queue
+/// order, but calls from different host threads may interleave.
+fn removal_cause(
+    messages: &[(D3D12_MESSAGE_ID, D3D12_MESSAGE_SEVERITY, String)],
+) -> Option<String> {
+    let error = |m: &&(D3D12_MESSAGE_ID, D3D12_MESSAGE_SEVERITY, String)| {
+        m.1.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0
+    };
+    let first = messages.iter().find(error).map(|m| m.2.as_str());
+    let removal = messages.iter().position(|(id, ..)| {
+        *id == D3D12_MESSAGE_ID_DEVICE_REMOVAL_PROCESS_AT_FAULT
+            || *id == D3D12_MESSAGE_ID_DEVICE_REMOVAL_PROCESS_POSSIBLY_AT_FAULT
+    });
+    let Some(at) = removal else {
+        return first.map(str::to_owned);
+    };
+    // D3D12 message text prefixes the API call as `ID3D12Device::Method:`.
+    let call = |text: &str| text.split(':').take(3).collect::<Vec<_>>().join(":");
+    let before: Vec<&str> = messages[..at]
+        .iter()
+        .filter(error)
+        .map(|m| m.2.as_str())
+        .collect();
+    let Some(&last) = before.last() else {
+        return first.map(str::to_owned);
+    };
+    let from = before
+        .iter()
+        .rposition(|t| call(t) != call(last))
+        .map_or(0, |i| i + 1);
+    let mut text = before[from..].join(" / ");
+    if let Some(first) = first
+        && !before[from..].contains(&first)
+    {
+        text.push_str(&format!(" (first error: {first})"));
+    }
+    Some(text)
+}
+
+#[cfg(test)]
+mod removal_cause_tests {
+    use super::*;
+
+    fn m(
+        id: i32,
+        severity: D3D12_MESSAGE_SEVERITY,
+        text: &str,
+    ) -> (D3D12_MESSAGE_ID, D3D12_MESSAGE_SEVERITY, String) {
+        (D3D12_MESSAGE_ID(id), severity, text.to_owned())
+    }
+
+    #[test]
+    fn a_removal_names_the_call_just_before_it_and_keeps_the_first_error() {
+        let e = D3D12_MESSAGE_SEVERITY_ERROR;
+        let messages = [
+            m(599, e, "ID3D12Device::GetResourceAllocationInfo: B5G5R5A1_UNORM unordered"),
+            m(342, e, "ID3D12Device::CreateUnorderedAccessView: B5G5R5A1_UNORM typed"),
+            m(340, e, "ID3D12Device::CreateUnorderedAccessView: no unordered flag"),
+            m(232, e, "ID3D12Device::RemoveDevice: DXGI_ERROR_INVALID_CALL"),
+            m(1, D3D12_MESSAGE_SEVERITY_WARNING, "later"),
+        ];
+        assert_eq!(
+            removal_cause(&messages).as_deref(),
+            Some(
+                "ID3D12Device::CreateUnorderedAccessView: B5G5R5A1_UNORM typed / \
+                 ID3D12Device::CreateUnorderedAccessView: no unordered flag \
+                 (first error: ID3D12Device::GetResourceAllocationInfo: B5G5R5A1_UNORM unordered)"
+            )
+        );
+    }
+
+    #[test]
+    fn the_first_error_is_not_repeated() {
+        let e = D3D12_MESSAGE_SEVERITY_ERROR;
+        let messages = [
+            m(36, e, "ID3D12Device::CreateRenderTargetView: B4G4R4A4_UNORM"),
+            m(232, e, "ID3D12Device::RemoveDevice: DXGI_ERROR_INVALID_CALL"),
+        ];
+        assert_eq!(
+            removal_cause(&messages).as_deref(),
+            Some("ID3D12Device::CreateRenderTargetView: B4G4R4A4_UNORM")
+        );
+    }
+
+    #[test]
+    fn without_a_removal_the_first_error_is_reported() {
+        let messages = [
+            m(1, D3D12_MESSAGE_SEVERITY_WARNING, "a warning"),
+            m(599, D3D12_MESSAGE_SEVERITY_ERROR, "first"),
+            m(36, D3D12_MESSAGE_SEVERITY_CORRUPTION, "second"),
+        ];
+        assert_eq!(removal_cause(&messages).as_deref(), Some("first"));
+        assert_eq!(removal_cause(&[m(1, D3D12_MESSAGE_SEVERITY_INFO, "info")]), None);
+        assert_eq!(removal_cause(&[]), None);
+    }
+
+    #[test]
+    fn a_removal_without_an_earlier_error_reports_the_removal_message() {
+        let messages = [m(
+            233,
+            D3D12_MESSAGE_SEVERITY_ERROR,
+            "ID3D12Device::RemoveDevice: possibly at fault",
+        )];
+        assert_eq!(
+            removal_cause(&messages).as_deref(),
+            Some("ID3D12Device::RemoveDevice: possibly at fault")
+        );
     }
 }

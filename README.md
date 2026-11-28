@@ -35,7 +35,7 @@ Tested on one machine: Windows 11, AMD RX 6700 XT (12 GB).
 > moment). The latest runs, several minutes each in the world, did not, but
 > it is not ruled out; a run can also end on a GPU fault (`crashes.log`). A
 > diagnostics build with `VICTORY_D3D12_WARP=1` renders on the software
-> adapter instead (too slow to reach the world in minutes).
+> adapter instead (too slow to reach the world in minutes). The optional `VICTORY_NO_TDR=1` switch (any value except `0` turns it on) disables the timeout only for VIctory's direct queue; it is not a performance tweak. If the GPU really hangs, Windows may not recover on the usual timeout and the display can remain unresponsive until the process is killed or the PC is restarted. Leave it unset unless diagnosing workloads that legitimately exceed the watchdog window.
 
 What each part does today and what it still needs:
 
@@ -198,6 +198,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_KEYS_FILE=<path>` | reads append-only, newline-terminated key names in order; incomplete lines wait, invalid names are warned and consumed |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
@@ -208,6 +209,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `VICTORY_NO_TDR=1` | disable the GPU timeout for VIctory's direct queue only; default off. Risky diagnostic workaround: a real GPU hang may freeze the display/system for much longer and require a manual restart |
+| `VICTORY_EFFICIENCY_MODE=1` | opt back into Windows process-wide efficiency throttling (EcoQoS execution-speed throttling and ignored timer-resolution requests); default is explicitly off for console timer pacing. This may reduce CPU performance and frame pacing; exact value `1` is required. |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | skip host pipeline creation and omit draws and dispatches, including indirect ones, when the pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
 | `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |

@@ -70,6 +70,10 @@
 *.7z
 *.rar
 
+# Python tooling
+__pycache__/
+*.py[cod]
+
 # Editor / OS noise
 .vs/
 .idea/

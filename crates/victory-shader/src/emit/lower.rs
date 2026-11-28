@@ -21,6 +21,9 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod shift;
+mod waterfall;
+mod interp;
 
 type Why = &'static str;
 
@@ -235,8 +238,8 @@ struct Lower<'a> {
     writes_uavs: bool,
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
     heap: [bool; 2],
-    /// src0 of the current instruction as DPP fetched it.
-    src0: Option<V>,
+    /// The source DPP fetched for the current instruction, and its index.
+    src0: Option<(V, usize)>,
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
@@ -2074,8 +2077,8 @@ impl<'a> Lower<'a> {
                 let x = self.select_bits(x, sel, sext);
                 self.as_float(x)
             }
-            _ if k == 0 && self.src0.is_some() => {
-                let x = self.src0.expect("checked");
+            _ if self.src0.is_some_and(|(_, k1)| k == k1) => {
+                let (x, _) = self.src0.expect("checked");
                 self.as_float(x)
             }
             Operand::Vector { reg, .. } | Operand::Scalar { code: reg, .. }
@@ -2119,7 +2122,7 @@ impl<'a> Lower<'a> {
             return Err("integer operand modifiers");
         }
         match self.src0 {
-            Some(x) if k == 0 => Ok(x),
+            Some((x, k1)) if k == k1 => Ok(x),
             _ => {
                 let sel = Self::sdwa_src(inst, k);
                 // A byte or word select within the low half.
@@ -2743,30 +2746,8 @@ impl<'a> Lower<'a> {
 
     /// [`Self::write`] of a dword already placed (SDWA applied).
     fn write_placed(&mut self, inst: &Inst, reg: Reg, x: V, guard: Option<V>) {
-        let Some(new) = inst.write(reg) else { return };
-        let x = match (guard, reg) {
-            (Some(g), Reg::V(_)) => {
-                let o = inst.read(reg);
-                let read = o.is_some_and(|o| self.read_phis.contains(&o));
-                let old = match o.map(|o| self.i32_of(o)) {
-                    Some(Ok(o)) => o,
-                    // The validator refuses reads of undef.
-                    _ => self.s.m.i32(0),
-                };
-                // What lanes keep is zero where it has no DXIL form (as
-                // above), so keeping a phi does not make it live.
-                if let Some(o) = o.filter(|_| !read) {
-                    self.read_phis.remove(&o);
-                }
-                self.s.m.select(self.cur, g, x, old)
-            }
-            _ => x,
-        };
-        self.vals.insert(new, Val::I32(x));
+        self.write_placed_with_old(inst, reg, x, guard, inst.read(reg));
     }
-
-    /// The SDWA destination selection: a byte or word, and what the other
-    /// bits get (0 zeros, 1 the sign above the field, 2 the old bits).
     fn sdwa_dst(inst: &Inst) -> Option<(u8, u8)> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
@@ -3579,6 +3560,16 @@ impl<'a> Lower<'a> {
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+            if let Some(scc) = scc
+                && self.leaves_with_no_lane(inst)
+            {
+                for &(_, v) in &inst.writes {
+                    self.vals.insert(v, Val::Missing(LANE_MASK));
+                }
+                let none = self.s.m.bool(false);
+                self.vals.insert(scc, Val::Bit(none));
+                return Ok(());
+            }
             return Err(LANE_MASK);
         }
         if matches!(
@@ -3786,27 +3777,16 @@ impl<'a> Lower<'a> {
                     Ok(())
                 }
                 "s_lshl_b64" | "s_lshr_b64" | "s_ashr_i64" => {
+                    // On the two dwords: a 64-bit DXIL shift would need the
+                    // SFI0 INT64 feature (see `Self::shift64`).
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
                     let n = src32(self, 1)?;
-                    let i64t = self.s.m.int(64);
-                    self.s.flags |= flags::INT64;
-                    let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
-                    let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
-                    let k32 = self.s.m.int_const(i64t, 32);
-                    let b = self.s.m.bin(c, Bin::Shl, b, k32);
-                    let x = self.s.m.bin(c, Bin::Or, a, b);
-                    let k63 = self.s.m.i32(63);
-                    let n = self.s.m.bin(c, Bin::And, n, k63);
-                    let n = self.s.m.cast(c, Cast::ZExt, n, i64t);
                     let op = match name {
                         "s_lshl_b64" => Bin::Shl,
                         "s_lshr_b64" => Bin::LShr,
                         _ => Bin::AShr,
                     };
-                    let r = self.s.m.bin(c, op, x, n);
-                    let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
-                    let rh = self.s.m.bin(c, Bin::LShr, r, k32);
-                    let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    let (rl, rh) = self.shift64(a, b, n, op);
                     self.set(lo, Val::I32(rl));
                     self.set(hi, Val::I32(rh));
                     let s = nonzero(self, rl, rh);
@@ -5816,25 +5796,37 @@ impl<'a> Lower<'a> {
             _ => self.guard(b, i)?,
         };
         if let Some(d) = v.dpp {
-            let (x, enable) = self.dpp(inst, d, guard)?;
+            // These GFX10 reverse integer opcodes apply DPP to src1.
+            let k1 = usize::from(matches!(
+                name,
+                "v_subrev_nc_u32" | "v_subrev_co_ci_u32" | "v_lshlrev_b32" | "v_lshrrev_b32"
+                | "v_ashrrev_i32"
+            ));
+            let (x, enable) = self.dpp(inst, d, guard, k1)?;
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
             };
-            self.src0 = Some(x);
+            self.src0 = Some((x, k1));
         }
         let r = self.valu_op(inst, guard);
         self.src0 = None;
         r
     }
 
-    /// DPP: src0 as read from another lane, and which lanes write their
-    /// result (none: all).
-    fn dpp(&mut self, inst: &Inst, dpp: Dpp, guard: Option<V>) -> Result<(V, Option<V>), Why> {
+    /// DPP: the selected source as read from another lane, and which lanes
+    /// write their result (none: all).
+    fn dpp(
+        &mut self,
+        inst: &Inst,
+        dpp: Dpp,
+        guard: Option<V>,
+        source_index: usize,
+    ) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let Some(&Operand::Vector { reg, .. }) = v.src.first() else {
+        let Some(&Operand::Vector { reg, .. }) = v.src.get(source_index) else {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
@@ -5988,22 +5980,19 @@ impl<'a> Lower<'a> {
         }
         match name {
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
+                // On the two dwords: a 64-bit DXIL shift would need the SFI0
+                // INT64 feature (see `Self::shift64`).
                 let n = s(self, 0)?;
-                let x = self.src64(inst, 1)?;
-                let i64t = self.s.m.int(64);
-                let k63 = self.s.m.i32(63);
-                let n = self.s.m.bin(c, Bin::And, n, k63);
-                let n = self.s.m.cast(c, Cast::ZExt, n, i64t);
+                let (a, b) = self.src64_dwords(inst, 1)?;
                 let op = match name {
                     "v_lshlrev_b64" => Bin::Shl,
                     "v_lshrrev_b64" => Bin::LShr,
                     _ => Bin::AShr,
                 };
-                let r = self.s.m.bin(c, op, x, n);
+                let (lo, hi) = self.shift64(a, b, n, op);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a 64-bit result");
                 };
-                let (lo, hi) = self.split64(r);
                 self.write(inst, Reg::V(reg), lo, guard);
                 self.write(inst, Reg::V(reg + 1), hi, guard);
                 Ok(())
@@ -6261,13 +6250,25 @@ impl<'a> Lower<'a> {
                     return Err("an accumulator");
                 };
                 let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
-                let acc = match self.floats.get(&acc) {
+                let mut acc = match self.floats.get(&acc) {
                     Some(&x) => x,
                     None => {
                         let x = self.i32_of(acc)?;
                         self.as_float(x)
                     }
                 };
+                // RDNA2 VOP3 v_fmac_f32 applies abs[2] and neg[2] to the
+                // destination accumulator. The analogous v_mac forms are
+                // left unchanged until their own hardware oracle is measured.
+                if name == "v_fmac_f32" {
+                    if v.abs >> 2 & 1 != 0 {
+                        acc = self.unary(6, acc);
+                    }
+                    if v.neg >> 2 & 1 != 0 {
+                        let z = self.s.m.f32(0x8000_0000);
+                        acc = self.s.m.bin(c, Bin::Sub, z, acc);
+                    }
+                }
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
@@ -6566,7 +6567,7 @@ impl<'a> Lower<'a> {
                     let mut xs = Vec::new();
                     for k in 0..2 {
                         let mut x = match self.src0 {
-                            Some(x) if k == 0 => x,
+                            Some((x, k1)) if k == k1 => x,
                             _ => {
                                 let op = *v.src.get(k).ok_or("a missing operand")?;
                                 let x = self.operand(inst, &op)?;
@@ -6817,7 +6818,7 @@ impl<'a> Lower<'a> {
             }
         }
         let x = match self.src0 {
-            Some(x) if k == 0 => x,
+            Some((x, k1)) if k == k1 => x,
             _ => match self.low16_src(inst, k).filter(|_| !high) {
                 Some(x) => x,
                 None => self.f16_operand(inst, &op)?,
@@ -6858,48 +6859,8 @@ impl<'a> Lower<'a> {
     /// half, or its high half with op_sel bit 3 (or an SDWA WORD_1 select);
     /// the other half is kept (GFX10).
     fn write_half(&mut self, inst: &Inst, x: V, guard: Option<V>) -> Result<(), Why> {
-        let Fields::Valu(v) = &inst.fields else {
-            unreachable!()
-        };
-        let Some(Operand::Vector { reg, .. }) = v.dst else {
-            return Err("a 16-bit result outside a VGPR");
-        };
-        let mut high = v.opsel >> 3 & 1 != 0;
-        // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
-        let mut keep = true;
-        if let Some(sd) = v.sdwa {
-            match (sd.dst_sel, sd.dst_unused) {
-                (4, 2) => {}
-                (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
-                _ => return Err("an SDWA destination of a 16-bit operation"),
-            }
-        }
-        let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) if keep => o,
-            _ => self.s.m.i32(0),
-        };
-        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
-        let x = self.s.m.bin(c, Bin::And, x, low);
-        let r = if high {
-            let o = self.s.m.bin(c, Bin::And, old, low);
-            let x = self.s.m.bin(c, Bin::Shl, x, k16);
-            self.s.m.bin(c, Bin::Or, o, x)
-        } else {
-            let keep = self.s.m.i32(0xFFFF_0000);
-            let o = self.s.m.bin(c, Bin::And, old, keep);
-            self.s.m.bin(c, Bin::Or, o, x)
-        };
-        self.write_placed(inst, Reg::V(reg), r, guard);
-        Ok(())
+        self.write_half_with_old(inst, x, guard, None)
     }
-
-    /// 16-bit operations, computed in f32 or i32: f16 sums, differences and
-    /// products are exact there and round once to f16 (f32 has the 2 x 11 +
-    /// 2 bits that make double rounding harmless); `None` if `name` is none.
     fn valu16(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Option<Result<(), Why>> {
         const FLOAT2: &[&str] = &[
             "v_add_f16",
@@ -8102,6 +8063,8 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = dst else {
             return Err("an interpolation");
         };
+        let guard = self.guard(site.0, site.1)?;
+        let old = guard.and_then(|_| self.interp_old(inst, site, reg, interp));
         // A channel of an input element, interpolated as `mode` says.
         let channel = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
             let (id, col) = l
@@ -8152,7 +8115,7 @@ impl<'a> Lower<'a> {
                     // omod and clamp are part of the f16 instruction; op_sel[3]
                     // picks the destination half.
                     let lo = self.half_modifiers(inst, lo);
-                    return self.write_half(inst, lo, None);
+                    return self.write_half_with_old(inst, lo, guard, old);
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
                     let z = self.s.m.i32(0);
@@ -8167,7 +8130,13 @@ impl<'a> Lower<'a> {
             }
         };
         // A pixel interpolates in every lane; guards only hide inactive ones.
-        self.write(inst, Reg::V(reg), x, None);
+        self.write_placed_with_old(
+            inst,
+            Reg::V(reg),
+            x,
+            guard,
+            old.or_else(|| inst.read(Reg::V(reg))),
+        );
         Ok(())
     }
 
@@ -11276,6 +11245,96 @@ mod tests {
             0,
             "dynamic v_perm_b32 must not require INT64"
         );
+    }
+
+    /// The SFI0 feature bits of a synthetic compute shader that shifts a
+    /// 64-bit value and stores both result dwords to LDS. `vector` picks the
+    /// VOP3 form (v[1:2] shifted by v3 into v[5:6]), otherwise the SOP2 form
+    /// (s[0:1] shifted by s2 into s[6:7]).
+    fn shift_features(op: u32, vector: bool) -> u64 {
+        let sop2 = |op: u32, dst: u32, src0: u32, src1: u32| {
+            0x8000_0000 | (op & 0x7F) << 23 | (dst & 0x7F) << 16 | (src1 & 0xFF) << 8 | src0 & 0xFF
+        };
+        let mut words = if vector {
+            // v_lshlrev_b64 v[5:6], v3, v[1:2].
+            vec![0xD400_0000 | (op & 0x3FF) << 16 | 5, 0x0002_0303]
+        } else {
+            vec![
+                sop2(op, 6, 0, 2), // s_lshl_b64 s[6:7], s[0:1], s2
+                0x7E0A_0206,       // v_mov_b32 v5, s6
+                0x7E0C_0207,       // v_mov_b32 v6, s7
+            ]
+        };
+        words.extend_from_slice(&[
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xD834_0000, // ds_write_b32 v0, v5
+            0x0000_0500,
+            0xD834_0004, // ds_write_b32 v0, v6 offset:4
+            0x0000_0600,
+            S_ENDPGM,
+        ]);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+
+        let emitted = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+        })
+        .unwrap();
+
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
+
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+
+        u64::from_le_bytes(features.data.try_into().unwrap())
+    }
+
+    #[test]
+    fn scalar_64_bit_shifts_need_no_int64() {
+        for op in [0x1Fu32, 0x21, 0x23] {
+            assert_eq!(
+                shift_features(op, false) & 0x8000,
+                0,
+                "SOP2 {op:#x} must not require INT64"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_64_bit_shifts_need_no_int64() {
+        for op in [0x2FFu32, 0x300, 0x301] {
+            assert_eq!(
+                shift_features(op, true) & 0x8000,
+                0,
+                "VOP3 {op:#x} must not require INT64"
+            );
+        }
     }
 
     #[test]

@@ -162,9 +162,13 @@ impl Changed {
         if !saved.armed(page) || saved.bytes.contains_key(&page) {
             return;
         }
-        let mut bytes = vec![0u8; PAGE].into_boxed_slice();
-        if crate::host::read_into((page * PAGE) as *const u8, &mut bytes) {
-            saved.bytes.insert(page, bytes);
+        // Keep the lock across the read: the bytes must belong to this
+        // arming of the page, even if another thread disarms or re-arms it.
+        // The kernel fills the buffer, so do not zero it first.
+        let mut bytes = Box::<[u8]>::new_uninit_slice(PAGE);
+        if crate::host::read_into_uninit((page * PAGE) as *const u8, &mut bytes) {
+            // SAFETY: a successful read wrote every byte of the buffer.
+            saved.bytes.insert(page, unsafe { bytes.assume_init() });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SavedPages, 1);
         }

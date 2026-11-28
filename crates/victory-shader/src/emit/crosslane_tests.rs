@@ -1023,3 +1023,104 @@ fn pixel_quad_swizzle_and_dpp_validate_and_create_pipeline() {
             .unwrap_or_else(|e| panic!("{label}: graphics pipeline creation failed: {e}"));
     }
 }
+
+/// VOP2 `op` with a DPP16 dword (`src0` in the second word, `src1` in the first).
+const fn vop2_dpp16(op: u8, vdst: u8, vsrc0: u8, vsrc1: u8, ctrl: u16) -> [u32; 2] {
+    [
+        (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | 0xFA,
+        dpp16_word(vsrc0, ctrl, 0xF, 0xF, false, false),
+    ]
+}
+
+/// Integer reverse subtract and shift opcodes apply DPP to the SECOND source:
+/// the lane-selected `src1` and the lane's own `src0` (LLVM
+/// `SIInstrInfo::isSrc1DPPRevOpcode` — "REV shift opcodes worked this way
+/// before GFX11, verified on hardware"; Mesa `README-ISA.md` "DPP with
+/// integer `subrev` and shifts"). Pair-swapping quad permutation (0xB1), full
+/// EXEC, so every lane's source is valid and lane values differ in both
+/// registers: v1 = 0x1000_0001 + lane (first source), v3 = 0x0001_0000 + lane
+/// (second source); shift amounts stay below 32.
+#[test]
+fn dpp16_reverse_integer_ops_shuffle_the_second_source_on_gpu() {
+    let swap = 0xB1;
+    // The reverse opcodes shuffle the second source; v_sub_nc_u32, the
+    // control, shuffles the first.
+    let cases: [(&str, u8); 5] = [
+        ("v_subrev_nc_u32", 0x27),
+        ("v_lshlrev_b32", 0x1A),
+        ("v_lshrrev_b32", 0x16),
+        ("v_ashrrev_i32", 0x18),
+        ("v_sub_nc_u32", 0x26),
+    ];
+    let items: Vec<_> = cases
+        .iter()
+        .map(|&(name, op)| {
+            let words = vop2_dpp16(op, 2, 1, 3, swap);
+            let mut expected = [0u32; 32];
+            for lane in 0..32u32 {
+                let src = lane ^ 1;
+                let (own1, own3) = (lane_v1(lane), lane_v3_rhs(lane));
+                let (sh1, sh3) = (lane_v1(src), lane_v3_rhs(src));
+                expected[lane as usize] = match op {
+                    // second source shuffled: result uses sh3 with own1
+                    0x27 => sh3.wrapping_sub(own1),
+                    0x1A => sh3 << (own1 & 31),
+                    0x16 => sh3 >> (own1 & 31),
+                    0x18 => ((sh3 as i32) >> (own1 & 31)) as u32,
+                    // control: first source shuffled
+                    _ => sh1.wrapping_sub(own3),
+                };
+            }
+            (
+                name,
+                build_wave32_cs(MaskPattern::All, Divergence::Full, &words),
+                expected,
+            )
+        })
+        .collect();
+    check_cases("DPP16rev", &items);
+}
+
+
+/// The reverse subtract shuffles src1 and keeps each lane's own borrow-in.
+/// Adapted from Andrew Pozdnakov's independent follow-up test:
+/// https://github.com/andrewpozdnakov7-jpg/VIctory/commit/f1795aa01b4b65c37b159b0b596ecdce06ac94d4
+#[test]
+fn dpp16_reverse_subtract_keeps_local_borrow_on_gpu() {
+    let mut words = vec![v_and_b32_imm(4, 1, 0), v_cmp_eq_u32_imm(0, 4)];
+    words.extend(v_add_nc_u32_lit(3, lane_v1(0), 0));
+    words.extend([
+        0x2A << 25 | 2 << 17 | 3 << 9 | 0xFA, // v_subrev_co_ci_u32 v2, v1, v3, vcc
+        dpp16_word(1, 0xB1, 0xF, 0xF, false, false),
+    ]);
+
+    let value = build_wave32_cs(MaskPattern::All, Divergence::Full, &words);
+    words.extend(v_add_nc_u32_lit(5, 1, 0));
+    words.push(0x01 << 25 | 2 << 17 | 5 << 9 | 0x80); // v_cndmask_b32 v2, 0, v5, vcc
+    let borrow = build_wave32_cs(MaskPattern::All, Divergence::Full, &words);
+    check_cases(
+        "DPP16rev borrow",
+        &[
+            (
+                "v_subrev_co_ci_u32 value",
+                value,
+                std::array::from_fn(|lane| {
+                    let lane = lane as u32;
+                    lane_v1(lane ^ 1)
+                        .wrapping_sub(lane_v1(lane) + u32::from(lane.is_multiple_of(2)))
+                }),
+            ),
+            (
+                "v_subrev_co_ci_u32 borrow out",
+                borrow,
+                std::array::from_fn(|lane| {
+                    if lane.is_multiple_of(2) {
+                        0
+                    } else {
+                        lane as u32 + 1
+                    }
+                }),
+            ),
+        ],
+    );
+}

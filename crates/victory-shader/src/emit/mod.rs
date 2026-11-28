@@ -1792,4 +1792,266 @@ mod tests {
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
+
+    /// Guarded `v_interp_mov_f32`, `v_interp_p1_f32` + `v_interp_p2_f32`
+    /// (sharing `vdst`), and `v_interp_p2_f16` (both with a separate `vdst`
+    /// and sharing `vdst` with `v_interp_p1ll_f16`) must preserve inactive
+    /// lanes' prior `vdst` values under straight-line EXEC narrowing.
+    #[cfg(windows)]
+    #[test]
+    fn guarded_interpolation_preserves_inactive_lanes() {
+        use super::bitcode::{Attr, Term};
+        use super::host::{Draw, Host};
+        use super::shader::Shader;
+
+        // Pass-through vertex shader: POSITION (row 0) + TEXCOORD (row 1) ->
+        // TEXCOORD (row 0) + SV_Position (row 1), matching `rows(...)` below.
+        let vs = {
+            let mut s = Shader::new(false);
+            let b = s.entry;
+            let el = |name: &str, kind, row| SigElement {
+                name: name.into(),
+                index: 0,
+                kind,
+                comp: 9,
+                interp: 0,
+                row: Some(row),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            };
+            s.inputs = vec![el("POSITION", 0, 0), el("TEXCOORD", 0, 1)];
+            s.outputs = vec![el("TEXCOORD", 0, 0), el("SV_Position", 3, 1)];
+            for (in_id, out_id) in [(1u32, 0u32), (0u32, 1u32)] {
+                for col in 0..4u8 {
+                    let args = [s.m.i32(in_id), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                    let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+                    let store = [s.m.i32(out_id), s.m.i32(0), s.m.i8(col), v];
+                    s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &store);
+                }
+            }
+            s.m.terminate(b, Term::Ret);
+            s.finish()
+        };
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut vs.clone()).unwrap();
+        }
+
+        // Fullscreen clockwise triangle covering an 8x8 render target, with
+        // TEXCOORD.x = 0.25 at every vertex.
+        let vertices: [f32; 24] = [
+            -1.0, -1.0, 0.5, 1.0, 0.25, 0.0, 0.0, 0.0, // bottom-left
+            -1.0, 3.0, 0.5, 1.0, 0.25, 0.0, 0.0, 0.0, // top-left
+            3.0, -1.0, 0.5, 1.0, 0.25, 0.0, 0.0, 0.0, // bottom-right
+        ];
+
+        // input_addr = (1 << 1) | (1 << 8): v0/v1 = PerspectiveCenter (i, j), v2 = SV_Position.x.
+        // Guard: v_cmpx_lt_f32 exec, 4.0, v2 -> active iff SV_Position.x > 4.0 (columns 4..8).
+        const S_SAVE_EXEC: u32 = 0xBE80_037E; // s_mov_b32 s0, exec_lo
+        const V_CMPX_X_GT_4: u32 = 0x7C22_04F6; // v_cmpx_lt_f32 exec, 4.0, v2
+        const S_RESTORE_EXEC: u32 = 0xBEFE_0300; // s_mov_b32 exec_lo, s0
+        const V_MOV_V3_1: u32 = 0x7E06_02F2; // v_mov_b32 v3, 1.0
+        const EXP_V3: [u32; 2] = [0xF800_180F, 0x0303_0303]; // exp mrt0, v3, v3, v3, v3 done vm
+        const S_ENDPGM: u32 = 0xBF81_0000;
+
+        // 1. Guarded v_interp_mov_f32 (flat provoking-vertex attribute).
+        let ps_mov = emit_pixel(
+            &[
+                V_MOV_V3_1,
+                S_SAVE_EXEC,
+                V_CMPX_X_GT_4,
+                0xC80E_0002, // v_interp_mov_f32 v3, p0, attr0.x
+                S_RESTORE_EXEC,
+                EXP_V3[0],
+                EXP_V3[1],
+                S_ENDPGM,
+            ],
+            vec![texcoord(false)],
+            1 << 1 | 1 << 8,
+            &rows(&[("TEXCOORD", 0, false), ("SV_Position", 3, false)], true),
+            &rows(&[("SV_Target", 16, false)], false),
+        )
+        .unwrap();
+
+        // 2. Guarded v_interp_p1_f32 + v_interp_p2_f32 sharing vdst = v3.
+        let ps_p2_f32 = emit_pixel(
+            &[
+                V_MOV_V3_1,
+                S_SAVE_EXEC,
+                V_CMPX_X_GT_4,
+                0xC80C_0000, // v_interp_p1_f32 v3, v0, attr0.x
+                0xC80D_0001, // v_interp_p2_f32 v3, v1, attr0.x
+                S_RESTORE_EXEC,
+                EXP_V3[0],
+                EXP_V3[1],
+                S_ENDPGM,
+            ],
+            vec![texcoord(false)],
+            1 << 1 | 1 << 8,
+            &rows(&[("TEXCOORD", 0, false), ("SV_Position", 3, false)], true),
+            &rows(&[("SV_Target", 16, false)], false),
+        )
+        .unwrap();
+
+        // 3. Guarded v_interp_p1ll_f16 (v4) + v_interp_p2_f16 (v3, separate vdst).
+        //    v3 starts as packed f16 (1.0h, 2.0h) = 0x4000_3C00.
+        //    Active lanes update low half to 0.25h and keep high half 2.0h;
+        //    inactive lanes keep both halves (1.0h, 2.0h).
+        let ps_p2_f16_sep = emit_pixel(
+            &[
+                0x7E06_02FF,
+                0x4000_3C00, // v_mov_b32 v3, 0x4000_3C00 (1.0h, 2.0h)
+                S_SAVE_EXEC,
+                V_CMPX_X_GT_4,
+                0xD742_0004,
+                0x0002_0000, // v_interp_p1ll_f16 v4, v0, attr0.x
+                0xD75A_0003,
+                (257u32 << 9) | (260u32 << 18), // v_interp_p2_f16 v3, attr0.x, v1, v4
+                S_RESTORE_EXEC,
+                0x7E0A_1703, // v_cvt_f32_f16 v5, v3 (low half)
+                0xD58B_0806,
+                0x0000_0103, // v_cvt_f32_f16_e64 v6, v3 op_sel:[1] (high half)
+                0xF800_180F,
+                0x0605_0605, // exp mrt0, v5, v6, v5, v6 done vm
+                S_ENDPGM,
+            ],
+            vec![texcoord(true)],
+            1 << 1 | 1 << 8,
+            &rows(&[("TEXCOORD", 0, true), ("SV_Position", 3, false)], true),
+            &rows(&[("SV_Target", 16, false)], false),
+        )
+        .unwrap();
+
+        // 4. Guarded v_interp_p1ll_f16 (v3) + v_interp_p2_f16 (v3, shared vdst).
+        //    v3 starts as packed f16 (1.0h, 2.0h) = 0x4000_3C00.
+        //    Active lanes get 0.25h in low half; inactive lanes keep (1.0h, 2.0h).
+        let ps_p2_f16_shared = emit_pixel(
+            &[
+                0x7E06_02FF,
+                0x4000_3C00, // v_mov_b32 v3, 0x4000_3C00 (1.0h, 2.0h)
+                S_SAVE_EXEC,
+                V_CMPX_X_GT_4,
+                0xD742_0003,
+                0x0002_0000, // v_interp_p1ll_f16 v3, v0, attr0.x
+                0xD75A_0003,
+                (257u32 << 9) | (259u32 << 18), // v_interp_p2_f16 v3, attr0.x, v1, v3
+                S_RESTORE_EXEC,
+                0x7E0A_1703, // v_cvt_f32_f16 v5, v3 (low half)
+                0xD58B_0806,
+                0x0000_0103, // v_cvt_f32_f16_e64 v6, v3 op_sel:[1] (high half)
+                0xF800_180F,
+                0x0605_0605, // exp mrt0, v5, v6, v5, v6 done vm
+                S_ENDPGM,
+            ],
+            vec![texcoord(true)],
+            1 << 1 | 1 << 8,
+            &rows(&[("TEXCOORD", 0, true), ("SV_Position", 3, false)], true),
+            &rows(&[("SV_Target", 16, false)], false),
+        )
+        .unwrap();
+
+        // 5. Guarded v_interp_p1ll_f16 (v4) + v_interp_p2_f16 (v3, op_sel[3]=1,
+        //    separate vdst). Active lanes keep low half 1.0h and update high
+        //    half to 0.25h; inactive lanes keep both halves (1.0h, 2.0h).
+        let ps_p2_f16_hi = emit_pixel(
+            &[
+                0x7E06_02FF,
+                0x4000_3C00, // v_mov_b32 v3, 0x4000_3C00 (1.0h, 2.0h)
+                S_SAVE_EXEC,
+                V_CMPX_X_GT_4,
+                0xD742_0004,
+                0x0002_0000, // v_interp_p1ll_f16 v4, v0, attr0.x
+                0xD75A_4003,
+                (257u32 << 9) | (260u32 << 18), // v_interp_p2_f16 v3, attr0.x, v1, v4 op_sel:[0,0,0,1]
+                S_RESTORE_EXEC,
+                0x7E0A_1703, // v_cvt_f32_f16 v5, v3 (low half)
+                0xD58B_0806,
+                0x0000_0103, // v_cvt_f32_f16_e64 v6, v3 op_sel:[1] (high half)
+                0xF800_180F,
+                0x0605_0605, // exp mrt0, v5, v6, v5, v6 done vm
+                S_ENDPGM,
+            ],
+            vec![texcoord(true)],
+            1 << 1 | 1 << 8,
+            &rows(&[("TEXCOORD", 0, true), ("SV_Position", 3, false)], true),
+            &rows(&[("SV_Target", 16, false)], false),
+        )
+        .unwrap();
+
+        let _one = valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            ran += 1;
+            let root = host.root_signature_for(&[]).unwrap();
+            let draw = Draw {
+                roots: Vec::new(),
+                textures: &[],
+                samplers: &[],
+                vertices: &vertices,
+                stride: 32,
+                size: (8, 8),
+                mesh_groups: 0,
+            };
+            for (case, ps, active_want, inactive_want) in [
+                ("v_interp_mov_f32", &ps_mov, (0.25f32, None), (1.0f32, None)),
+                (
+                    "v_interp_p2_f32_shared",
+                    &ps_p2_f32,
+                    (0.25, None),
+                    (1.0, None),
+                ),
+                (
+                    "v_interp_p2_f16_sep",
+                    &ps_p2_f16_sep,
+                    (0.25, Some(2.0)),
+                    (1.0, Some(2.0)),
+                ),
+                (
+                    "v_interp_p2_f16_shared",
+                    &ps_p2_f16_shared,
+                    (0.25, None),
+                    (1.0, Some(2.0)),
+                ),
+                (
+                    "v_interp_p2_f16_hi",
+                    &ps_p2_f16_hi,
+                    (1.0, Some(0.25)),
+                    (1.0, Some(2.0)),
+                ),
+            ] {
+                let pso = host.pipeline_with(&root, &vs, &ps.dxil).unwrap();
+                let texels = host.draw(&root, &pso, &draw).unwrap();
+                for (idx, t) in texels.iter().enumerate() {
+                    let x = idx % 8;
+                    let (want_r, want_g) = if x >= 4 { active_want } else { inactive_want };
+                    assert!(
+                        (t[0] - want_r).abs() < 1e-3,
+                        "{label} {case} pixel ({x}, {}): r={}, want {want_r} (full {t:?})",
+                        idx / 8,
+                        t[0]
+                    );
+                    if let Some(want_g) = want_g {
+                        assert!(
+                            (t[1] - want_g).abs() < 1e-3,
+                            "{label} {case} pixel ({x}, {}): g={}, want {want_g} (full {t:?})",
+                            idx / 8,
+                            t[1]
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            ran > 0,
+            "expected at least one D3D12 host (hardware or WARP)"
+        );
+    }
 }
