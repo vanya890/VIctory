@@ -3,16 +3,35 @@
 Read this file before changing code, opening issues, creating pull requests, reviewing changes, or merging branches.
 
 
-## 0. Single-operator autonomous development
+## 0. Operating modes and autonomous authority
 
-The project is currently maintained directly by the project owner and one coordinating development agent. The previous multi-agent swarm review process is optional and is not a mandatory merge gate unless the project owner explicitly re-enables it.
+The repository supports both coordinated multi-agent work and single-agent operation. The default is coordinated swarm mode whenever multiple agents are actively contributing. A single-agent fallback is available when only one agent is actually available; never simulate a swarm or fabricate independent reviewers.
 
-- The coordinating agent may implement, inspect its own changes, run available validation, write a documented self-review, update PRs, merge qualifying PRs into `dev`, and promote a validated `dev` snapshot to `main` without requesting artificial or ceremonial independent reviews.
-- A self-review is valid as an engineering self-audit in this operating mode. It must be honest about scope, tests actually run, untested paths, and residual risks. It must never be labelled as an independent review.
-- Peer/agent reviews are welcome when genuinely available and useful, but their absence alone does not block work.
-- The project owner's direct instructions define priorities and may explicitly authorize changes to this governance policy. Routine implementation and integration decisions are delegated to the coordinating agent.
+### 0.1 Coordinated swarm mode
+
+- Agents may independently claim bounded tasks, investigate upstream solutions, implement changes, open PRs, and integrate work through the normal branch policy.
+- Agents MUST communicate through the canonical issues and PR discussions. They should read and comment on relevant work by other agents, challenge assumptions, identify counterexamples, and debate technical disagreements using code references, reproducible evidence, and tests.
+- A PR author must request substantive review from an agent who did not author or implement the change. Reviewers must inspect the actual diff and relevant call paths, not merely approve the description.
+- Reviewers should explicitly record findings, questions, risks, test gaps, and a final verdict. The author must answer each material finding and update the code or explain with evidence why no change is needed.
+- Reviews must be genuinely independent in authorship and analysis. Separate usernames, copied comments, ceremonial approvals, or an agent reviewing its own work do not count as independent review.
+- Reviewers are encouraged to disagree. Resolve disagreements through source inspection, upstream evidence, targeted tests, and documented reasoning, not hierarchy or vote-counting.
+- Agents may merge qualifying PRs themselves after the required peer reviews, CI, self-audit, and all other gates pass. The PR author may perform the merge; peer review is a quality gate, not a transfer of merge ownership.
+- For high-risk changes involving unsafe code, concurrency, memory/resource lifetime, security boundaries, GPU synchronization, data integrity, or privileged CI/workflows, require two substantive independent peer reviews where two genuinely available reviewers exist. If fewer reviewers are available, use the documented single-agent fallback only when the project is genuinely operating with one available agent; otherwise keep the PR blocked.
+
+### 0.2 Single-agent fallback
+
+- If only one agent is available to perform the work, that agent may implement, inspect, test, self-audit, update PRs, and merge qualifying PRs without inventing or waiting for unavailable reviewers.
+- Before using this fallback, record in the PR that the repository is operating in single-agent mode and that no independent reviewer was available. Do not claim that self-review is independent review.
+- The solo agent must perform a second-pass adversarial audit after implementation: re-read the complete final diff from a clean perspective, trace affected call paths, enumerate failure modes and boundary cases, inspect upstream/related PR alternatives, and run every applicable check. Record the exact SHA, commands, results, limitations, and residual risks.
+- A solo agent must not weaken CI, skip applicable tests, bypass branch protections, fabricate approvals, or use the fallback merely to avoid inconvenient peer feedback.
+- If another agent becomes available before merge, return to swarm mode and obtain the required peer review.
+
+### 0.3 Owner authority and truthfulness
+
+- The project owner sets priorities and may explicitly change this governance policy. Routine implementation and integration decisions are delegated to participating agents under the gates below.
+- Agents are authorized to merge qualifying PRs into `dev` and to promote a validated `dev` snapshot to `main` when the applicable swarm or solo gates are satisfied.
 - Technical validation, exact-SHA checks, security boundaries, branch protections, and truthful reporting remain mandatory. Owner authorization does not justify fabricated CI results, false test claims, secret exposure, or bypassing GitHub protections.
-- If an actual GitHub rule or permission prevents an authorized operation, report that concrete restriction. Do not claim that conversational authorization changed the repository's technical permissions.
+- If an actual GitHub rule or permission prevents an authorized operation, report that concrete restriction. Do not claim that conversational authorization changed repository permissions.
 
 ## 1. Coordination is mandatory
 
@@ -28,7 +47,9 @@ Before starting work:
 3. Claim exactly one existing `TASK-ID` in #50. Include your agent identifier, precise scope, files/functions, and expected output.
 4. If no canonical issue exists, create one focused issue only after checking for duplicates; then add its `TASK-ID` to #50.
 5. Do not begin overlapping implementation while another active claim owns that scope. Coordinate a handoff first.
-6. Optional peer-review tasks may be claimed when another agent is genuinely available; they are not required in single-operator mode.
+6. In swarm mode, actively review relevant PRs/issues owned by other agents. Do not restrict participation to your own assigned task: report concrete risks, missing tests, upstream alternatives, and integration conflicts.
+7. For every PR, request peer review according to section 4. A reviewer must be different from the author/implementer and must leave a substantive written review. For high-risk changes, seek two independent reviews when two reviewers are available.
+8. If only one agent is available, explicitly use the single-agent fallback in section 0.2 and complete its adversarial second-pass audit.
 
 Use these status words consistently:
 
@@ -39,7 +60,7 @@ Use these status words consistently:
 - `done`: the promised output is complete; link the canonical result.
 - `release`: the claim is relinquished without completion.
 
-A completed research task does not mean its implementation PR is merged. Track implementation, self-audit, validation, and integration separately.
+A completed research task does not mean its implementation PR is merged. Track implementation, peer review or solo self-audit, validation, and integration separately.
 
 ## 2. Keep the repository and issue tracker clean
 
@@ -78,9 +99,11 @@ All feature, fix, experiment, and upstream-import branches are temporary.
 
 The goal is to catch defects through careful inspection and reproducible validation, not to collect ceremonial approvals.
 
-### 4.1 Required self-audit
+### 4.1 Required technical audit and peer review
 
-Before merging an implementation PR into `dev`, the coordinating agent must:
+Before merging an implementation PR into `dev`, the PR must receive both a technical self-audit by its author and the applicable independent peer review:
+
+**Author self-audit (always required):**
 1. Inspect the complete diff at the exact current head SHA, not only the PR description or its own summary.
 2. Trace changed functions through relevant call sites, ownership/lifetime rules, error paths, concurrency behavior, and compatibility boundaries.
 3. Actively search for counterexamples, boundary cases, races, resource exhaustion, malformed input, and tests that could pass while the implementation remains incorrect.
@@ -88,7 +111,20 @@ Before merging an implementation PR into `dev`, the coordinating agent must:
 5. Record the exact head SHA, files/functions inspected, commands actually run, findings, test gaps, and residual risks in the PR.
 6. Fix blocking findings and repeat the affected inspection and validation after every change.
 
-Optional peer reviews may add confidence, but they are not mandatory in the current single-operator mode. Never fabricate reviewer identities, separate agent instances, or approvals. Resolve technical disagreements through evidence and targeted tests, not vote-counting.
+**Independent peer review (required in swarm mode):**
+- At least one agent who did not author or implement the change must inspect the complete diff and relevant surrounding code, then submit a substantive review.
+- For high-risk changes involving unsafe code, concurrency, memory/resource lifetime, security boundaries, GPU synchronization, data integrity, or privileged CI/workflows, require two independent substantive reviews when two genuinely available reviewers exist.
+- Reviewers must challenge the implementation, not merely confirm style. They should examine correctness invariants, race/deadlock possibilities, failure recovery, compatibility, tests, and whether an existing upstream solution is safer.
+- The PR author must respond to every material finding. Unresolved blocking findings or unresolved review threads prevent merge.
+- A reviewer must not approve work they authored or materially implemented. Do not count duplicate or coordinated rubber-stamp reviews as independent.
+- Record reviewer identity, review scope, concrete findings, and verdict in the PR. Never fabricate reviewer identities, separate agent instances, or approvals.
+
+**Single-agent fallback:**
+- When only one agent is genuinely available, an independent review cannot be manufactured. Record that fact and complete the adversarial second-pass audit described in section 0.2.
+- A solo self-audit is not an independent review and must never be labelled as one.
+- If a second agent becomes available before merge, obtain the normal peer review rather than relying on the fallback.
+
+Technical disagreements must be resolved through evidence and targeted tests, not vote-counting.
 
 ### 4.2 Required validation for every PR
 
@@ -126,25 +162,27 @@ The workspace tests include the repository asset-policy check. Follow [docs/asse
 
 ### 4.4 Permission to merge into dev
 
-An AI agent MAY merge a PR into `dev` without waiting for the project owner when every applicable requirement in sections 4.1–4.3 is satisfied.
+An AI agent MAY merge a PR into `dev` without waiting for the project owner when every applicable requirement in sections 4.1–4.3 is satisfied, including independent peer review in swarm mode or the documented adversarial self-audit fallback in genuine single-agent mode.
 
 Before the merge:
 
 1. Re-fetch the PR and confirm it is open, not draft, mergeable, and targets `dev`.
-2. Re-check the exact head SHA, base SHA, review results, unresolved threads, and CI status.
-3. Confirm no newer commit was pushed after the final reviews and successful checks.
+2. Re-check the exact head SHA, base SHA, peer review results (or documented solo-mode justification), unresolved threads, and CI status.
+3. Confirm no newer commit was pushed after the final reviews and successful checks. Any new commit invalidates reviews of affected code and requires re-review.
 4. Merge using the exact reviewed head SHA as the expected head. If it changed, stop and repeat the affected review and validation.
 5. After merging, verify the resulting `dev` commit and run/inspect the post-merge CI on that resulting commit. If post-merge CI fails, investigate immediately, stop further dependent merges, and fix or revert with a documented reason.
 
-This is explicit authorization for agents to merge into `dev`. Do not ask the owner for routine permission when all gates pass.
-
+The author or another authorized participating agent may perform the merge. Do not ask the owner for routine permission when all gates pass. Never bypass repository rules or required checks.
+ 
 ## 5. Release gate: promoting dev into main
 
-Promotion to `main` remains a deliberate release operation, but it does not require a multi-agent review ceremony in single-operator mode.
+Promotion to `main` is a deliberate release operation. It requires the complete release self-audit and the applicable peer-review gate; it does not require ceremonial approval from the project owner.
 
 - The only normal promotion path is a focused PR from the current `dev` into the current `main`. Do not merge an individual feature branch directly into `main`.
 - Promote a validated snapshot of `dev`; do not combine unrelated, unfinished work merely to make a release.
 - The coordinating agent must perform and document a release self-audit of the complete `main...dev` diff and commit graph, including main-only commits, accidental scope expansion, critical invariants, unsafe code, resource lifetime, concurrency, data integrity, and failure handling.
+- In swarm mode, the release PR requires at least one substantive independent peer review; require two independent reviews when the release includes high-risk changes and two reviewers are available. Reviewers must inspect the complete release diff and commit graph, not just the PR summary.
+- In genuine single-agent mode, use the explicit solo fallback from section 0.2, including the adversarial second-pass release audit. Do not claim this is peer review.
 - All P0/P1 findings must be resolved. P2/P3 residual risks must be explicitly documented with rationale and follow-up issue where appropriate.
 - The complete applicable CI suite must pass on the exact release candidate. Re-run after any rebase, new commit, conflict resolution, or candidate-tree change.
 - All hardware-dependent changes included in the release must have required real-hardware evidence. WARP or synthetic tests alone do not prove vendor hardware behavior.
@@ -152,7 +190,7 @@ Promotion to `main` remains a deliberate release operation, but it does not requ
 - Identify main-only commits and preserve them. Do not overwrite or discard changes that exist only on `main`.
 - Confirm release notes accurately describe included changes, known limitations, and validation evidence.
 
-The coordinating agent may merge the `dev` → `main` PR without routine human approval when this release self-audit, applicable validation, and actual GitHub repository protections are satisfied.
+An authorized agent may merge the `dev` → `main` PR when this release self-audit, applicable peer-review or solo fallback, validation, and actual GitHub repository protections are satisfied.
 
 After promotion, verify the new `main` SHA and its CI. If the release checks fail, stop further promotion and prepare a narrow corrective PR or revert. Do not silently leave `main` red.
 
