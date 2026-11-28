@@ -1,16 +1,23 @@
 name: CI
 
 on:
-  workflow_dispatch:
   pull_request:
+    branches: [dev, main]
   push:
-    branches: [main]
+    branches: [dev, main]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      target_ref:
+        description: Exact VIctory ref to check when called by another workflow
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -22,9 +29,17 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+        with:
+          repository: vanya890/VIctory
+          ref: ${{ inputs.target_ref || github.sha }}
+          persist-credentials: false
+      - name: Test coordination triage scripts
+        run: python -B -I -m unittest discover -s scripts -p 'test_coordination_triage.py' -v
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
