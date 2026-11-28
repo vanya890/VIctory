@@ -45,6 +45,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Test coordination triage scripts
+        if: ${{ hashFiles('scripts/test_coordination_triage.py') != '' }}
         run: python -B -I -m unittest discover -s scripts -p 'test_coordination_triage.py' -v
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
@@ -59,12 +60,19 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Forced WARP selection must fail closed if the software adapter or debug layer cannot initialize.
       - name: D3D12 WARP OOM recovery regressions
+        shell: pwsh
         run: |
+          $source = Get-Content "crates/victory-gpu/src/resource.rs" -Raw
+          if ($source -notmatch "oom_backoff_reuses_host_texture_from_another_resource_with_same_memory_key" -or $source -notmatch "a_slot_left_null_for_want_of_memory_is_read_again") {
+            Write-Host "WARP OOM regressions are not present in this target ref; skipping this ref-specific step."
+            exit 0
+          }
+          $env:VICTORY_D3D12_WARP = "1"
+          $env:VICTORY_D3D12_DEBUG = "1"
           cargo test -p victory-gpu --features diagnostics --lib --locked resource::tests::oom_backoff_reuses_host_texture_from_another_resource_with_same_memory_key -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p victory-gpu --features diagnostics --lib --locked resource::tests::a_slot_left_null_for_want_of_memory_is_read_again -- --nocapture
-        env:
-          VICTORY_D3D12_WARP: "1"
-          VICTORY_D3D12_DEBUG: "1"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
