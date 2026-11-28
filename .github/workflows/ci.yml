@@ -6,10 +6,20 @@ on:
   push:
     branches: [dev, main]
   workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Base ref for changed-line formatting validation
+        required: false
+        default: dev
+        type: string
   workflow_call:
     inputs:
       target_ref:
         description: Exact VIctory ref to check when called by another workflow
+        required: true
+        type: string
+      base_ref:
+        description: Base ref for changed-line formatting validation
         required: true
         type: string
 
@@ -32,18 +42,29 @@ jobs:
         with:
           repository: vanya890/VIctory
           ref: ${{ inputs.target_ref || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Test coordination triage scripts
         run: python -B -I -m unittest discover -s scripts -p 'test_coordination_triage.py' -v
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: Formatting
-        run: cargo fmt --all -- --check
+      - name: Formatting on changed Rust lines
+        env:
+          BASE_REF: ${{ inputs.base_ref || github.event.pull_request.base.ref || github.event.before || 'dev' }}
+        run: python -B -I scripts/check_changed_rust_format.py
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Forced WARP selection must fail closed if the software adapter or debug layer cannot initialize.
+      - name: D3D12 WARP OOM recovery regressions
+        run: |
+          cargo test -p victory-gpu --features diagnostics --lib --locked resource::tests::oom_backoff_reuses_host_texture_from_another_resource_with_same_memory_key -- --nocapture
+          cargo test -p victory-gpu --features diagnostics --lib --locked resource::tests::a_slot_left_null_for_want_of_memory_is_read_again -- --nocapture
+        env:
+          VICTORY_D3D12_WARP: "1"
+          VICTORY_D3D12_DEBUG: "1"
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
